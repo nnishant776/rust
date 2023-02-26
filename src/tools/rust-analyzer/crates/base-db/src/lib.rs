@@ -17,6 +17,7 @@ pub use crate::{
         CrateData, CrateDisplayName, CrateGraph, CrateId, CrateName, CrateOrigin, Dependency,
         Edition, Env, LangCrateOrigin, ProcMacro, ProcMacroExpander, ProcMacroExpansionError,
         ProcMacroId, ProcMacroKind, ProcMacroLoadResult, SourceRoot, SourceRootId,
+        TargetLayoutLoadResult,
     },
 };
 pub use salsa::{self, Cancelled};
@@ -75,9 +76,9 @@ pub trait SourceDatabase: FileLoader + std::fmt::Debug {
 }
 
 fn parse_query(db: &dyn SourceDatabase, file_id: FileId) -> Parse<ast::SourceFile> {
-    let _p = profile::span("parse_query").detail(|| format!("{:?}", file_id));
+    let _p = profile::span("parse_query").detail(|| format!("{file_id:?}"));
     let text = db.file_text(file_id);
-    SourceFile::parse(&*text)
+    SourceFile::parse(&text)
 }
 
 /// We don't want to give HIR knowledge of source roots, hence we extract these

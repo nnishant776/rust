@@ -15,7 +15,7 @@ use hir_def::{
     expr::ExprId,
     FunctionId,
 };
-use hir_ty::{TyExt, TypeWalk};
+use hir_ty::{Interner, TyExt, TypeFlags};
 use ide::{Analysis, AnalysisHost, LineCol, RootDatabase};
 use ide_db::base_db::{
     salsa::{self, debug::DebugQueryTable, ParallelDatabase},
@@ -33,7 +33,7 @@ use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 use crate::cli::{
     flags::{self, OutputFormat},
-    load_cargo::{load_workspace, LoadCargoConfig},
+    load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice},
     print_memory_usage,
     progress_report::ProgressReport,
     report_metric, Result, Verbosity,
@@ -59,11 +59,6 @@ impl flags::AnalysisStats {
             true => None,
             false => Some(RustcSource::Discover),
         };
-        let load_cargo_config = LoadCargoConfig {
-            load_out_dirs_from_check: !self.disable_build_scripts,
-            with_proc_macro: !self.disable_proc_macros,
-            prefill_caches: false,
-        };
         let no_progress = &|_| ();
 
         let mut db_load_sw = self.stop_watch();
@@ -73,6 +68,11 @@ impl flags::AnalysisStats {
 
         let mut workspace = ProjectWorkspace::load(manifest, &cargo_config, no_progress)?;
         let metadata_time = db_load_sw.elapsed();
+        let load_cargo_config = LoadCargoConfig {
+            load_out_dirs_from_check: !self.disable_build_scripts,
+            with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+            prefill_caches: false,
+        };
 
         let build_scripts_time = if self.disable_build_scripts {
             None
@@ -87,9 +87,9 @@ impl flags::AnalysisStats {
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config)?;
         let db = host.raw_database();
         eprint!("{:<20} {}", "Database loaded:", db_load_sw.elapsed());
-        eprint!(" (metadata {}", metadata_time);
+        eprint!(" (metadata {metadata_time}");
         if let Some(build_scripts_time) = build_scripts_time {
-            eprint!("; build {}", build_scripts_time);
+            eprint!("; build {build_scripts_time}");
         }
         eprintln!(")");
 
@@ -118,7 +118,7 @@ impl flags::AnalysisStats {
             shuffle(&mut rng, &mut visit_queue);
         }
 
-        eprint!("  crates: {}", num_crates);
+        eprint!("  crates: {num_crates}");
         let mut num_decls = 0;
         let mut funcs = Vec::new();
         while let Some(module) = visit_queue.pop() {
@@ -142,7 +142,7 @@ impl flags::AnalysisStats {
                 }
             }
         }
-        eprintln!(", mods: {}, decls: {}, fns: {}", visited_modules.len(), num_decls, funcs.len());
+        eprintln!(", mods: {}, decls: {num_decls}, fns: {}", visited_modules.len(), funcs.len());
         eprintln!("{:<20} {}", "Item Collection:", analysis_sw.elapsed());
 
         if self.randomize {
@@ -154,7 +154,7 @@ impl flags::AnalysisStats {
         }
 
         let total_span = analysis_sw.elapsed();
-        eprintln!("{:<20} {}", "Total:", total_span);
+        eprintln!("{:<20} {total_span}", "Total:");
         report_metric("total time", total_span.time.as_millis() as u64, "ms");
         if let Some(instructions) = total_span.instructions {
             report_metric("total instructions", instructions, "#instr");
@@ -179,7 +179,7 @@ impl flags::AnalysisStats {
                     total_macro_file_size += syntax_len(val.syntax_node())
                 }
             }
-            eprintln!("source files: {}, macro files: {}", total_file_size, total_macro_file_size);
+            eprintln!("source files: {total_file_size}, macro files: {total_macro_file_size}");
         }
 
         if self.memory_usage && verbosity.is_verbose() {
@@ -239,7 +239,7 @@ impl flags::AnalysisStats {
                     continue;
                 }
             }
-            let mut msg = format!("processing: {}", full_name);
+            let mut msg = format!("processing: {full_name}");
             if verbosity.is_verbose() {
                 if let Some(src) = f.source(db) {
                     let original_file = src.file_id.original_file(db);
@@ -275,17 +275,13 @@ impl flags::AnalysisStats {
                                 end.col,
                             ));
                         } else {
-                            bar.println(format!("{}: Unknown type", name,));
+                            bar.println(format!("{name}: Unknown type",));
                         }
                     }
                     true
                 } else {
-                    let mut is_partially_unknown = false;
-                    ty.walk(&mut |ty| {
-                        if ty.is_unknown() {
-                            is_partially_unknown = true;
-                        }
-                    });
+                    let is_partially_unknown =
+                        ty.data(Interner).flags.contains(TypeFlags::HAS_ERROR);
                     if is_partially_unknown {
                         num_exprs_partially_unknown += 1;
                     }
@@ -402,7 +398,7 @@ fn location_csv(
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
-    format!("{},{}:{},{}:{}", path, start.line + 1, start.col, end.line + 1, end.col)
+    format!("{path},{}:{},{}:{}", start.line + 1, start.col, end.line + 1, end.col)
 }
 
 fn expr_syntax_range(

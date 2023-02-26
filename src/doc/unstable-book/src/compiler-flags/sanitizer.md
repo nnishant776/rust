@@ -14,6 +14,9 @@ This feature allows for use of one of following sanitizers:
   forward-edge control flow protection.
 * [HWAddressSanitizer](#hwaddresssanitizer) a memory error detector similar to
   AddressSanitizer, but based on partial hardware assistance.
+* [KernelControlFlowIntegrity](#kernelcontrolflowintegrity) LLVM Kernel Control
+  Flow Integrity (KCFI) provides forward-edge control flow protection for
+  operating systems kernels.
 * [LeakSanitizer](#leaksanitizer) a run-time memory leak detector.
 * [MemorySanitizer](#memorysanitizer) a detector of uninitialized reads.
 * [MemTagSanitizer](#memtagsanitizer) fast memory error detector based on
@@ -47,10 +50,10 @@ with runtime flag `ASAN_OPTIONS=detect_leaks=1` on macOS.
 AddressSanitizer is supported on the following targets:
 
 * `aarch64-apple-darwin`
-* `aarch64-fuchsia`
+* `aarch64-unknown-fuchsia`
 * `aarch64-unknown-linux-gnu`
 * `x86_64-apple-darwin`
-* `x86_64-fuchsia`
+* `x86_64-unknown-fuchsia`
 * `x86_64-unknown-freebsd`
 * `x86_64-unknown-linux-gnu`
 
@@ -417,8 +420,8 @@ flow using an indirect branch/call to a function with different return and
 parameter types than the return type expected and arguments intended/passed in
 the call/branch site, the execution is also terminated (see Fig. 9).
 
-[rust-book-ch19-05]: https://doc.rust-lang.org/book/ch19-05-advanced-functions-and-closures.html
-[rust-book]: https://doc.rust-lang.org/book/title-page.html
+[rust-book-ch19-05]: ../../book/ch19-05-advanced-functions-and-closures.html
+[rust-book]: ../../book/title-page.html
 
 # HWAddressSanitizer
 
@@ -501,6 +504,50 @@ Registers where the failure occurred (pc 0xaaaae0ae4a98):
     x28 0000000000000000  x29 0000ffffc30ac5a0  x30 0000aaaae0ae4a98
 SUMMARY: HWAddressSanitizer: tag-mismatch (/.../main+0x54a94)
 ```
+
+# KernelControlFlowIntegrity
+
+The LLVM Kernel Control Flow Integrity (CFI) support to the Rust compiler
+initially provides forward-edge control flow protection for operating systems
+kernels for Rust-compiled code only by aggregating function pointers in groups
+identified by their return and parameter types. (See [LLVM commit cff5bef "KCFI
+sanitizer"](https://github.com/llvm/llvm-project/commit/cff5bef948c91e4919de8a5fb9765e0edc13f3de).)
+
+Forward-edge control flow protection for C or C++ and Rust -compiled code "mixed
+binaries" (i.e., for when C or C++ and Rust -compiled code share the same
+virtual address space) will be provided in later work by defining and using
+compatible type identifiers (see Type metadata in the design document in the
+tracking issue [#89653](https://github.com/rust-lang/rust/issues/89653)).
+
+LLVM KCFI can be enabled with `-Zsanitizer=kcfi`.
+
+LLVM KCFI is supported on the following targets:
+
+* `aarch64-linux-android`
+* `aarch64-unknown-linux-gnu`
+* `x86_64-linux-android`
+* `x86_64-unknown-linux-gnu`
+
+See the [Clang KernelControlFlowIntegrity documentation][clang-kcfi] for more
+details.
+
+# KernelAddressSanitizer
+
+KernelAddressSanitizer (KASAN) is a freestanding version of AddressSanitizer
+which is suitable for detecting memory errors in programs which do not have a
+runtime environment, such as operating system kernels. KernelAddressSanitizer
+requires manual implementation of the underlying functions used for tracking
+KernelAddressSanitizer state.
+
+KernelAddressSanitizer is supported on the following targets:
+
+* `aarch64-unknown-none`
+* `riscv64gc-unknown-none-elf`
+* `riscv64imac-unknown-none-elf`
+* `x86_64-unknown-none`
+
+See the [Linux Kernel's KernelAddressSanitizer documentation][linux-kasan] for
+more details.
 
 # LeakSanitizer
 
@@ -662,7 +709,7 @@ It is strongly recommended to combine sanitizers with recompiled and
 instrumented standard library, for example using [cargo `-Zbuild-std`
 functionality][build-std].
 
-[build-std]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#build-std
+[build-std]: ../../cargo/reference/unstable.html#build-std
 
 # Build scripts and procedural macros
 
@@ -685,6 +732,7 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 * [AddressSanitizer in Clang][clang-asan]
 * [ControlFlowIntegrity in Clang][clang-cfi]
 * [HWAddressSanitizer in Clang][clang-hwasan]
+* [Linux Kernel's KernelAddressSanitizer documentation][linux-kasan]
 * [LeakSanitizer in Clang][clang-lsan]
 * [MemorySanitizer in Clang][clang-msan]
 * [MemTagSanitizer in LLVM][llvm-memtag]
@@ -693,8 +741,10 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 [clang-asan]: https://clang.llvm.org/docs/AddressSanitizer.html
 [clang-cfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html
 [clang-hwasan]: https://clang.llvm.org/docs/HardwareAssistedAddressSanitizerDesign.html
+[clang-kcfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html#fsanitize-kcfi
 [clang-lsan]: https://clang.llvm.org/docs/LeakSanitizer.html
 [clang-msan]: https://clang.llvm.org/docs/MemorySanitizer.html
 [clang-scs]: https://clang.llvm.org/docs/ShadowCallStack.html
 [clang-tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
+[linux-kasan]: https://www.kernel.org/doc/html/latest/dev-tools/kasan.html
 [llvm-memtag]: https://llvm.org/docs/MemTagSanitizer.html

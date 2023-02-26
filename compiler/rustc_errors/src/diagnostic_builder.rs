@@ -1,7 +1,7 @@
 use crate::diagnostic::IntoDiagnosticArg;
 use crate::{
     Diagnostic, DiagnosticId, DiagnosticMessage, DiagnosticStyledString, ErrorGuaranteed,
-    SubdiagnosticMessage,
+    ExplicitBug, SubdiagnosticMessage,
 };
 use crate::{Handler, Level, MultiSpan, StashKey};
 use rustc_lint_defs::Applicability;
@@ -12,12 +12,12 @@ use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::panic;
 use std::thread::panicking;
 
 /// Trait implemented by error types. This should not be implemented manually. Instead, use
 /// `#[derive(Diagnostic)]` -- see [rustc_macros::Diagnostic].
-#[cfg_attr(bootstrap, rustc_diagnostic_item = "SessionDiagnostic")]
-#[cfg_attr(not(bootstrap), rustc_diagnostic_item = "IntoDiagnostic")]
+#[rustc_diagnostic_item = "IntoDiagnostic"]
 pub trait IntoDiagnostic<'a, T: EmissionGuarantee = ErrorGuaranteed> {
     /// Write out as a diagnostic out of `Handler`.
     #[must_use]
@@ -309,6 +309,58 @@ impl EmissionGuarantee for Noted {
     }
 }
 
+/// Marker type which enables implementation of `create_bug` and `emit_bug` functions for
+/// bug struct diagnostics.
+#[derive(Copy, Clone)]
+pub struct Bug;
+
+impl<'a> DiagnosticBuilder<'a, Bug> {
+    /// Convenience function for internal use, clients should use one of the
+    /// `struct_*` methods on [`Handler`].
+    #[track_caller]
+    pub(crate) fn new_bug(handler: &'a Handler, message: impl Into<DiagnosticMessage>) -> Self {
+        let diagnostic = Diagnostic::new_with_code(Level::Bug, None, message);
+        Self::new_diagnostic_bug(handler, diagnostic)
+    }
+
+    /// Creates a new `DiagnosticBuilder` with an already constructed
+    /// diagnostic.
+    pub(crate) fn new_diagnostic_bug(handler: &'a Handler, diagnostic: Diagnostic) -> Self {
+        debug!("Created new diagnostic bug");
+        Self {
+            inner: DiagnosticBuilderInner {
+                state: DiagnosticBuilderState::Emittable(handler),
+                diagnostic: Box::new(diagnostic),
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl EmissionGuarantee for Bug {
+    fn diagnostic_builder_emit_producing_guarantee(db: &mut DiagnosticBuilder<'_, Self>) -> Self {
+        match db.inner.state {
+            // First `.emit()` call, the `&Handler` is still available.
+            DiagnosticBuilderState::Emittable(handler) => {
+                db.inner.state = DiagnosticBuilderState::AlreadyEmittedOrDuringCancellation;
+
+                handler.emit_diagnostic(&mut db.inner.diagnostic);
+            }
+            // `.emit()` was previously called, disallowed from repeating it.
+            DiagnosticBuilderState::AlreadyEmittedOrDuringCancellation => {}
+        }
+        // Then panic. No need to return the marker type.
+        panic::panic_any(ExplicitBug);
+    }
+
+    fn make_diagnostic_builder(
+        handler: &Handler,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, Self> {
+        DiagnosticBuilder::new_bug(handler, msg)
+    }
+}
+
 impl<'a> DiagnosticBuilder<'a, !> {
     /// Convenience function for internal use, clients should use one of the
     /// `struct_*` methods on [`Handler`].
@@ -353,6 +405,59 @@ impl EmissionGuarantee for ! {
         msg: impl Into<DiagnosticMessage>,
     ) -> DiagnosticBuilder<'_, Self> {
         DiagnosticBuilder::new_fatal(handler, msg)
+    }
+}
+
+impl<'a> DiagnosticBuilder<'a, rustc_span::fatal_error::FatalError> {
+    /// Convenience function for internal use, clients should use one of the
+    /// `struct_*` methods on [`Handler`].
+    #[track_caller]
+    pub(crate) fn new_almost_fatal(
+        handler: &'a Handler,
+        message: impl Into<DiagnosticMessage>,
+    ) -> Self {
+        let diagnostic = Diagnostic::new_with_code(Level::Fatal, None, message);
+        Self::new_diagnostic_almost_fatal(handler, diagnostic)
+    }
+
+    /// Creates a new `DiagnosticBuilder` with an already constructed
+    /// diagnostic.
+    pub(crate) fn new_diagnostic_almost_fatal(
+        handler: &'a Handler,
+        diagnostic: Diagnostic,
+    ) -> Self {
+        debug!("Created new diagnostic");
+        Self {
+            inner: DiagnosticBuilderInner {
+                state: DiagnosticBuilderState::Emittable(handler),
+                diagnostic: Box::new(diagnostic),
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl EmissionGuarantee for rustc_span::fatal_error::FatalError {
+    fn diagnostic_builder_emit_producing_guarantee(db: &mut DiagnosticBuilder<'_, Self>) -> Self {
+        match db.inner.state {
+            // First `.emit()` call, the `&Handler` is still available.
+            DiagnosticBuilderState::Emittable(handler) => {
+                db.inner.state = DiagnosticBuilderState::AlreadyEmittedOrDuringCancellation;
+
+                handler.emit_diagnostic(&mut db.inner.diagnostic);
+            }
+            // `.emit()` was previously called, disallowed from repeating it.
+            DiagnosticBuilderState::AlreadyEmittedOrDuringCancellation => {}
+        }
+        // Then fatally error..
+        rustc_span::fatal_error::FatalError
+    }
+
+    fn make_diagnostic_builder(
+        handler: &Handler,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, Self> {
+        DiagnosticBuilder::new_almost_fatal(handler, msg)
     }
 }
 
@@ -482,9 +587,9 @@ impl<'a, G: EmissionGuarantee> DiagnosticBuilder<'a, G> {
     /// In the meantime, though, callsites are required to deal with the "bug"
     /// locally in whichever way makes the most sense.
     #[track_caller]
-    pub fn delay_as_bug(&mut self) {
+    pub fn delay_as_bug(&mut self) -> G {
         self.downgrade_to_delayed_bug();
-        self.emit();
+        self.emit()
     }
 
     forward!(
@@ -564,7 +669,6 @@ impl<'a, G: EmissionGuarantee> DiagnosticBuilder<'a, G> {
         sp: impl Into<MultiSpan>,
         msg: impl Into<SubdiagnosticMessage>,
     ) -> &mut Self);
-    forward!(pub fn help_use_latest_edition(&mut self,) -> &mut Self);
     forward!(pub fn set_is_lint(&mut self,) -> &mut Self);
 
     forward!(pub fn disable_suggestions(&mut self,) -> &mut Self);
@@ -599,13 +703,13 @@ impl<'a, G: EmissionGuarantee> DiagnosticBuilder<'a, G> {
         &mut self,
         sp: Span,
         msg: impl Into<SubdiagnosticMessage>,
-        suggestions: impl Iterator<Item = String>,
+        suggestions: impl IntoIterator<Item = String>,
         applicability: Applicability,
     ) -> &mut Self);
     forward!(pub fn multipart_suggestions(
         &mut self,
         msg: impl Into<SubdiagnosticMessage>,
-        suggestions: impl Iterator<Item = Vec<(Span, String)>>,
+        suggestions: impl IntoIterator<Item = Vec<(Span, String)>>,
         applicability: Applicability,
     ) -> &mut Self);
     forward!(pub fn span_suggestion_short(

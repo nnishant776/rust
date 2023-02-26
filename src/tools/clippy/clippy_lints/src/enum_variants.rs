@@ -250,7 +250,7 @@ impl LateLintPass<'_> for EnumVariantNames {
         let item_name = item.ident.name.as_str();
         let item_camel = to_camel_case(item_name);
         if !item.span.from_expansion() && is_present_in_source(cx, item.span) {
-            if let Some(&(ref mod_name, ref mod_camel)) = self.modules.last() {
+            if let Some((mod_name, mod_camel)) = self.modules.last() {
                 // constants don't have surrounding modules
                 if !mod_camel.is_empty() {
                     if mod_name == &item.ident.name {
@@ -277,7 +277,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                                 Some(c) if is_word_beginning(c) => span_lint(
                                     cx,
                                     MODULE_NAME_REPETITIONS,
-                                    item.span,
+                                    item.ident.span,
                                     "item name starts with its containing module's name",
                                 ),
                                 _ => (),
@@ -287,7 +287,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                             span_lint(
                                 cx,
                                 MODULE_NAME_REPETITIONS,
-                                item.span,
+                                item.ident.span,
                                 "item name ends with its containing module's name",
                             );
                         }

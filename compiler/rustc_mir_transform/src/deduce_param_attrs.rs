@@ -110,15 +110,16 @@ impl<'tcx> Visitor<'tcx> for DeduceReadOnly {
 
         if let TerminatorKind::Call { ref args, .. } = terminator.kind {
             for arg in args {
-                if let Operand::Move(_) = *arg {
-                    // ArgumentChecker panics if a direct move of an argument from a caller to a
-                    // callee was detected.
-                    //
-                    // If, in the future, MIR optimizations cause arguments to be moved directly
-                    // from callers to callees, change the panic to instead add the argument in
-                    // question to `mutating_uses`.
-                    ArgumentChecker::new(self.mutable_args.domain_size())
-                        .visit_operand(arg, location)
+                if let Operand::Move(place) = *arg {
+                    let local = place.local;
+                    if place.is_indirect()
+                        || local == RETURN_PLACE
+                        || local.index() > self.mutable_args.domain_size()
+                    {
+                        continue;
+                    }
+
+                    self.mutable_args.insert(local.index() - 1);
                 }
             }
         };
@@ -127,37 +128,8 @@ impl<'tcx> Visitor<'tcx> for DeduceReadOnly {
     }
 }
 
-/// A visitor that simply panics if a direct move of an argument from a caller to a callee was
-/// detected.
-struct ArgumentChecker {
-    /// The number of arguments to the calling function.
-    arg_count: usize,
-}
-
-impl ArgumentChecker {
-    /// Creates a new ArgumentChecker.
-    fn new(arg_count: usize) -> Self {
-        Self { arg_count }
-    }
-}
-
-impl<'tcx> Visitor<'tcx> for ArgumentChecker {
-    fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
-        // Check to make sure that, if this local is an argument, we didn't move directly from it.
-        if matches!(context, PlaceContext::NonMutatingUse(NonMutatingUseContext::Move))
-            && local != RETURN_PLACE
-            && local.index() <= self.arg_count
-        {
-            // If, in the future, MIR optimizations cause arguments to be moved directly from
-            // callers to callees, change this panic to instead add the argument in question to
-            // `mutating_uses`.
-            panic!("Detected a direct move from a caller's argument to a callee's argument!")
-        }
-    }
-}
-
 /// Returns true if values of a given type will never be passed indirectly, regardless of ABI.
-fn type_will_always_be_passed_directly<'tcx>(ty: Ty<'tcx>) -> bool {
+fn type_will_always_be_passed_directly(ty: Ty<'_>) -> bool {
     matches!(
         ty.kind(),
         ty::Bool
@@ -191,7 +163,7 @@ pub fn deduced_param_attrs<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx [Ded
 
     // Codegen won't use this information for anything if all the function parameters are passed
     // directly. Detect that and bail, for compilation speed.
-    let fn_ty = tcx.type_of(def_id);
+    let fn_ty = tcx.type_of(def_id).subst_identity();
     if matches!(fn_ty.kind(), ty::FnDef(..)) {
         if fn_ty
             .fn_sig(tcx)

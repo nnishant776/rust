@@ -1,11 +1,12 @@
-use rustc_ast as ast;
+use rustc_ast::{self as ast, NodeId};
 use rustc_feature::is_builtin_attr_name;
 use rustc_hir::def::{DefKind, Namespace, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_hir::PrimTy;
 use rustc_middle::bug;
 use rustc_middle::ty;
+use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
+use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::edition::Edition;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::{Span, DUMMY_SP};
@@ -27,7 +28,7 @@ use RibKind::*;
 
 type Visibility = ty::Visibility<LocalDefId>;
 
-impl<'a> Resolver<'a> {
+impl<'a, 'tcx> Resolver<'a, 'tcx> {
     /// A generic scope visitor.
     /// Visits scopes in order to resolve some identifier in them or perform other actions.
     /// If the callback returns `Some` result, we stop visiting scopes and return it.
@@ -84,7 +85,7 @@ impl<'a> Resolver<'a> {
         // 4c. Standard library prelude (de-facto closed, controlled).
         // 6. Language prelude: builtin attributes (closed, controlled).
 
-        let rust_2015 = ctxt.edition() == Edition::Edition2015;
+        let rust_2015 = ctxt.edition().is_rust_2015();
         let (ns, macro_kind, is_absolute_path) = match scope_set {
             ScopeSet::All(ns, _) => (ns, None, false),
             ScopeSet::AbsolutePath(ns) => (ns, None, true),
@@ -99,7 +100,7 @@ impl<'a> Resolver<'a> {
         };
         let mut scope = match ns {
             _ if is_absolute_path => Scope::CrateRoot,
-            TypeNS | ValueNS => Scope::Module(module),
+            TypeNS | ValueNS => Scope::Module(module, None),
             MacroNS => Scope::DeriveHelpers(parent_scope.expansion),
         };
         let mut ctxt = ctxt.normalize_to_macros_2_0();
@@ -163,7 +164,7 @@ impl<'a> Resolver<'a> {
                     MacroRulesScope::Invocation(invoc_id) => {
                         Scope::MacroRules(self.invocation_parent_scopes[&invoc_id].macro_rules)
                     }
-                    MacroRulesScope::Empty => Scope::Module(module),
+                    MacroRulesScope::Empty => Scope::Module(module, None),
                 },
                 Scope::CrateRoot => match ns {
                     TypeNS => {
@@ -172,10 +173,16 @@ impl<'a> Resolver<'a> {
                     }
                     ValueNS | MacroNS => break,
                 },
-                Scope::Module(module) => {
+                Scope::Module(module, prev_lint_id) => {
                     use_prelude = !module.no_implicit_prelude;
-                    match self.hygienic_lexical_parent(module, &mut ctxt) {
-                        Some(parent_module) => Scope::Module(parent_module),
+                    let derive_fallback_lint_id = match scope_set {
+                        ScopeSet::Late(.., lint_id) => lint_id,
+                        _ => None,
+                    };
+                    match self.hygienic_lexical_parent(module, &mut ctxt, derive_fallback_lint_id) {
+                        Some((parent_module, lint_id)) => {
+                            Scope::Module(parent_module, lint_id.or(prev_lint_id))
+                        }
                         None => {
                             ctxt.adjust(ExpnId::root());
                             match ns {
@@ -207,13 +214,45 @@ impl<'a> Resolver<'a> {
         &mut self,
         module: Module<'a>,
         ctxt: &mut SyntaxContext,
-    ) -> Option<Module<'a>> {
+        derive_fallback_lint_id: Option<NodeId>,
+    ) -> Option<(Module<'a>, Option<NodeId>)> {
         if !module.expansion.outer_expn_is_descendant_of(*ctxt) {
-            return Some(self.expn_def_scope(ctxt.remove_mark()));
+            return Some((self.expn_def_scope(ctxt.remove_mark()), None));
         }
 
         if let ModuleKind::Block = module.kind {
-            return Some(module.parent.unwrap().nearest_item_scope());
+            return Some((module.parent.unwrap().nearest_item_scope(), None));
+        }
+
+        // We need to support the next case under a deprecation warning
+        // ```
+        // struct MyStruct;
+        // ---- begin: this comes from a proc macro derive
+        // mod implementation_details {
+        //     // Note that `MyStruct` is not in scope here.
+        //     impl SomeTrait for MyStruct { ... }
+        // }
+        // ---- end
+        // ```
+        // So we have to fall back to the module's parent during lexical resolution in this case.
+        if derive_fallback_lint_id.is_some() {
+            if let Some(parent) = module.parent {
+                // Inner module is inside the macro, parent module is outside of the macro.
+                if module.expansion != parent.expansion
+                    && module.expansion.is_descendant_of(parent.expansion)
+                {
+                    // The macro is a proc macro derive
+                    if let Some(def_id) = module.expansion.expn_data().macro_def_id {
+                        let ext = self.get_macro_by_def_id(def_id).ext;
+                        if ext.builtin_name.is_none()
+                            && ext.macro_kind() == MacroKind::Derive
+                            && parent.expansion.outer_expn_is_descendant_of(*ctxt)
+                        {
+                            return Some((parent, derive_fallback_lint_id));
+                        }
+                    }
+                }
+            }
         }
 
         None
@@ -470,7 +509,7 @@ impl<'a> Resolver<'a> {
                             Err((Determinacy::Determined, _)) => Err(Determinacy::Determined),
                         }
                     }
-                    Scope::Module(module) => {
+                    Scope::Module(module, derive_fallback_lint_id) => {
                         let adjusted_parent_scope = &ParentScope { module, ..*parent_scope };
                         let binding = this.resolve_ident_in_module_unadjusted_ext(
                             ModuleOrUniformRoot::Module(module),
@@ -483,6 +522,21 @@ impl<'a> Resolver<'a> {
                         );
                         match binding {
                             Ok(binding) => {
+                                if let Some(lint_id) = derive_fallback_lint_id {
+                                    this.lint_buffer.buffer_lint_with_diagnostic(
+                                        PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+                                        lint_id,
+                                        orig_ident.span,
+                                        &format!(
+                                            "cannot find {} `{}` in this scope",
+                                            ns.descr(),
+                                            ident
+                                        ),
+                                        BuiltinLintDiagnostics::ProcMacroDeriveResolutionFallback(
+                                            orig_ident.span,
+                                        ),
+                                    );
+                                }
                                 let misc_flags = if ptr::eq(module, this.graph_root) {
                                     Flags::MISC_SUGGEST_CRATE
                                 } else if module.is_normal() {
@@ -820,13 +874,12 @@ impl<'a> Resolver<'a> {
             // binding if it exists. What we really want here is having two separate scopes in
             // a module - one for non-globs and one for globs, but until that's done use this
             // hack to avoid inconsistent resolution ICEs during import validation.
-            let binding = [resolution.binding, resolution.shadowed_glob]
-                .into_iter()
-                .filter_map(|binding| match (binding, ignore_binding) {
+            let binding = [resolution.binding, resolution.shadowed_glob].into_iter().find_map(
+                |binding| match (binding, ignore_binding) {
                     (Some(binding), Some(ignored)) if ptr::eq(binding, ignored) => None,
                     _ => binding,
-                })
-                .next();
+                },
+            );
             let Some(binding) = binding else {
                 return Err((Determined, Weak::No));
             };
@@ -1126,7 +1179,7 @@ impl<'a> Resolver<'a> {
                         }
 
                         ConstantItemRibKind(trivial, _) => {
-                            let features = self.session.features_untracked();
+                            let features = self.tcx.sess.features_untracked();
                             // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
                             if !(trivial == ConstantHasGenerics::Yes
                                 || features.generic_const_exprs)
@@ -1155,7 +1208,7 @@ impl<'a> Resolver<'a> {
                                                 is_type: true,
                                             },
                                         );
-                                        self.session.delay_span_bug(span, CG_BUG_STR);
+                                        self.tcx.sess.delay_span_bug(span, CG_BUG_STR);
                                     }
 
                                     return Res::Err;
@@ -1202,7 +1255,7 @@ impl<'a> Resolver<'a> {
                         | ForwardGenericParamBanRibKind => continue,
 
                         ConstantItemRibKind(trivial, _) => {
-                            let features = self.session.features_untracked();
+                            let features = self.tcx.sess.features_untracked();
                             // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
                             if !(trivial == ConstantHasGenerics::Yes
                                 || features.generic_const_exprs)
@@ -1215,7 +1268,7 @@ impl<'a> Resolver<'a> {
                                             is_type: false,
                                         },
                                     );
-                                    self.session.delay_span_bug(span, CG_BUG_STR);
+                                    self.tcx.sess.delay_span_bug(span, CG_BUG_STR);
                                 }
 
                                 return Res::Err;
@@ -1344,7 +1397,10 @@ impl<'a> Resolver<'a> {
                         module = Some(ModuleOrUniformRoot::ExternPrelude);
                         continue;
                     }
-                    if name == kw::PathRoot && ident.span.rust_2015() && self.session.rust_2018() {
+                    if name == kw::PathRoot
+                        && ident.span.is_rust_2015()
+                        && self.tcx.sess.rust_2018()
+                    {
                         // `::a::b` from 2015 macro on 2018 global edition
                         module = Some(ModuleOrUniformRoot::CrateRootAndExternPrelude);
                         continue;
@@ -1440,7 +1496,8 @@ impl<'a> Resolver<'a> {
                         record_segment_res(self, res);
                     } else if res == Res::ToolMod && i + 1 != path.len() {
                         if binding.is_import() {
-                            self.session
+                            self.tcx
+                                .sess
                                 .struct_span_err(
                                     ident.span,
                                     "cannot use a tool module through an import",

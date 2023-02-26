@@ -79,7 +79,7 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::subst::GenericArgKin
             // WARNING: We dedup cache the `HashStable` results for `List`
             // while ignoring types and freely transmute
             // between `List<Ty<'tcx>>` and `List<GenericArg<'tcx>>`.
-            // See `fn intern_type_list` for more details.
+            // See `fn mk_type_list` for more details.
             //
             // We therefore hash types without adding a hash for their discriminant.
             //
@@ -109,19 +109,6 @@ impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::AllocId {
             let tcx = tcx.expect("can't hash AllocIds during hir lowering");
             tcx.try_get_global_alloc(*self).hash_stable(hcx, hasher);
         });
-    }
-}
-
-// `Relocations` with default type parameters is a sorted map.
-impl<'a, Prov> HashStable<StableHashingContext<'a>> for mir::interpret::ProvenanceMap<Prov>
-where
-    Prov: HashStable<StableHashingContext<'a>>,
-{
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        self.len().hash_stable(hcx, hasher);
-        for reloc in self.iter() {
-            reloc.hash_stable(hcx, hasher);
-        }
     }
 }
 

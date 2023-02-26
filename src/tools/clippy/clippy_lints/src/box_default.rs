@@ -8,7 +8,7 @@ use rustc_hir::{
     Block, Expr, ExprKind, Local, Node, QPath, TyKind,
 };
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
+use rustc_middle::{lint::in_external_macro, ty::print::with_forced_trimmed_paths};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::sym;
 
@@ -30,7 +30,7 @@ declare_clippy_lint! {
     /// ```rust
     /// let x: Box<String> = Box::default();
     /// ```
-    #[clippy::version = "1.65.0"]
+    #[clippy::version = "1.66.0"]
     pub BOX_DEFAULT,
     perf,
     "Using Box::new(T::default()) instead of Box::default()"
@@ -59,7 +59,7 @@ impl LateLintPass<'_> for BoxDefault {
                 if is_plain_default(arg_path) || given_type(cx, expr) {
                     "Box::default()".into()
                 } else {
-                    format!("Box::<{arg_ty}>::default()")
+                    with_forced_trimmed_paths!(format!("Box::<{arg_ty}>::default()"))
                 },
                 Applicability::MachineApplicable
             );

@@ -66,14 +66,15 @@ impl Command {
         //
         // Note that as soon as we're done with the fork there's no need to hold
         // a lock any more because the parent won't do anything and the child is
-        // in its own process. Thus the parent drops the lock guard while the child
-        // forgets it to avoid unlocking it on a new thread, which would be invalid.
+        // in its own process. Thus the parent drops the lock guard immediately.
+        // The child calls `mem::forget` to leak the lock, which is crucial because
+        // releasing a lock is not async-signal-safe.
         let env_lock = sys::os::env_read_lock();
         let (pid, pidfd) = unsafe { self.do_fork()? };
 
         if pid == 0 {
             crate::panic::always_abort();
-            mem::forget(env_lock);
+            mem::forget(env_lock); // avoid non-async-signal-safe unlocking
             drop(input);
             let Err(err) = unsafe { self.do_exec(theirs, envp.as_ref()) };
             let errno = err.raw_os_error().unwrap_or(libc::EINVAL) as u32;
@@ -130,6 +131,11 @@ impl Command {
                 }
             }
         }
+    }
+
+    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        let (proc, pipes) = self.spawn(Stdio::MakePipe, false)?;
+        crate::sys_common::process::wait_with_output(proc, pipes)
     }
 
     // Attempts to fork the process. If successful, returns Ok((0, -1))
@@ -660,11 +666,11 @@ impl ExitStatus {
     }
 
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        // This assumes that WIFEXITED(status) && WEXITSTATUS==0 corresponds to status==0.  This is
+        // This assumes that WIFEXITED(status) && WEXITSTATUS==0 corresponds to status==0. This is
         // true on all actual versions of Unix, is widely assumed, and is specified in SuS
-        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html .  If it is not
+        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html. If it is not
         // true for a platform pretending to be Unix, the tests (our doctests, and also
-        // procsss_unix/tests.rs) will spot it.  `ExitStatusError::code` assumes this too.
+        // procsss_unix/tests.rs) will spot it. `ExitStatusError::code` assumes this too.
         match NonZero_c_int::try_from(self.0) {
             /* was nonzero */ Ok(failure) => Err(ExitStatusError(failure)),
             /* was zero, couldn't convert */ Err(_) => Ok(()),
@@ -740,6 +746,8 @@ fn signal_string(signal: i32) -> &'static str {
         libc::SIGWINCH => " (SIGWINCH)",
         #[cfg(not(target_os = "haiku"))]
         libc::SIGIO => " (SIGIO)",
+        #[cfg(target_os = "haiku")]
+        libc::SIGPOLL => " (SIGPOLL)",
         libc::SIGSYS => " (SIGSYS)",
         // For information on Linux signals, run `man 7 signal`
         #[cfg(all(

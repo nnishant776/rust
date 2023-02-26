@@ -87,6 +87,12 @@ export function shuffleCrateGraph(ctx: CtxInit): Cmd {
     };
 }
 
+export function triggerParameterHints(_: CtxInit): Cmd {
+    return async () => {
+        await vscode.commands.executeCommand("editor.action.triggerParameterHints");
+    };
+}
+
 export function matchingBrace(ctx: CtxInit): Cmd {
     return async () => {
         const editor = ctx.activeRustEditor;
@@ -130,11 +136,11 @@ export function joinLines(ctx: CtxInit): Cmd {
 }
 
 export function moveItemUp(ctx: CtxInit): Cmd {
-    return moveItem(ctx, ra.Direction.Up);
+    return moveItem(ctx, "Up");
 }
 
 export function moveItemDown(ctx: CtxInit): Cmd {
-    return moveItem(ctx, ra.Direction.Down);
+    return moveItem(ctx, "Down");
 }
 
 export function moveItem(ctx: CtxInit, direction: ra.Direction): Cmd {
@@ -788,8 +794,23 @@ export function openDocs(ctx: CtxInit): Cmd {
 
 export function cancelFlycheck(ctx: CtxInit): Cmd {
     return async () => {
+        await ctx.client.sendNotification(ra.cancelFlycheck);
+    };
+}
+
+export function clearFlycheck(ctx: CtxInit): Cmd {
+    return async () => {
+        await ctx.client.sendNotification(ra.clearFlycheck);
+    };
+}
+
+export function runFlycheck(ctx: CtxInit): Cmd {
+    return async () => {
+        const editor = ctx.activeRustEditor;
         const client = ctx.client;
-        await client.sendRequest(ra.cancelFlycheck);
+        const params = editor ? { uri: editor.document.uri.toString() } : null;
+
+        await client.sendNotification(ra.runFlycheck, { textDocument: params });
     };
 }
 
@@ -797,12 +818,12 @@ export function resolveCodeAction(ctx: CtxInit): Cmd {
     return async (params: lc.CodeAction) => {
         const client = ctx.client;
         params.command = undefined;
-        const item = await client?.sendRequest(lc.CodeActionResolveRequest.type, params);
+        const item = await client.sendRequest(lc.CodeActionResolveRequest.type, params);
         if (!item?.edit) {
             return;
         }
         const itemEdit = item.edit;
-        const edit = await client?.protocol2CodeConverter.asWorkspaceEdit(itemEdit);
+        const edit = await client.protocol2CodeConverter.asWorkspaceEdit(itemEdit);
         // filter out all text edits and recreate the WorkspaceEdit without them so we can apply
         // snippet edits on our own
         const lcFileSystemEdit = {

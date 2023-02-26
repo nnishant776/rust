@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use syntax::{ast, SmolStr, SyntaxKind};
+use syntax::{ast, utils::is_raw_identifier, SmolStr};
 
 /// `Name` is a wrapper around string, which is used in hir for both references
 /// and declarations. In theory, names should also carry hygiene info, but we are
@@ -33,11 +33,6 @@ impl fmt::Display for Name {
     }
 }
 
-fn is_raw_identifier(name: &str) -> bool {
-    let is_keyword = SyntaxKind::from_keyword(name).is_some();
-    is_keyword && !matches!(name, "self" | "crate" | "super" | "Self")
-}
-
 impl<'a> fmt::Display for UnescapedName<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 .0 {
@@ -62,7 +57,7 @@ impl<'a> UnescapedName<'a> {
                     it.clone()
                 }
             }
-            Repr::TupleField(it) => SmolStr::new(&it.to_string()),
+            Repr::TupleField(it) => SmolStr::new(it.to_string()),
         }
     }
 }
@@ -133,13 +128,21 @@ impl Name {
         }
     }
 
+    /// Returns the text this name represents if it isn't a tuple field.
+    pub fn as_str(&self) -> Option<&str> {
+        match &self.0 {
+            Repr::Text(it) => Some(it),
+            _ => None,
+        }
+    }
+
     /// Returns the textual representation of this name as a [`SmolStr`].
     /// Prefer using this over [`ToString::to_string`] if possible as this conversion is cheaper in
     /// the general case.
     pub fn to_smol_str(&self) -> SmolStr {
         match &self.0 {
             Repr::Text(it) => it.clone(),
-            Repr::TupleField(it) => SmolStr::new(&it.to_string()),
+            Repr::TupleField(it) => SmolStr::new(it.to_string()),
         }
     }
 
@@ -183,7 +186,7 @@ impl AsName for ast::NameOrNameRef {
     }
 }
 
-impl AsName for tt::Ident {
+impl<Span> AsName for tt::Ident<Span> {
     fn as_name(&self) -> Name {
         Name::resolve(&self.text)
     }
@@ -338,45 +341,8 @@ pub mod known {
         test_case,
         recursion_limit,
         feature,
-        // Safe intrinsics
-        abort,
-        add_with_overflow,
-        black_box,
-        bitreverse,
-        bswap,
-        caller_location,
-        ctlz,
-        ctpop,
-        cttz,
-        discriminant_value,
-        forget,
-        likely,
-        maxnumf32,
-        maxnumf64,
-        min_align_of_val,
-        min_align_of,
-        minnumf32,
-        minnumf64,
-        mul_with_overflow,
-        needs_drop,
-        ptr_guaranteed_eq,
-        ptr_guaranteed_ne,
-        rotate_left,
-        rotate_right,
-        rustc_peek,
-        saturating_add,
-        saturating_sub,
-        size_of_val,
-        size_of,
-        sub_with_overflow,
-        type_id,
-        type_name,
-        unlikely,
-        variant_count,
-        wrapping_add,
-        wrapping_mul,
-        wrapping_sub,
         // known methods of lang items
+        call_once,
         eq,
         ne,
         ge,
@@ -419,6 +385,8 @@ pub mod known {
         shr,
         sub_assign,
         sub,
+        unsafe_cell,
+        va_list
     );
 
     // self/Self cannot be used as an identifier

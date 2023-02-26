@@ -88,7 +88,7 @@ pub fn feature_err<'a>(
     sess: &'a ParseSess,
     feature: Symbol,
     span: impl Into<MultiSpan>,
-    explain: &str,
+    explain: impl Into<DiagnosticMessage>,
 ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
     feature_err_issue(sess, feature, span, GateIssue::Language, explain)
 }
@@ -103,7 +103,7 @@ pub fn feature_err_issue<'a>(
     feature: Symbol,
     span: impl Into<MultiSpan>,
     issue: GateIssue,
-    explain: &str,
+    explain: impl Into<DiagnosticMessage>,
 ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
     let span = span.into();
 
@@ -114,7 +114,7 @@ pub fn feature_err_issue<'a>(
             .map(|err| err.cancel());
     }
 
-    let mut err = sess.create_err(FeatureGateError { span, explain });
+    let mut err = sess.create_err(FeatureGateError { span, explain: explain.into() });
     add_feature_diagnostics_for_issue(&mut err, sess, feature, issue);
     err
 }
@@ -122,7 +122,7 @@ pub fn feature_err_issue<'a>(
 /// Construct a future incompatibility diagnostic for a feature gate.
 ///
 /// This diagnostic is only a warning and *does not cause compilation to fail*.
-pub fn feature_warn<'a>(sess: &'a ParseSess, feature: Symbol, span: Span, explain: &str) {
+pub fn feature_warn(sess: &ParseSess, feature: Symbol, span: Span, explain: &str) {
     feature_warn_issue(sess, feature, span, GateIssue::Language, explain);
 }
 
@@ -134,8 +134,8 @@ pub fn feature_warn<'a>(sess: &'a ParseSess, feature: Symbol, span: Span, explai
 /// Almost always, you want to use this for a language feature. If so, prefer `feature_warn`.
 #[allow(rustc::diagnostic_outside_of_impl)]
 #[allow(rustc::untranslatable_diagnostic)]
-pub fn feature_warn_issue<'a>(
-    sess: &'a ParseSess,
+pub fn feature_warn_issue(
+    sess: &ParseSess,
     feature: Symbol,
     span: Span,
     issue: GateIssue,
@@ -160,7 +160,7 @@ pub fn feature_warn_issue<'a>(
 }
 
 /// Adds the diagnostics for a feature to an existing error.
-pub fn add_feature_diagnostics<'a>(err: &mut Diagnostic, sess: &'a ParseSess, feature: Symbol) {
+pub fn add_feature_diagnostics(err: &mut Diagnostic, sess: &ParseSess, feature: Symbol) {
     add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language);
 }
 
@@ -169,9 +169,9 @@ pub fn add_feature_diagnostics<'a>(err: &mut Diagnostic, sess: &'a ParseSess, fe
 /// This variant allows you to control whether it is a library or language feature.
 /// Almost always, you want to use this for a language feature. If so, prefer
 /// `add_feature_diagnostics`.
-pub fn add_feature_diagnostics_for_issue<'a>(
+pub fn add_feature_diagnostics_for_issue(
     err: &mut Diagnostic,
-    sess: &'a ParseSess,
+    sess: &ParseSess,
     feature: Symbol,
     issue: GateIssue,
 ) {
@@ -226,8 +226,8 @@ pub struct ParseSess {
 
 impl ParseSess {
     /// Used for testing.
-    pub fn new(file_path_mapping: FilePathMapping) -> Self {
-        let fallback_bundle = fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
+    pub fn new(locale_resources: Vec<&'static str>, file_path_mapping: FilePathMapping) -> Self {
+        let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
         let sm = Lrc::new(SourceMap::new(file_path_mapping));
         let handler = Handler::with_tty_emitter(
             ColorConfig::Auto,
@@ -265,7 +265,7 @@ impl ParseSess {
     }
 
     pub fn with_silent_emitter(fatal_note: Option<String>) -> Self {
-        let fallback_bundle = fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
+        let fallback_bundle = fallback_fluent_bundle(Vec::new(), false);
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let fatal_handler =
             Handler::with_tty_emitter(ColorConfig::Auto, false, None, None, None, fallback_bundle);

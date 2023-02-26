@@ -4,9 +4,9 @@ use crate::{
     SubdiagnosticMessage, Substitution, SubstitutionPart, SuggestionStyle,
 };
 use rustc_data_structures::fx::FxHashMap;
+use rustc_error_messages::fluent_value_from_str_list_sep_by_and;
 use rustc_error_messages::FluentValue;
 use rustc_lint_defs::{Applicability, LintExpectationId};
-use rustc_span::edition::LATEST_STABLE_EDITION;
 use rustc_span::symbol::Symbol;
 use rustc_span::{Span, DUMMY_SP};
 use std::borrow::Cow;
@@ -34,6 +34,7 @@ pub type DiagnosticArgName<'source> = Cow<'source, str>;
 pub enum DiagnosticArgValue<'source> {
     Str(Cow<'source, str>),
     Number(usize),
+    StrListSepByAnd(Vec<Cow<'source, str>>),
 }
 
 /// Converts a value of a type into a `DiagnosticArg` (typically a field of an `IntoDiagnostic`
@@ -44,19 +45,31 @@ pub trait IntoDiagnosticArg {
     fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static>;
 }
 
+impl<'source> IntoDiagnosticArg for DiagnosticArgValue<'source> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        match self {
+            DiagnosticArgValue::Str(s) => DiagnosticArgValue::Str(Cow::Owned(s.into_owned())),
+            DiagnosticArgValue::Number(n) => DiagnosticArgValue::Number(n),
+            DiagnosticArgValue::StrListSepByAnd(l) => DiagnosticArgValue::StrListSepByAnd(
+                l.into_iter().map(|s| Cow::Owned(s.into_owned())).collect(),
+            ),
+        }
+    }
+}
+
 impl<'source> Into<FluentValue<'source>> for DiagnosticArgValue<'source> {
     fn into(self) -> FluentValue<'source> {
         match self {
             DiagnosticArgValue::Str(s) => From::from(s),
             DiagnosticArgValue::Number(n) => From::from(n),
+            DiagnosticArgValue::StrListSepByAnd(l) => fluent_value_from_str_list_sep_by_and(l),
         }
     }
 }
 
 /// Trait implemented by error types. This should not be implemented manually. Instead, use
 /// `#[derive(Subdiagnostic)]` -- see [rustc_macros::Subdiagnostic].
-#[cfg_attr(bootstrap, rustc_diagnostic_item = "AddSubdiagnostic")]
-#[cfg_attr(not(bootstrap), rustc_diagnostic_item = "AddToDiagnostic")]
+#[rustc_diagnostic_item = "AddToDiagnostic"]
 pub trait AddToDiagnostic
 where
     Self: Sized,
@@ -100,9 +113,9 @@ pub struct Diagnostic {
     pub suggestions: Result<Vec<CodeSuggestion>, SuggestionsDisabled>,
     args: FxHashMap<DiagnosticArgName<'static>, DiagnosticArgValue<'static>>,
 
-    /// This is not used for highlighting or rendering any error message.  Rather, it can be used
-    /// as a sort key to sort a buffer of diagnostics.  By default, it is the primary span of
-    /// `span` if there is one.  Otherwise, it is `DUMMY_SP`.
+    /// This is not used for highlighting or rendering any error message. Rather, it can be used
+    /// as a sort key to sort a buffer of diagnostics. By default, it is the primary span of
+    /// `span` if there is one. Otherwise, it is `DUMMY_SP`.
     pub sort_span: Span,
 
     /// If diagnostic is from Lint, custom hash function ignores notes
@@ -205,6 +218,22 @@ impl Diagnostic {
     }
 
     #[track_caller]
+    pub fn new_with_messages(level: Level, messages: Vec<(DiagnosticMessage, Style)>) -> Self {
+        Diagnostic {
+            level,
+            message: messages,
+            code: None,
+            span: MultiSpan::new(),
+            children: vec![],
+            suggestions: Ok(vec![]),
+            args: Default::default(),
+            sort_span: DUMMY_SP,
+            is_lint: false,
+            emitted_at: DiagnosticLocation::caller(),
+        }
+    }
+
+    #[track_caller]
     pub fn new_with_code<M: Into<DiagnosticMessage>>(
         level: Level,
         code: Option<DiagnosticId>,
@@ -262,7 +291,7 @@ impl Diagnostic {
             let lint_index = expectation_id.get_lint_index();
             expectation_id.set_lint_index(None);
             let mut stable_id = unstable_to_stable
-                .get(&expectation_id)
+                .get(expectation_id)
                 .expect("each unstable `LintExpectationId` must have a matching stable id")
                 .normalize();
 
@@ -335,12 +364,16 @@ impl Diagnostic {
         self
     }
 
-    pub fn replace_span_with(&mut self, after: Span) -> &mut Self {
+    pub fn replace_span_with(&mut self, after: Span, keep_label: bool) -> &mut Self {
         let before = self.span.clone();
         self.set_span(after);
         for span_label in before.span_labels() {
             if let Some(label) = span_label.label {
-                self.span.push_span_label(after, label);
+                if span_label.is_primary && keep_label {
+                    self.span.push_span_label(after, label);
+                } else {
+                    self.span.push_span_label(span_label.span, label);
+                }
             }
         }
         self
@@ -521,18 +554,6 @@ impl Diagnostic {
         self
     }
 
-    /// Help the user upgrade to the latest edition.
-    /// This is factored out to make sure it does the right thing with `Cargo.toml`.
-    pub fn help_use_latest_edition(&mut self) -> &mut Self {
-        if std::env::var_os("CARGO").is_some() {
-            self.help(&format!("set `edition = \"{}\"` in `Cargo.toml`", LATEST_STABLE_EDITION));
-        } else {
-            self.help(&format!("pass `--edition {}` to `rustc`", LATEST_STABLE_EDITION));
-        }
-        self.note("for more on editions, read https://doc.rust-lang.org/edition-guide");
-        self
-    }
-
     /// Disallow attaching suggestions this diagnostic.
     /// Any suggestions attached e.g. with the `span_suggestion_*` methods
     /// (before and after the call to `disable_suggestions`) will be ignored.
@@ -595,19 +616,27 @@ impl Diagnostic {
         applicability: Applicability,
         style: SuggestionStyle,
     ) -> &mut Self {
-        assert!(!suggestion.is_empty());
-        debug_assert!(
-            !(suggestion.iter().any(|(sp, text)| sp.is_empty() && text.is_empty())),
-            "Span must not be empty and have no suggestion"
+        let mut parts = suggestion
+            .into_iter()
+            .map(|(span, snippet)| SubstitutionPart { snippet, span })
+            .collect::<Vec<_>>();
+
+        parts.sort_unstable_by_key(|part| part.span);
+
+        assert!(!parts.is_empty());
+        debug_assert_eq!(
+            parts.iter().find(|part| part.span.is_empty() && part.snippet.is_empty()),
+            None,
+            "Span must not be empty and have no suggestion",
+        );
+        debug_assert_eq!(
+            parts.array_windows().find(|[a, b]| a.span.overlaps(b.span)),
+            None,
+            "suggestion must not have overlapping parts",
         );
 
         self.push_suggestion(CodeSuggestion {
-            substitutions: vec![Substitution {
-                parts: suggestion
-                    .into_iter()
-                    .map(|(span, snippet)| SubstitutionPart { snippet, span })
-                    .collect(),
-            }],
+            substitutions: vec![Substitution { parts }],
             msg: self.subdiagnostic_message_to_diagnostic_message(msg),
             style,
             applicability,
@@ -717,7 +746,7 @@ impl Diagnostic {
         &mut self,
         sp: Span,
         msg: impl Into<SubdiagnosticMessage>,
-        suggestions: impl Iterator<Item = String>,
+        suggestions: impl IntoIterator<Item = String>,
         applicability: Applicability,
     ) -> &mut Self {
         self.span_suggestions_with_style(
@@ -734,11 +763,11 @@ impl Diagnostic {
         &mut self,
         sp: Span,
         msg: impl Into<SubdiagnosticMessage>,
-        suggestions: impl Iterator<Item = String>,
+        suggestions: impl IntoIterator<Item = String>,
         applicability: Applicability,
         style: SuggestionStyle,
     ) -> &mut Self {
-        let mut suggestions: Vec<_> = suggestions.collect();
+        let mut suggestions: Vec<_> = suggestions.into_iter().collect();
         suggestions.sort();
 
         debug_assert!(
@@ -765,28 +794,37 @@ impl Diagnostic {
     pub fn multipart_suggestions(
         &mut self,
         msg: impl Into<SubdiagnosticMessage>,
-        suggestions: impl Iterator<Item = Vec<(Span, String)>>,
+        suggestions: impl IntoIterator<Item = Vec<(Span, String)>>,
         applicability: Applicability,
     ) -> &mut Self {
-        let suggestions: Vec<_> = suggestions.collect();
-        debug_assert!(
-            !(suggestions
-                .iter()
-                .flat_map(|suggs| suggs)
-                .any(|(sp, suggestion)| sp.is_empty() && suggestion.is_empty())),
-            "Span must not be empty and have no suggestion"
-        );
+        let substitutions = suggestions
+            .into_iter()
+            .map(|sugg| {
+                let mut parts = sugg
+                    .into_iter()
+                    .map(|(span, snippet)| SubstitutionPart { snippet, span })
+                    .collect::<Vec<_>>();
+
+                parts.sort_unstable_by_key(|part| part.span);
+
+                assert!(!parts.is_empty());
+                debug_assert_eq!(
+                    parts.iter().find(|part| part.span.is_empty() && part.snippet.is_empty()),
+                    None,
+                    "Span must not be empty and have no suggestion",
+                );
+                debug_assert_eq!(
+                    parts.array_windows().find(|[a, b]| a.span.overlaps(b.span)),
+                    None,
+                    "suggestion must not have overlapping parts",
+                );
+
+                Substitution { parts }
+            })
+            .collect();
 
         self.push_suggestion(CodeSuggestion {
-            substitutions: suggestions
-                .into_iter()
-                .map(|sugg| Substitution {
-                    parts: sugg
-                        .into_iter()
-                        .map(|(span, snippet)| SubstitutionPart { snippet, span })
-                        .collect(),
-                })
-                .collect(),
+            substitutions,
             msg: self.subdiagnostic_message_to_diagnostic_message(msg),
             style: SuggestionStyle::ShowCode,
             applicability,
@@ -931,6 +969,13 @@ impl Diagnostic {
         self
     }
 
+    pub fn replace_args(
+        &mut self,
+        args: FxHashMap<DiagnosticArgName<'static>, DiagnosticArgValue<'static>>,
+    ) {
+        self.args = args;
+    }
+
     pub fn styled_message(&self) -> &[(DiagnosticMessage, Style)] {
         &self.message
     }
@@ -993,6 +1038,7 @@ impl Diagnostic {
     ) -> (
         &Level,
         &[(DiagnosticMessage, Style)],
+        Vec<(&Cow<'static, str>, &DiagnosticArgValue<'static>)>,
         &Option<DiagnosticId>,
         &MultiSpan,
         &Result<Vec<CodeSuggestion>, SuggestionsDisabled>,
@@ -1001,6 +1047,7 @@ impl Diagnostic {
         (
             &self.level,
             &self.message,
+            self.args().collect(),
             &self.code,
             &self.span,
             &self.suggestions,

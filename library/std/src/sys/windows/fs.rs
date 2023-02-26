@@ -1,5 +1,6 @@
 use crate::os::windows::prelude::*;
 
+use crate::borrow::Cow;
 use crate::ffi::OsString;
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, Error, IoSlice, IoSliceMut, SeekFrom};
@@ -719,7 +720,7 @@ impl<'a> DirBuffIter<'a> {
     }
 }
 impl<'a> Iterator for DirBuffIter<'a> {
-    type Item = (&'a [u16], bool);
+    type Item = (Cow<'a, [u16]>, bool);
     fn next(&mut self) -> Option<Self::Item> {
         use crate::mem::size_of;
         let buffer = &self.buffer?[self.cursor..];
@@ -734,15 +735,19 @@ impl<'a> Iterator for DirBuffIter<'a> {
         //   `FileNameLength` bytes)
         let (name, is_directory, next_entry) = unsafe {
             let info = buffer.as_ptr().cast::<c::FILE_ID_BOTH_DIR_INFO>();
-            // Guaranteed to be aligned in documentation for
+            // While this is guaranteed to be aligned in documentation for
             // https://docs.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_both_dir_info
-            assert!(info.is_aligned());
-            let next_entry = (*info).NextEntryOffset as usize;
-            let name = crate::slice::from_raw_parts(
+            // it does not seem that reality is so kind, and assuming this
+            // caused crashes in some cases (https://github.com/rust-lang/rust/issues/104530)
+            // presumably, this can be blamed on buggy filesystem drivers, but who knows.
+            let next_entry = ptr::addr_of!((*info).NextEntryOffset).read_unaligned() as usize;
+            let length = ptr::addr_of!((*info).FileNameLength).read_unaligned() as usize;
+            let attrs = ptr::addr_of!((*info).FileAttributes).read_unaligned();
+            let name = from_maybe_unaligned(
                 ptr::addr_of!((*info).FileName).cast::<u16>(),
-                (*info).FileNameLength as usize / size_of::<u16>(),
+                length / size_of::<u16>(),
             );
-            let is_directory = ((*info).FileAttributes & c::FILE_ATTRIBUTE_DIRECTORY) != 0;
+            let is_directory = (attrs & c::FILE_ATTRIBUTE_DIRECTORY) != 0;
 
             (name, is_directory, next_entry)
         };
@@ -755,10 +760,18 @@ impl<'a> Iterator for DirBuffIter<'a> {
 
         // Skip `.` and `..` pseudo entries.
         const DOT: u16 = b'.' as u16;
-        match name {
+        match &name[..] {
             [DOT] | [DOT, DOT] => self.next(),
             _ => Some((name, is_directory)),
         }
+    }
+}
+
+unsafe fn from_maybe_unaligned<'a>(p: *const u16, len: usize) -> Cow<'a, [u16]> {
+    if p.is_aligned() {
+        Cow::Borrowed(crate::slice::from_raw_parts(p, len))
+    } else {
+        Cow::Owned((0..len).map(|i| p.add(i).read_unaligned()).collect())
     }
 }
 
@@ -1117,13 +1130,13 @@ fn remove_dir_all_iterative(f: &File, delete: fn(&File) -> io::Result<()>) -> io
             if is_directory {
                 let child_dir = open_link_no_reparse(
                     &dir,
-                    name,
+                    &name,
                     c::SYNCHRONIZE | c::DELETE | c::FILE_LIST_DIRECTORY,
                 )?;
                 dirlist.push(child_dir);
             } else {
                 for i in 1..=MAX_RETRIES {
-                    let result = open_link_no_reparse(&dir, name, c::SYNCHRONIZE | c::DELETE);
+                    let result = open_link_no_reparse(&dir, &name, c::SYNCHRONIZE | c::DELETE);
                     match result {
                         Ok(f) => delete(&f)?,
                         // Already deleted, so skip.
@@ -1253,7 +1266,12 @@ fn metadata(path: &Path, reparse: ReparsePoint) -> io::Result<FileAttr> {
     // If the fallback fails for any reason we return the original error.
     match File::open(path, &opts) {
         Ok(file) => file.file_attr(),
-        Err(e) if e.raw_os_error() == Some(c::ERROR_SHARING_VIOLATION as _) => {
+        Err(e)
+            if [Some(c::ERROR_SHARING_VIOLATION as _), Some(c::ERROR_ACCESS_DENIED as _)]
+                .contains(&e.raw_os_error()) =>
+        {
+            // `ERROR_ACCESS_DENIED` is returned when the user doesn't have permission for the resource.
+            // One such example is `System Volume Information` as default but can be created as well
             // `ERROR_SHARING_VIOLATION` will almost never be returned.
             // Usually if a file is locked you can still read some metadata.
             // However, there are special system files, such as
@@ -1380,6 +1398,8 @@ fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
         let mut data = Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
         let data_ptr = data.0.as_mut_ptr();
         let db = data_ptr.cast::<c::REPARSE_MOUNTPOINT_DATA_BUFFER>();
+        // Zero the header to ensure it's fully initialized, including reserved parameters.
+        *db = mem::zeroed();
         let buf = ptr::addr_of_mut!((*db).ReparseTarget).cast::<c::WCHAR>();
         let mut i = 0;
         // FIXME: this conversion is very hacky

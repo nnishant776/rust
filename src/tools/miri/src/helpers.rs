@@ -2,12 +2,12 @@ pub mod convert;
 
 use std::cmp;
 use std::iter;
-use std::mem;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use log::trace;
 
+use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc_middle::mir;
 use rustc_middle::ty::{
@@ -74,89 +74,141 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
 };
 
 /// Gets an instance for a path.
-fn try_resolve_did<'tcx>(tcx: TyCtxt<'tcx>, path: &[&str]) -> Option<DefId> {
-    tcx.crates(()).iter().find(|&&krate| tcx.crate_name(krate).as_str() == path[0]).and_then(
-        |krate| {
-            let krate = DefId { krate: *krate, index: CRATE_DEF_INDEX };
-            let mut items = tcx.module_children(krate);
-            let mut path_it = path.iter().skip(1).peekable();
+///
+/// A `None` namespace indicates we are looking for a module.
+fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>) -> Option<DefId> {
+    /// Yield all children of the given item, that have the given name.
+    fn find_children<'tcx: 'a, 'a>(
+        tcx: TyCtxt<'tcx>,
+        item: DefId,
+        name: &'a str,
+    ) -> impl Iterator<Item = DefId> + 'a {
+        tcx.module_children(item)
+            .iter()
+            .filter(move |item| item.ident.name.as_str() == name)
+            .map(move |item| item.res.def_id())
+    }
 
-            while let Some(segment) = path_it.next() {
-                for item in mem::take(&mut items).iter() {
-                    if item.ident.name.as_str() == *segment {
-                        if path_it.peek().is_none() {
-                            return Some(item.res.def_id());
-                        }
+    // Take apart the path: leading crate, a sequence of modules, and potentially a final item.
+    let (&crate_name, path) = path.split_first().expect("paths must have at least one segment");
+    let (modules, item) = if let Some(namespace) = namespace {
+        let (&item_name, modules) =
+            path.split_last().expect("non-module paths must have at least 2 segments");
+        (modules, Some((item_name, namespace)))
+    } else {
+        (path, None)
+    };
 
-                        items = tcx.module_children(item.res.def_id());
-                        break;
-                    }
-                }
-            }
-            None
-        },
-    )
+    // First find the crate.
+    let krate =
+        tcx.crates(()).iter().find(|&&krate| tcx.crate_name(krate).as_str() == crate_name)?;
+    let mut cur_item = DefId { krate: *krate, index: CRATE_DEF_INDEX };
+    // Then go over the modules.
+    for &segment in modules {
+        cur_item = find_children(tcx, cur_item, segment)
+            .find(|item| tcx.def_kind(item) == DefKind::Mod)?;
+    }
+    // Finally, look up the desired item in this module, if any.
+    match item {
+        Some((item_name, namespace)) =>
+            Some(
+                find_children(tcx, cur_item, item_name)
+                    .find(|item| tcx.def_kind(item).ns() == Some(namespace))?,
+            ),
+        None => Some(cur_item),
+    }
 }
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+    /// Checks if the given crate/module exists.
+    fn have_module(&self, path: &[&str]) -> bool {
+        try_resolve_did(*self.eval_context_ref().tcx, path, None).is_some()
+    }
+
     /// Gets an instance for a path; fails gracefully if the path does not exist.
-    fn try_resolve_path(&self, path: &[&str]) -> Option<ty::Instance<'tcx>> {
-        let did = try_resolve_did(self.eval_context_ref().tcx.tcx, path)?;
-        Some(ty::Instance::mono(self.eval_context_ref().tcx.tcx, did))
+    fn try_resolve_path(&self, path: &[&str], namespace: Namespace) -> Option<ty::Instance<'tcx>> {
+        let tcx = self.eval_context_ref().tcx.tcx;
+        let did = try_resolve_did(tcx, path, Some(namespace))?;
+        Some(ty::Instance::mono(tcx, did))
     }
 
     /// Gets an instance for a path.
-    fn resolve_path(&self, path: &[&str]) -> ty::Instance<'tcx> {
-        self.try_resolve_path(path)
+    fn resolve_path(&self, path: &[&str], namespace: Namespace) -> ty::Instance<'tcx> {
+        self.try_resolve_path(path, namespace)
             .unwrap_or_else(|| panic!("failed to find required Rust item: {path:?}"))
     }
 
-    /// Evaluates the scalar at the specified path. Returns Some(val)
-    /// if the path could be resolved, and None otherwise
-    fn eval_path_scalar(&self, path: &[&str]) -> InterpResult<'tcx, Scalar<Provenance>> {
+    /// Evaluates the scalar at the specified path.
+    fn eval_path_scalar(&self, path: &[&str]) -> Scalar<Provenance> {
         let this = self.eval_context_ref();
-        let instance = this.resolve_path(path);
+        let instance = this.resolve_path(path, Namespace::ValueNS);
         let cid = GlobalId { instance, promoted: None };
-        let const_val = this.eval_to_allocation(cid)?;
+        // We don't give a span -- this isn't actually used directly by the program anyway.
+        let const_val = this
+            .eval_global(cid, None)
+            .unwrap_or_else(|err| panic!("failed to evaluate required Rust item: {path:?}\n{err}"));
         this.read_scalar(&const_val.into())
+            .unwrap_or_else(|err| panic!("failed to read required Rust item: {path:?}\n{err}"))
     }
 
     /// Helper function to get a `libc` constant as a `Scalar`.
-    fn eval_libc(&self, name: &str) -> InterpResult<'tcx, Scalar<Provenance>> {
+    fn eval_libc(&self, name: &str) -> Scalar<Provenance> {
         self.eval_path_scalar(&["libc", name])
     }
 
     /// Helper function to get a `libc` constant as an `i32`.
-    fn eval_libc_i32(&self, name: &str) -> InterpResult<'tcx, i32> {
+    fn eval_libc_i32(&self, name: &str) -> i32 {
         // TODO: Cache the result.
-        self.eval_libc(name)?.to_i32()
+        self.eval_libc(name).to_i32().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `i32`): {name}")
+        })
+    }
+
+    /// Helper function to get a `libc` constant as an `u32`.
+    fn eval_libc_u32(&self, name: &str) -> u32 {
+        // TODO: Cache the result.
+        self.eval_libc(name).to_u32().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `u32`): {name}")
+        })
     }
 
     /// Helper function to get a `windows` constant as a `Scalar`.
-    fn eval_windows(&self, module: &str, name: &str) -> InterpResult<'tcx, Scalar<Provenance>> {
+    fn eval_windows(&self, module: &str, name: &str) -> Scalar<Provenance> {
         self.eval_context_ref().eval_path_scalar(&["std", "sys", "windows", module, name])
     }
 
-    /// Helper function to get a `windows` constant as a `u64`.
-    fn eval_windows_u64(&self, module: &str, name: &str) -> InterpResult<'tcx, u64> {
+    /// Helper function to get a `windows` constant as a `u32`.
+    fn eval_windows_u32(&self, module: &str, name: &str) -> u32 {
         // TODO: Cache the result.
-        self.eval_windows(module, name)?.to_u64()
+        self.eval_windows(module, name).to_u32().unwrap_or_else(|_err| {
+            panic!("required Windows item has unexpected type (not `u32`): {module}::{name}")
+        })
+    }
+
+    /// Helper function to get a `windows` constant as a `u64`.
+    fn eval_windows_u64(&self, module: &str, name: &str) -> u64 {
+        // TODO: Cache the result.
+        self.eval_windows(module, name).to_u64().unwrap_or_else(|_err| {
+            panic!("required Windows item has unexpected type (not `u64`): {module}::{name}")
+        })
     }
 
     /// Helper function to get the `TyAndLayout` of a `libc` type
-    fn libc_ty_layout(&self, name: &str) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
+    fn libc_ty_layout(&self, name: &str) -> TyAndLayout<'tcx> {
         let this = self.eval_context_ref();
-        let ty = this.resolve_path(&["libc", name]).ty(*this.tcx, ty::ParamEnv::reveal_all());
-        this.layout_of(ty)
+        let ty = this
+            .resolve_path(&["libc", name], Namespace::TypeNS)
+            .ty(*this.tcx, ty::ParamEnv::reveal_all());
+        this.layout_of(ty).unwrap()
     }
 
     /// Helper function to get the `TyAndLayout` of a `windows` type
-    fn windows_ty_layout(&self, name: &str) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
+    fn windows_ty_layout(&self, name: &str) -> TyAndLayout<'tcx> {
         let this = self.eval_context_ref();
         let ty = this
-            .resolve_path(&["std", "sys", "windows", "c", name])
+            .resolve_path(&["std", "sys", "windows", "c", name], Namespace::TypeNS)
             .ty(*this.tcx, ty::ParamEnv::reveal_all());
-        this.layout_of(ty)
+        this.layout_of(ty).unwrap()
     }
 
     /// Project to the given *named* field of the mplace (which must be a struct or union type).
@@ -426,6 +478,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 } else if matches!(v.layout.fields, FieldsShape::Union(..)) {
                     // A (non-frozen) union. We fall back to whatever the type says.
                     (self.unsafe_cell_action)(v)
+                } else if matches!(v.layout.ty.kind(), ty::Dynamic(_, _, ty::DynStar)) {
+                    // This needs to read the vtable pointer to proceed type-driven, but we don't
+                    // want to reentrantly read from memory here.
+                    (self.unsafe_cell_action)(v)
                 } else {
                     // We want to not actually read from memory for this visit. So, before
                     // walking this value, we have to make sure it is not a
@@ -524,9 +580,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         assert_eq!(
             self.eval_context_ref().tcx.sess.target.os,
             target_os,
-            "`{}` is only available on the `{}` target OS",
-            name,
-            target_os,
+            "`{name}` is only available on the `{target_os}` target OS",
         )
     }
 
@@ -536,8 +590,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn assert_target_os_is_unix(&self, name: &str) {
         assert!(
             target_os_is_unix(self.eval_context_ref().tcx.sess.target.os.as_ref()),
-            "`{}` is only available for supported UNIX family targets",
-            name,
+            "`{name}` is only available for supported UNIX family targets",
         );
     }
 
@@ -582,14 +635,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if target.families.iter().any(|f| f == "unix") {
             for &(name, kind) in UNIX_IO_ERROR_TABLE {
                 if err_kind == kind {
-                    return this.eval_libc(name);
+                    return Ok(this.eval_libc(name));
                 }
             }
             throw_unsup_format!("io error {:?} cannot be translated into a raw os error", err_kind)
         } else if target.families.iter().any(|f| f == "windows") {
             // FIXME: we have to finish implementing the Windows equivalent of this.
             use std::io::ErrorKind::*;
-            this.eval_windows(
+            Ok(this.eval_windows(
                 "c",
                 match err_kind {
                     NotFound => "ERROR_FILE_NOT_FOUND",
@@ -600,7 +653,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             err_kind
                         ),
                 },
-            )
+            ))
         } else {
             throw_unsup_format!(
                 "converting io::Error into errnum is unsupported for OS {}",
@@ -620,7 +673,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if target.families.iter().any(|f| f == "unix") {
             let errnum = errnum.to_i32()?;
             for &(name, kind) in UNIX_IO_ERROR_TABLE {
-                if errnum == this.eval_libc_i32(name)? {
+                if errnum == this.eval_libc_i32(name) {
                     return Ok(Some(kind));
                 }
             }
@@ -667,7 +720,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
         let this = self.eval_context_ref();
-        let op_place = this.deref_operand(op)?;
+        let op_place = this.deref_operand(op)?; // FIXME: we still deref with the original type!
         let offset = Size::from_bytes(offset);
 
         // Ensure that the access is within bounds.
@@ -687,17 +740,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         this.read_scalar(&value_place.into())
     }
 
-    fn write_immediate_at_offset(
-        &mut self,
-        op: &OpTy<'tcx, Provenance>,
-        offset: u64,
-        value: &ImmTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, ()> {
-        let this = self.eval_context_mut();
-        let value_place = this.deref_operand_and_offset(op, offset, value.layout)?;
-        this.write_immediate(**value, &value_place.into())
-    }
-
     fn write_scalar_at_offset(
         &mut self,
         op: &OpTy<'tcx, Provenance>,
@@ -705,7 +747,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         value: impl Into<Scalar<Provenance>>,
         layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ()> {
-        self.write_immediate_at_offset(op, offset, &ImmTy::from_scalar(value.into(), layout))
+        let this = self.eval_context_mut();
+        let value_place = this.deref_operand_and_offset(op, offset, layout)?;
+        this.write_scalar(value, &value_place.into())
     }
 
     /// Parse a `timespec` struct and return it as a `std::time::Duration`. It returns `None`
@@ -718,10 +762,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_mut();
         let seconds_place = this.mplace_field(tp, 0)?;
         let seconds_scalar = this.read_scalar(&seconds_place.into())?;
-        let seconds = seconds_scalar.to_machine_isize(this)?;
+        let seconds = seconds_scalar.to_target_isize(this)?;
         let nanoseconds_place = this.mplace_field(tp, 1)?;
         let nanoseconds_scalar = this.read_scalar(&nanoseconds_place.into())?;
-        let nanoseconds = nanoseconds_scalar.to_machine_isize(this)?;
+        let nanoseconds = nanoseconds_scalar.to_target_isize(this)?;
 
         Ok(try {
             // tv_sec must be non-negative.
@@ -903,7 +947,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         link_name: Symbol,
     ) -> InterpResult<'tcx, ()> {
         self.check_abi(abi, exp_abi)?;
-        if let Some((body, _)) = self.eval_context_mut().lookup_exported_symbol(link_name)? {
+        if let Some((body, instance)) = self.eval_context_mut().lookup_exported_symbol(link_name)? {
+            // If compiler-builtins is providing the symbol, then don't treat it as a clash.
+            // We'll use our built-in implementation in `emulate_foreign_item_by_name` for increased
+            // performance. Note that this means we won't catch any undefined behavior in
+            // compiler-builtins when running other crates, but Miri can still be run on
+            // compiler-builtins itself (or any crate that uses it as a normal dependency)
+            if self.eval_context_ref().tcx.is_compiler_builtins(instance.def_id().krate) {
+                return Ok(());
+            }
+
             throw_machine_stop!(TerminationInfo::SymbolShimClashing {
                 link_name,
                 span: body.span.data(),
@@ -944,31 +997,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
-    pub fn current_span(&self) -> CurrentSpan<'_, 'mir, 'tcx> {
-        CurrentSpan { current_frame_idx: None, machine: self }
-    }
-}
-
-/// A `CurrentSpan` should be created infrequently (ideally once) per interpreter step. It does
-/// nothing on creation, but when `CurrentSpan::get` is called, searches the current stack for the
-/// topmost frame which corresponds to a local crate, and returns the current span in that frame.
-/// The result of that search is cached so that later calls are approximately free.
-#[derive(Clone)]
-pub struct CurrentSpan<'a, 'mir, 'tcx> {
-    current_frame_idx: Option<usize>,
-    machine: &'a MiriMachine<'mir, 'tcx>,
-}
-
-impl<'a, 'mir: 'a, 'tcx: 'a + 'mir> CurrentSpan<'a, 'mir, 'tcx> {
-    pub fn machine(&self) -> &'a MiriMachine<'mir, 'tcx> {
-        self.machine
-    }
-
-    /// Get the current span, skipping non-local frames.
+    /// Get the current span in the topmost function which is workspace-local and not
+    /// `#[track_caller]`.
     /// This function is backed by a cache, and can be assumed to be very fast.
-    pub fn get(&mut self) -> Span {
-        let idx = self.current_frame_idx();
-        self.stack().get(idx).map(Frame::current_span).unwrap_or(rustc_span::DUMMY_SP)
+    /// It will work even when the stack is empty.
+    pub fn current_span(&self) -> Span {
+        self.top_user_relevant_frame()
+            .map(|frame_idx| self.stack()[frame_idx].current_span())
+            .unwrap_or(rustc_span::DUMMY_SP)
     }
 
     /// Returns the span of the *caller* of the current operation, again
@@ -976,46 +1012,27 @@ impl<'a, 'mir: 'a, 'tcx: 'a + 'mir> CurrentSpan<'a, 'mir, 'tcx> {
     /// current operation is not in a local crate.
     /// This is useful when we are processing something which occurs on function-entry and we want
     /// to point at the call to the function, not the function definition generally.
-    pub fn get_caller(&mut self) -> Span {
+    pub fn caller_span(&self) -> Span {
         // We need to go down at least to the caller (len - 2), or however
-        // far we have to go to find a frame in a local crate.
-        let local_frame_idx = self.current_frame_idx();
-        let stack = self.stack();
-        let idx = cmp::min(local_frame_idx, stack.len().saturating_sub(2));
-        stack.get(idx).map(Frame::current_span).unwrap_or(rustc_span::DUMMY_SP)
+        // far we have to go to find a frame in a local crate which is also not #[track_caller].
+        let frame_idx = self.top_user_relevant_frame().unwrap();
+        let frame_idx = cmp::min(frame_idx, self.stack().len().checked_sub(2).unwrap());
+        self.stack()[frame_idx].current_span()
     }
 
-    fn stack(&self) -> &[Frame<'mir, 'tcx, Provenance, machine::FrameData<'tcx>>] {
-        self.machine.threads.active_thread_stack()
+    fn stack(&self) -> &[Frame<'mir, 'tcx, Provenance, machine::FrameExtra<'tcx>>] {
+        self.threads.active_thread_stack()
     }
 
-    fn current_frame_idx(&mut self) -> usize {
-        *self
-            .current_frame_idx
-            .get_or_insert_with(|| Self::compute_current_frame_index(self.machine))
+    fn top_user_relevant_frame(&self) -> Option<usize> {
+        self.threads.active_thread_ref().top_user_relevant_frame()
     }
 
-    // Find the position of the inner-most frame which is part of the crate being
-    // compiled/executed, part of the Cargo workspace, and is also not #[track_caller].
-    #[inline(never)]
-    fn compute_current_frame_index(machine: &MiriMachine<'_, '_>) -> usize {
-        machine
-            .threads
-            .active_thread_stack()
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, frame)| {
-                let def_id = frame.instance.def_id();
-                if (def_id.is_local() || machine.local_crates.contains(&def_id.krate))
-                    && !frame.instance.def.requires_caller_location(machine.tcx)
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0)
+    /// This is the source of truth for the `is_user_relevant` flag in our `FrameExtra`.
+    pub fn is_user_relevant(&self, frame: &Frame<'mir, 'tcx, Provenance>) -> bool {
+        let def_id = frame.instance.def_id();
+        (def_id.is_local() || self.local_crates.contains(&def_id.krate))
+            && !frame.instance.def.requires_caller_location(self.tcx)
     }
 }
 
@@ -1034,8 +1051,7 @@ where
 
 pub fn isolation_abort_error<'tcx>(name: &str) -> InterpResult<'tcx> {
     throw_machine_stop!(TerminationInfo::UnsupportedInIsolation(format!(
-        "{} not available when isolation is enabled",
-        name,
+        "{name} not available when isolation is enabled",
     )))
 }
 

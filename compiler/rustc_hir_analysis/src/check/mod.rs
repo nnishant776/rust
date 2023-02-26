@@ -14,23 +14,23 @@ can be broken down into several distinct phases:
 
 - main: the main pass does the lion's share of the work: it
   determines the types of all expressions, resolves
-  methods, checks for most invalid conditions, and so forth.  In
+  methods, checks for most invalid conditions, and so forth. In
   some cases, where a type is unknown, it may create a type or region
   variable and use that as the type of an expression.
 
   In the process of checking, various constraints will be placed on
   these type variables through the subtyping relationships requested
-  through the `demand` module.  The `infer` module is in charge
+  through the `demand` module. The `infer` module is in charge
   of resolving those constraints.
 
 - regionck: after main is complete, the regionck pass goes over all
   types looking for regions and making sure that they did not escape
-  into places where they are not in scope.  This may also influence the
+  into places where they are not in scope. This may also influence the
   final assignments of the various region variables if there is some
   flexibility.
 
 - writeback: writes the final types within a function body, replacing
-  type variables with their final inferred types.  These final types
+  type variables with their final inferred types. These final types
   are written into the `tcx.node_types` table, which should *never* contain
   any reference to a type variable.
 
@@ -38,8 +38,8 @@ can be broken down into several distinct phases:
 
 While type checking a function, the intermediate types for the
 expressions, blocks, and so forth contained within the function are
-stored in `fcx.node_types` and `fcx.node_substs`.  These types
-may contain unresolved type variables.  After type checking is
+stored in `fcx.node_types` and `fcx.node_substs`. These types
+may contain unresolved type variables. After type checking is
 complete, the functions in the writeback module are used to take the
 types from this table, resolve them, and then write them into their
 permanent home in the type context `tcx`.
@@ -51,19 +51,19 @@ nodes within the function.
 The types of top-level items, which never contain unbound type
 variables, are stored directly into the `tcx` typeck_results.
 
-N.B., a type variable is not the same thing as a type parameter.  A
+N.B., a type variable is not the same thing as a type parameter. A
 type variable is an instance of a type parameter. That is,
 given a generic function `fn foo<T>(t: T)`, while checking the
 function `foo`, the type `ty_param(0)` refers to the type `T`, which
 is treated in abstract. However, when `foo()` is called, `T` will be
-substituted for a fresh type variable `N`.  This variable will
+substituted for a fresh type variable `N`. This variable will
 eventually be resolved to some concrete type (which might itself be
 a type parameter).
 
 */
 
 mod check;
-mod compare_method;
+mod compare_impl_item;
 pub mod dropck;
 pub mod intrinsic;
 pub mod intrinsicck;
@@ -75,7 +75,6 @@ pub use check::check_abi;
 use check::check_mod_item_types;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder};
-use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_index::bit_set::BitSet;
@@ -94,7 +93,7 @@ use std::num::NonZeroU32;
 use crate::require_c_abi_if_c_variadic;
 use crate::util::common::indenter;
 
-use self::compare_method::collect_trait_impl_trait_tys;
+use self::compare_impl_item::collect_return_position_impl_trait_in_trait_tys;
 use self::region::region_scope_tree;
 
 pub fn provide(providers: &mut Providers) {
@@ -103,8 +102,9 @@ pub fn provide(providers: &mut Providers) {
         adt_destructor,
         check_mod_item_types,
         region_scope_tree,
-        collect_trait_impl_trait_tys,
-        compare_assoc_const_impl_item_with_trait_item: compare_method::raw_compare_const_impl,
+        collect_return_position_impl_trait_in_trait_tys,
+        compare_impl_const: compare_impl_item::compare_impl_const_raw,
+        check_generator_obligations: check::check_generator_obligations,
         ..*providers
     };
 }
@@ -115,10 +115,10 @@ fn adt_destructor(tcx: TyCtxt<'_>, def_id: DefId) -> Option<ty::Destructor> {
 
 /// Given a `DefId` for an opaque type in return position, find its parent item's return
 /// expressions.
-fn get_owner_return_paths<'tcx>(
-    tcx: TyCtxt<'tcx>,
+fn get_owner_return_paths(
+    tcx: TyCtxt<'_>,
     def_id: LocalDefId,
-) -> Option<(LocalDefId, ReturnsVisitor<'tcx>)> {
+) -> Option<(LocalDefId, ReturnsVisitor<'_>)> {
     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
     let parent_id = tcx.hir().get_parent_item(hir_id).def_id;
     tcx.hir().find_by_def_id(parent_id).and_then(|node| node.body_id()).map(|body_id| {
@@ -159,7 +159,7 @@ fn maybe_check_static_with_link_section(tcx: TyCtxt<'_>, id: LocalDefId) {
     // the consumer's responsibility to ensure all bytes that have been read
     // have defined values.
     if let Ok(alloc) = tcx.eval_static_initializer(id.to_def_id())
-        && alloc.inner().provenance().len() != 0
+        && alloc.inner().provenance().ptrs().len() != 0
     {
         let msg = "statics with a custom `#[link_section]` must be a \
                         simple list of bytes on the wasm target with no \
@@ -168,27 +168,24 @@ fn maybe_check_static_with_link_section(tcx: TyCtxt<'_>, id: LocalDefId) {
     }
 }
 
-fn report_forbidden_specialization(
-    tcx: TyCtxt<'_>,
-    impl_item: &hir::ImplItemRef,
-    parent_impl: DefId,
-) {
+fn report_forbidden_specialization(tcx: TyCtxt<'_>, impl_item: DefId, parent_impl: DefId) {
+    let span = tcx.def_span(impl_item);
+    let ident = tcx.item_name(impl_item);
     let mut err = struct_span_err!(
         tcx.sess,
-        impl_item.span,
+        span,
         E0520,
-        "`{}` specializes an item from a parent `impl`, but \
-         that item is not marked `default`",
-        impl_item.ident
+        "`{}` specializes an item from a parent `impl`, but that item is not marked `default`",
+        ident,
     );
-    err.span_label(impl_item.span, format!("cannot specialize default item `{}`", impl_item.ident));
+    err.span_label(span, format!("cannot specialize default item `{}`", ident));
 
     match tcx.span_of_impl(parent_impl) {
         Ok(span) => {
             err.span_label(span, "parent `impl` is here");
             err.note(&format!(
                 "to specialize, `{}` in the parent `impl` must be marked `default`",
-                impl_item.ident
+                ident
             ));
         }
         Err(cname) => {
@@ -202,7 +199,7 @@ fn report_forbidden_specialization(
 fn missing_items_err(
     tcx: TyCtxt<'_>,
     impl_span: Span,
-    missing_items: &[&ty::AssocItem],
+    missing_items: &[ty::AssocItem],
     full_impl_span: Span,
 ) {
     let missing_items_msg = missing_items
@@ -228,7 +225,7 @@ fn missing_items_err(
     let padding =
         tcx.sess.source_map().indentation_before(sugg_sp).unwrap_or_else(|| String::new());
 
-    for trait_item in missing_items {
+    for &trait_item in missing_items {
         let snippet = suggestion_signature(trait_item, tcx);
         let code = format!("{}{}\n{}", padding, snippet, padding);
         let msg = format!("implement the missing item: `{snippet}`");
@@ -275,7 +272,7 @@ fn default_body_is_unstable(
     reason: Option<Symbol>,
     issue: Option<NonZeroU32>,
 ) {
-    let missing_item_name = &tcx.associated_item(item_did).name;
+    let missing_item_name = tcx.associated_item(item_did).name;
     let use_of_unstable_library_feature_note = match reason {
         Some(r) => format!("use of unstable library feature '{feature}': {r}"),
         None => format!("use of unstable library feature '{feature}'"),
@@ -309,7 +306,7 @@ fn bounds_from_generic_predicates<'tcx>(
         debug!("predicate {:?}", predicate);
         let bound_predicate = predicate.kind();
         match bound_predicate.skip_binder() {
-            ty::PredicateKind::Trait(trait_predicate) => {
+            ty::PredicateKind::Clause(ty::Clause::Trait(trait_predicate)) => {
                 let entry = types.entry(trait_predicate.self_ty()).or_default();
                 let def_id = trait_predicate.def_id();
                 if Some(def_id) != tcx.lang_items().sized_trait() {
@@ -318,7 +315,7 @@ fn bounds_from_generic_predicates<'tcx>(
                     entry.push(trait_predicate.def_id());
                 }
             }
-            ty::PredicateKind::Projection(projection_pred) => {
+            ty::PredicateKind::Clause(ty::Clause::Projection(projection_pred)) => {
                 projections.push(bound_predicate.rebind(projection_pred));
             }
             _ => {}
@@ -352,11 +349,7 @@ fn bounds_from_generic_predicates<'tcx>(
         // insert the associated types where they correspond, but for now let's be "lazy" and
         // propose this instead of the following valid resugaring:
         // `T: Trait, Trait::Assoc = K` → `T: Trait<Assoc = K>`
-        where_clauses.push(format!(
-            "{} = {}",
-            tcx.def_path_str(p.projection_ty.item_def_id),
-            p.term,
-        ));
+        where_clauses.push(format!("{} = {}", tcx.def_path_str(p.projection_ty.def_id), p.term));
     }
     let where_clauses = if where_clauses.is_empty() {
         String::new()
@@ -372,7 +365,7 @@ fn fn_sig_suggestion<'tcx>(
     sig: ty::FnSig<'tcx>,
     ident: Ident,
     predicates: ty::GenericPredicates<'tcx>,
-    assoc: &ty::AssocItem,
+    assoc: ty::AssocItem,
 ) -> String {
     let args = sig
         .inputs()
@@ -440,16 +433,16 @@ pub fn ty_kind_suggestion(ty: Ty<'_>) -> Option<&'static str> {
 /// Return placeholder code for the given associated item.
 /// Similar to `ty::AssocItem::suggestion`, but appropriate for use as the code snippet of a
 /// structured suggestion.
-fn suggestion_signature(assoc: &ty::AssocItem, tcx: TyCtxt<'_>) -> String {
+fn suggestion_signature(assoc: ty::AssocItem, tcx: TyCtxt<'_>) -> String {
     match assoc.kind {
         ty::AssocKind::Fn => {
             // We skip the binder here because the binder would deanonymize all
             // late-bound regions, and we don't want method signatures to show up
-            // `as for<'r> fn(&'r MyType)`.  Pretty-printing handles late-bound
+            // `as for<'r> fn(&'r MyType)`. Pretty-printing handles late-bound
             // regions just fine, showing `fn(&MyType)`.
             fn_sig_suggestion(
                 tcx,
-                tcx.fn_sig(assoc.def_id).skip_binder(),
+                tcx.fn_sig(assoc.def_id).subst_identity().skip_binder(),
                 assoc.ident(tcx),
                 tcx.predicates_of(assoc.def_id),
                 assoc,
@@ -457,7 +450,7 @@ fn suggestion_signature(assoc: &ty::AssocItem, tcx: TyCtxt<'_>) -> String {
         }
         ty::AssocKind::Type => format!("type {} = Type;", assoc.name),
         ty::AssocKind::Const => {
-            let ty = tcx.type_of(assoc.def_id);
+            let ty = tcx.type_of(assoc.def_id).subst_identity();
             let val = ty_kind_suggestion(ty).unwrap_or("value");
             format!("const {}: {} = {};", assoc.name, ty, val)
         }

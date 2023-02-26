@@ -70,7 +70,7 @@ impl std::fmt::Debug for AttributeGate {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Gated(ref stab, name, expl, _) => {
-                write!(fmt, "Gated({:?}, {}, {})", stab, name, expl)
+                write!(fmt, "Gated({stab:?}, {name}, {expl})")
             }
             Self::Ungated => write!(fmt, "Ungated"),
         }
@@ -147,7 +147,7 @@ pub enum AttributeDuplicates {
     FutureWarnPreceding,
 }
 
-/// A conveniece macro to deal with `$($expr)?`.
+/// A convenience macro to deal with `$($expr)?`.
 macro_rules! or_default {
     ($default:expr,) => {
         $default
@@ -391,9 +391,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         DuplicatesOk, @only_local: true,
     ),
     ungated!(track_caller, Normal, template!(Word), WarnFollowing),
+    ungated!(instruction_set, Normal, template!(List: "set"), ErrorPreceding),
     gated!(
         no_sanitize, Normal,
-        template!(List: "address, memory, thread"), DuplicatesOk,
+        template!(List: "address, kcfi, memory, thread"), DuplicatesOk,
         experimental!(no_sanitize)
     ),
     gated!(no_coverage, Normal, template!(Word), WarnFollowing, experimental!(no_coverage)),
@@ -413,7 +414,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     // Linking:
-    gated!(naked, Normal, template!(Word), WarnFollowing, @only_local: true, naked_functions, experimental!(naked)),
+    gated!(
+        naked, Normal, template!(Word), WarnFollowing, @only_local: true,
+        naked_functions, experimental!(naked)
+    ),
 
     // Plugins:
     BuiltinAttribute {
@@ -440,7 +444,8 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
     // RFC #1268
     gated!(
-        marker, Normal, template!(Word), WarnFollowing, marker_trait_attr, experimental!(marker)
+        marker, Normal, template!(Word), WarnFollowing, @only_local: true,
+        marker_trait_attr, experimental!(marker)
     ),
     gated!(
         thread_local, Normal, template!(Word), WarnFollowing,
@@ -451,11 +456,6 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     gated!(
         optimize, Normal, template!(List: "size|speed"), ErrorPreceding, optimize_attribute,
         experimental!(optimize),
-    ),
-    // RFC 2867
-    gated!(
-        instruction_set, Normal, template!(List: "set"), ErrorPreceding,
-        isa_attribute, experimental!(instruction_set)
     ),
 
     gated!(
@@ -490,6 +490,9 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         collapse_debuginfo, Normal, template!(Word), WarnFollowing,
         experimental!(collapse_debuginfo)
     ),
+
+    // RFC 2397
+    gated!(do_not_recommend, Normal, template!(Word), WarnFollowing, experimental!(do_not_recommend)),
 
     // ==========================================================================
     // Internal attributes: Stability, deprecation, and unsafe:
@@ -683,8 +686,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "language items are subject to change",
     ),
     rustc_attr!(
-        rustc_pass_by_value, Normal,
-        template!(Word), ErrorFollowing,
+        rustc_pass_by_value, Normal, template!(Word), ErrorFollowing,
         "#[rustc_pass_by_value] is used to mark types that must be passed by value instead of reference."
     ),
     rustc_attr!(
@@ -692,8 +694,16 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "#![rustc_coherence_is_core] allows inherent methods on builtin types, only intended to be used in `core`."
     ),
     rustc_attr!(
+        rustc_coinductive, AttributeType::Normal, template!(Word), WarnFollowing, @only_local: true,
+        "#![rustc_coinductive] changes a trait to be coinductive, allowing cycles in the trait solver."
+    ),
+    rustc_attr!(
         rustc_allow_incoherent_impl, AttributeType::Normal, template!(Word), ErrorFollowing, @only_local: true,
         "#[rustc_allow_incoherent_impl] has to be added to all impl items of an incoherent inherent impl."
+    ),
+    rustc_attr!(
+        rustc_deny_explicit_impl, AttributeType::Normal, template!(Word), ErrorFollowing, @only_local: false,
+        "#[rustc_deny_explicit_impl] enforces that a trait can have no user-provided impls"
     ),
     rustc_attr!(
         rustc_has_incoherent_inherent_impls, AttributeType::Normal, template!(Word), ErrorFollowing,
@@ -814,6 +824,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(TEST, rustc_polymorphize_error, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_def_path, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_mir, Normal, template!(List: "arg1, arg2, ..."), DuplicatesOk),
+    gated!(
+        custom_mir, Normal, template!(List: r#"dialect = "...", phase = "...""#),
+        ErrorFollowing, "the `#[custom_mir]` attribute is just used for the Rust test suite",
+    ),
     rustc_attr!(TEST, rustc_dump_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_dump_env_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_object_lifetime_default, Normal, template!(Word), WarnFollowing),

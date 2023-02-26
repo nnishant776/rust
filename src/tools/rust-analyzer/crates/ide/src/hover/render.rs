@@ -2,7 +2,9 @@
 use std::fmt::Display;
 
 use either::Either;
-use hir::{AsAssocItem, AttributeTemplate, HasAttrs, HasSource, HirDisplay, Semantics, TypeInfo};
+use hir::{
+    Adt, AsAssocItem, AttributeTemplate, HasAttrs, HasSource, HirDisplay, Semantics, TypeInfo,
+};
 use ide_db::{
     base_db::SourceDatabase,
     defs::Definition,
@@ -14,7 +16,9 @@ use ide_db::{
 use itertools::Itertools;
 use stdx::format_to;
 use syntax::{
-    algo, ast, match_ast, AstNode, Direction,
+    algo,
+    ast::{self, RecordPat},
+    match_ast, AstNode, Direction,
     SyntaxKind::{LET_EXPR, LET_STMT},
     SyntaxToken, T,
 };
@@ -22,58 +26,24 @@ use syntax::{
 use crate::{
     doc_links::{remove_links, rewrite_links},
     hover::walk_and_push_ty,
-    markdown_remove::remove_markdown,
     HoverAction, HoverConfig, HoverResult, Markup,
 };
 
-pub(super) fn type_info(
+pub(super) fn type_info_of(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    _config: &HoverConfig,
     expr_or_pat: &Either<ast::Expr, ast::Pat>,
 ) -> Option<HoverResult> {
     let TypeInfo { original, adjusted } = match expr_or_pat {
         Either::Left(expr) => sema.type_of_expr(expr)?,
         Either::Right(pat) => sema.type_of_pat(pat)?,
     };
-
-    let mut res = HoverResult::default();
-    let mut targets: Vec<hir::ModuleDef> = Vec::new();
-    let mut push_new_def = |item: hir::ModuleDef| {
-        if !targets.contains(&item) {
-            targets.push(item);
-        }
-    };
-    walk_and_push_ty(sema.db, &original, &mut push_new_def);
-
-    res.markup = if let Some(adjusted_ty) = adjusted {
-        walk_and_push_ty(sema.db, &adjusted_ty, &mut push_new_def);
-        let original = original.display(sema.db).to_string();
-        let adjusted = adjusted_ty.display(sema.db).to_string();
-        let static_text_diff_len = "Coerced to: ".len() - "Type: ".len();
-        format!(
-            "{bt_start}Type: {:>apad$}\nCoerced to: {:>opad$}\n{bt_end}",
-            original,
-            adjusted,
-            apad = static_text_diff_len + adjusted.len().max(original.len()),
-            opad = original.len(),
-            bt_start = if config.markdown() { "```text\n" } else { "" },
-            bt_end = if config.markdown() { "```\n" } else { "" }
-        )
-        .into()
-    } else {
-        if config.markdown() {
-            Markup::fenced_block(&original.display(sema.db))
-        } else {
-            original.display(sema.db).to_string().into()
-        }
-    };
-    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
-    Some(res)
+    type_info(sema, _config, original, adjusted)
 }
 
 pub(super) fn try_expr(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    _config: &HoverConfig,
     try_expr: &ast::TryExpr,
 ) -> Option<HoverResult> {
     let inner_ty = sema.type_of_expr(&try_expr.expr()?)?.original;
@@ -149,14 +119,12 @@ pub(super) fn try_expr(
     let ppad = static_text_len_diff.min(0).abs() as usize;
 
     res.markup = format!(
-        "{bt_start}{} Type: {:>pad0$}\nPropagated as: {:>pad1$}\n{bt_end}",
+        "```text\n{} Type: {:>pad0$}\nPropagated as: {:>pad1$}\n```\n",
         s,
         inner_ty,
         body_ty,
         pad0 = ty_len_max + tpad,
         pad1 = ty_len_max + ppad,
-        bt_start = if config.markdown() { "```text\n" } else { "" },
-        bt_end = if config.markdown() { "```\n" } else { "" }
     )
     .into();
     Some(res)
@@ -164,7 +132,7 @@ pub(super) fn try_expr(
 
 pub(super) fn deref_expr(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    _config: &HoverConfig,
     deref_expr: &ast::PrefixExpr,
 ) -> Option<HoverResult> {
     let inner_ty = sema.type_of_expr(&deref_expr.expr()?)?.original;
@@ -193,15 +161,13 @@ pub(super) fn deref_expr(
             .max(adjusted.len() + coerced_len)
             .max(inner.len() + deref_len);
         format!(
-            "{bt_start}Dereferenced from: {:>ipad$}\nTo type: {:>apad$}\nCoerced to: {:>opad$}\n{bt_end}",
+            "```text\nDereferenced from: {:>ipad$}\nTo type: {:>apad$}\nCoerced to: {:>opad$}\n```\n",
             inner,
             original,
             adjusted,
             ipad = max_len - deref_len,
             apad = max_len - type_len,
             opad = max_len - coerced_len,
-            bt_start = if config.markdown() { "```text\n" } else { "" },
-            bt_end = if config.markdown() { "```\n" } else { "" }
         )
         .into()
     } else {
@@ -211,13 +177,11 @@ pub(super) fn deref_expr(
         let deref_len = "Dereferenced from: ".len();
         let max_len = (original.len() + type_len).max(inner.len() + deref_len);
         format!(
-            "{bt_start}Dereferenced from: {:>ipad$}\nTo type: {:>apad$}\n{bt_end}",
+            "```text\nDereferenced from: {:>ipad$}\nTo type: {:>apad$}\n```\n",
             inner,
             original,
             ipad = max_len - deref_len,
             apad = max_len - type_len,
-            bt_start = if config.markdown() { "```text\n" } else { "" },
-            bt_end = if config.markdown() { "```\n" } else { "" }
         )
         .into()
     };
@@ -226,12 +190,54 @@ pub(super) fn deref_expr(
     Some(res)
 }
 
+pub(super) fn underscore(
+    sema: &Semantics<'_, RootDatabase>,
+    config: &HoverConfig,
+    token: &SyntaxToken,
+) -> Option<HoverResult> {
+    if token.kind() != T![_] {
+        return None;
+    }
+    let parent = token.parent()?;
+    let _it = match_ast! {
+        match parent {
+            ast::InferType(it) => it,
+            ast::UnderscoreExpr(it) => return type_info_of(sema, config, &Either::Left(ast::Expr::UnderscoreExpr(it))),
+            ast::WildcardPat(it) => return type_info_of(sema, config, &Either::Right(ast::Pat::WildcardPat(it))),
+            _ => return None,
+        }
+    };
+    // let it = infer_type.syntax().parent()?;
+    // match_ast! {
+    //     match it {
+    //         ast::LetStmt(_it) => (),
+    //         ast::Param(_it) => (),
+    //         ast::RetType(_it) => (),
+    //         ast::TypeArg(_it) => (),
+
+    //         ast::CastExpr(_it) => (),
+    //         ast::ParenType(_it) => (),
+    //         ast::TupleType(_it) => (),
+    //         ast::PtrType(_it) => (),
+    //         ast::RefType(_it) => (),
+    //         ast::ArrayType(_it) => (),
+    //         ast::SliceType(_it) => (),
+    //         ast::ForType(_it) => (),
+    //         _ => return None,
+    //     }
+    // }
+
+    // FIXME: https://github.com/rust-lang/rust-analyzer/issues/11762, this currently always returns Unknown
+    // type_info(sema, config, sema.resolve_type(&ast::Type::InferType(it))?, None)
+    None
+}
+
 pub(super) fn keyword(
     sema: &Semantics<'_, RootDatabase>,
     config: &HoverConfig,
     token: &SyntaxToken,
 ) -> Option<HoverResult> {
-    if !token.kind().is_keyword() || !config.documentation.is_some() || !config.keywords {
+    if !token.kind().is_keyword() || !config.documentation || !config.keywords {
         return None;
     }
     let parent = token.parent()?;
@@ -248,6 +254,46 @@ pub(super) fn keyword(
         config,
     );
     Some(HoverResult { markup, actions })
+}
+
+/// Returns missing types in a record pattern.
+/// Only makes sense when there's a rest pattern in the record pattern.
+/// i.e. `let S {a, ..} = S {a: 1, b: 2}`
+pub(super) fn struct_rest_pat(
+    sema: &Semantics<'_, RootDatabase>,
+    _config: &HoverConfig,
+    pattern: &RecordPat,
+) -> HoverResult {
+    let missing_fields = sema.record_pattern_missing_fields(pattern);
+
+    // if there are no missing fields, the end result is a hover that shows ".."
+    // should be left in to indicate that there are no more fields in the pattern
+    // example, S {a: 1, b: 2, ..} when struct S {a: u32, b: u32}
+
+    let mut res = HoverResult::default();
+    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+    let mut push_new_def = |item: hir::ModuleDef| {
+        if !targets.contains(&item) {
+            targets.push(item);
+        }
+    };
+    for (_, t) in &missing_fields {
+        walk_and_push_ty(sema.db, t, &mut push_new_def);
+    }
+
+    res.markup = {
+        let mut s = String::from(".., ");
+        for (f, _) in &missing_fields {
+            s += f.display(sema.db).to_string().as_ref();
+            s += ", ";
+        }
+        // get rid of trailing comma
+        s.truncate(s.len() - 2);
+
+        Markup::fenced_block(&s)
+    };
+    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    res
 }
 
 pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<HoverResult> {
@@ -298,13 +344,8 @@ pub(super) fn process_markup(
     config: &HoverConfig,
 ) -> Markup {
     let markup = markup.as_str();
-    let markup = if !config.markdown() {
-        remove_markdown(markup)
-    } else if config.links_in_hover {
-        rewrite_links(db, markup, def)
-    } else {
-        remove_links(markup)
-    };
+    let markup =
+        if config.links_in_hover { rewrite_links(db, markup, def) } else { remove_links(markup) };
     Markup::from(markup)
 }
 
@@ -342,15 +383,35 @@ pub(super) fn definition(
     let mod_path = definition_mod_path(db, &def);
     let (label, docs) = match def {
         Definition::Macro(it) => label_and_docs(db, it),
-        Definition::Field(it) => label_and_docs(db, it),
+        Definition::Field(it) => label_and_layout_info_and_docs(db, it, |&it| {
+            let var_def = it.parent_def(db);
+            let id = it.index();
+            let layout = it.layout(db).ok()?;
+            let offset = match var_def {
+                hir::VariantDef::Struct(s) => Adt::from(s)
+                    .layout(db)
+                    .ok()
+                    .map(|layout| format!(", offset = {}", layout.fields.offset(id).bytes())),
+                _ => None,
+            };
+            Some(format!(
+                "size = {}, align = {}{}",
+                layout.size.bytes(),
+                layout.align.abi.bytes(),
+                offset.as_deref().unwrap_or_default()
+            ))
+        }),
         Definition::Module(it) => label_and_docs(db, it),
         Definition::Function(it) => label_and_docs(db, it),
-        Definition::Adt(it) => label_and_docs(db, it),
+        Definition::Adt(it) => label_and_layout_info_and_docs(db, it, |&it| {
+            let layout = it.layout(db).ok()?;
+            Some(format!("size = {}, align = {}", layout.size.bytes(), layout.align.abi.bytes()))
+        }),
         Definition::Variant(it) => label_value_and_docs(db, it, |&it| {
             if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
-                    Ok(x) => Some(format!("{}", x)),
-                    Err(_) => it.value(db).map(|x| format!("{:?}", x)),
+                    Ok(x) => Some(format!("{x}")),
+                    Err(_) => it.value(db).map(|x| format!("{x:?}")),
                 }
             } else {
                 None
@@ -359,7 +420,7 @@ pub(super) fn definition(
         Definition::Const(it) => label_value_and_docs(db, it, |it| {
             let body = it.eval(db);
             match body {
-                Ok(x) => Some(format!("{}", x)),
+                Ok(x) => Some(format!("{x}")),
                 Err(_) => {
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
@@ -397,8 +458,9 @@ pub(super) fn definition(
         Definition::DeriveHelper(it) => (format!("derive_helper {}", it.name(db)), None),
     };
 
-    let docs = match config.documentation {
-        Some(_) => docs.or_else(|| {
+    let docs = docs
+        .filter(|_| config.documentation)
+        .or_else(|| {
             // docs are missing, for assoc items of trait impls try to fall back to the docs of the
             // original item of the trait
             let assoc = def.as_assoc_item(db)?;
@@ -406,16 +468,49 @@ pub(super) fn definition(
             let name = Some(assoc.name(db)?);
             let item = trait_.items(db).into_iter().find(|it| it.name(db) == name)?;
             item.docs(db)
-        }),
-        None => None,
-    };
-    let docs = docs.filter(|_| config.documentation.is_some()).map(Into::into);
+        })
+        .map(Into::into);
     markup(docs, label, mod_path)
+}
+
+fn type_info(
+    sema: &Semantics<'_, RootDatabase>,
+    _config: &HoverConfig,
+    original: hir::Type,
+    adjusted: Option<hir::Type>,
+) -> Option<HoverResult> {
+    let mut res = HoverResult::default();
+    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+    let mut push_new_def = |item: hir::ModuleDef| {
+        if !targets.contains(&item) {
+            targets.push(item);
+        }
+    };
+    walk_and_push_ty(sema.db, &original, &mut push_new_def);
+
+    res.markup = if let Some(adjusted_ty) = adjusted {
+        walk_and_push_ty(sema.db, &adjusted_ty, &mut push_new_def);
+        let original = original.display(sema.db).to_string();
+        let adjusted = adjusted_ty.display(sema.db).to_string();
+        let static_text_diff_len = "Coerced to: ".len() - "Type: ".len();
+        format!(
+            "```text\nType: {:>apad$}\nCoerced to: {:>opad$}\n```\n",
+            original,
+            adjusted,
+            apad = static_text_diff_len + adjusted.len().max(original.len()),
+            opad = original.len(),
+        )
+        .into()
+    } else {
+        Markup::fenced_block(&original.display(sema.db))
+    };
+    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    Some(res)
 }
 
 fn render_builtin_attr(db: &RootDatabase, attr: hir::BuiltinAttr) -> Option<Markup> {
     let name = attr.name(db);
-    let desc = format!("#[{}]", name);
+    let desc = format!("#[{name}]");
 
     let AttributeTemplate { word, list, name_value_str } = match attr.template(db) {
         Some(template) => template,
@@ -443,6 +538,25 @@ where
     (label, docs)
 }
 
+fn label_and_layout_info_and_docs<D, E, V>(
+    db: &RootDatabase,
+    def: D,
+    value_extractor: E,
+) -> (String, Option<hir::Documentation>)
+where
+    D: HasAttrs + HirDisplay,
+    E: Fn(&D) -> Option<V>,
+    V: Display,
+{
+    let label = if let Some(value) = value_extractor(&def) {
+        format!("{} // {value}", def.display(db))
+    } else {
+        def.display(db).to_string()
+    };
+    let docs = def.attrs(db).docs();
+    (label, docs)
+}
+
 fn label_value_and_docs<D, E, V>(
     db: &RootDatabase,
     def: D,
@@ -454,7 +568,7 @@ where
     V: Display,
 {
     let label = if let Some(value) = value_extractor(&def) {
-        format!("{} = {}", def.display(db), value)
+        format!("{} = {value}", def.display(db))
     } else {
         def.display(db).to_string()
     };
@@ -518,9 +632,9 @@ fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
             } else {
                 ""
             };
-            format!("{}{}{}: {}", let_kw, is_mut, name, ty)
+            format!("{let_kw}{is_mut}{name}: {ty}")
         }
-        Either::Right(_) => format!("{}self: {}", is_mut, ty),
+        Either::Right(_) => format!("{is_mut}self: {ty}"),
     };
     markup(None, desc, None)
 }

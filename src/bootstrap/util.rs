@@ -44,7 +44,13 @@ pub use t;
 /// Given an executable called `name`, return the filename for the
 /// executable for a particular target.
 pub fn exe(name: &str, target: TargetSelection) -> String {
-    if target.contains("windows") { format!("{}.exe", name) } else { name.to_string() }
+    if target.contains("windows") {
+        format!("{}.exe", name)
+    } else if target.contains("uefi") {
+        format!("{}.efi", name)
+    } else {
+        name.to_string()
+    }
 }
 
 /// Returns `true` if the file name given looks like a dynamic library.
@@ -105,7 +111,7 @@ pub struct TimeIt(bool, Instant);
 
 /// Returns an RAII structure that prints out how long it took to drop.
 pub fn timeit(builder: &Builder<'_>) -> TimeIt {
-    TimeIt(builder.config.dry_run, Instant::now())
+    TimeIt(builder.config.dry_run(), Instant::now())
 }
 
 impl Drop for TimeIt {
@@ -128,7 +134,7 @@ pub(crate) fn program_out_of_date(stamp: &Path, key: &str) -> bool {
 /// Symlinks two directories, using junctions on Windows and normal symlinks on
 /// Unix.
 pub fn symlink_dir(config: &Config, src: &Path, dest: &Path) -> io::Result<()> {
-    if config.dry_run {
+    if config.dry_run() {
         return Ok(());
     }
     let _ = fs::remove_dir(dest);
@@ -247,35 +253,6 @@ pub enum CiEnv {
     AzurePipelines,
     /// The GitHub Actions environment, for Linux (including Docker), Windows and macOS builds.
     GitHubActions,
-}
-
-impl CiEnv {
-    /// Obtains the current CI environment.
-    pub fn current() -> CiEnv {
-        if env::var("TF_BUILD").map_or(false, |e| e == "True") {
-            CiEnv::AzurePipelines
-        } else if env::var("GITHUB_ACTIONS").map_or(false, |e| e == "true") {
-            CiEnv::GitHubActions
-        } else {
-            CiEnv::None
-        }
-    }
-
-    pub fn is_ci() -> bool {
-        Self::current() != CiEnv::None
-    }
-
-    /// If in a CI environment, forces the command to run with colors.
-    pub fn force_coloring_in_ci(self, cmd: &mut Command) {
-        if self != CiEnv::None {
-            // Due to use of stamp/docker, the output stream of rustbuild is not
-            // a TTY in CI, so coloring is by-default turned off.
-            // The explicit `TERM=xterm` environment is needed for
-            // `--color always` to actually work. This env var was lost when
-            // compiling through the Makefile. Very strange.
-            cmd.env("TERM", "xterm").args(&["--color", "always"]);
-        }
-    }
 }
 
 pub fn forcing_clang_based_tests() -> bool {
@@ -433,6 +410,23 @@ pub fn output(cmd: &mut Command) -> String {
         );
     }
     String::from_utf8(output.stdout).unwrap()
+}
+
+pub fn output_result(cmd: &mut Command) -> Result<String, String> {
+    let output = match cmd.stderr(Stdio::inherit()).output() {
+        Ok(status) => status,
+        Err(e) => return Err(format!("failed to run command: {:?}: {}", cmd, e)),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "command did not execute successfully: {:?}\n\
+             expected success, got: {}\n{}",
+            cmd,
+            output.status,
+            String::from_utf8(output.stderr).map_err(|err| format!("{err:?}"))?
+        ));
+    }
+    Ok(String::from_utf8(output.stdout).map_err(|err| format!("{err:?}"))?)
 }
 
 /// Returns the last-modified time for `path`, or zero if it doesn't exist.

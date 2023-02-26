@@ -268,10 +268,7 @@ impl<T: ?Sized> NonNull<T> {
     #[must_use]
     #[inline]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn addr(self) -> NonZeroUsize
-    where
-        T: Sized,
-    {
+    pub fn addr(self) -> NonZeroUsize {
         // SAFETY: The pointer is guaranteed by the type to be non-null,
         // meaning that the address will be non-zero.
         unsafe { NonZeroUsize::new_unchecked(self.pointer.addr()) }
@@ -286,10 +283,7 @@ impl<T: ?Sized> NonNull<T> {
     #[must_use]
     #[inline]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn with_addr(self, addr: NonZeroUsize) -> Self
-    where
-        T: Sized,
-    {
+    pub fn with_addr(self, addr: NonZeroUsize) -> Self {
         // SAFETY: The result of `ptr::from::with_addr` is non-null because `addr` is guaranteed to be non-zero.
         unsafe { NonNull::new_unchecked(self.pointer.with_addr(addr.get()) as *mut _) }
     }
@@ -303,10 +297,7 @@ impl<T: ?Sized> NonNull<T> {
     #[must_use]
     #[inline]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn map_addr(self, f: impl FnOnce(NonZeroUsize) -> NonZeroUsize) -> Self
-    where
-        T: Sized,
-    {
+    pub fn map_addr(self, f: impl FnOnce(NonZeroUsize) -> NonZeroUsize) -> Self {
         self.with_addr(f(self.addr()))
     }
 
@@ -330,7 +321,7 @@ impl<T: ?Sized> NonNull<T> {
     #[stable(feature = "nonnull", since = "1.25.0")]
     #[rustc_const_stable(feature = "const_nonnull_as_ptr", since = "1.32.0")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn as_ptr(self) -> *mut T {
         self.pointer as *mut T
     }
@@ -378,7 +369,7 @@ impl<T: ?Sized> NonNull<T> {
     #[stable(feature = "nonnull", since = "1.25.0")]
     #[rustc_const_unstable(feature = "const_ptr_as_ref", issue = "91822")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const unsafe fn as_ref<'a>(&self) -> &'a T {
         // SAFETY: the caller must guarantee that `self` meets all the
         // requirements for a reference.
@@ -429,7 +420,7 @@ impl<T: ?Sized> NonNull<T> {
     #[stable(feature = "nonnull", since = "1.25.0")]
     #[rustc_const_unstable(feature = "const_ptr_as_ref", issue = "91822")]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const unsafe fn as_mut<'a>(&mut self) -> &'a mut T {
         // SAFETY: the caller must guarantee that `self` meets all the
         // requirements for a mutable reference.
@@ -703,7 +694,7 @@ impl<T> NonNull<[T]> {
 #[stable(feature = "nonnull", since = "1.25.0")]
 #[rustc_const_unstable(feature = "const_clone", issue = "91805")]
 impl<T: ?Sized> const Clone for NonNull<T> {
-    #[inline]
+    #[inline(always)]
     fn clone(&self) -> Self {
         *self
     }
@@ -712,7 +703,7 @@ impl<T: ?Sized> const Clone for NonNull<T> {
 #[stable(feature = "nonnull", since = "1.25.0")]
 impl<T: ?Sized> Copy for NonNull<T> {}
 
-#[unstable(feature = "coerce_unsized", issue = "27732")]
+#[unstable(feature = "coerce_unsized", issue = "18598")]
 impl<T: ?Sized, U: ?Sized> CoerceUnsized<NonNull<U>> for NonNull<T> where T: Unsize<U> {}
 
 #[unstable(feature = "dispatch_from_dyn", issue = "none")]

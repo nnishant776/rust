@@ -214,7 +214,7 @@ fn infer_paths() {
 fn a() -> u32 { 1 }
 
 mod b {
-    fn c() -> u32 { 1 }
+    pub fn c() -> u32 { 1 }
 }
 
 fn test() {
@@ -225,13 +225,13 @@ fn test() {
         expect![[r#"
             14..19 '{ 1 }': u32
             16..17 '1': u32
-            47..52 '{ 1 }': u32
-            49..50 '1': u32
-            66..90 '{     ...c(); }': ()
-            72..73 'a': fn a() -> u32
-            72..75 'a()': u32
-            81..85 'b::c': fn c() -> u32
-            81..87 'b::c()': u32
+            51..56 '{ 1 }': u32
+            53..54 '1': u32
+            70..94 '{     ...c(); }': ()
+            76..77 'a': fn a() -> u32
+            76..79 'a()': u32
+            85..89 'b::c': fn c() -> u32
+            85..91 'b::c()': u32
         "#]],
     );
 }
@@ -1856,7 +1856,7 @@ fn not_shadowing_module_by_primitive() {
     check_types(
         r#"
 //- /str.rs
-fn foo() -> u32 {0}
+pub fn foo() -> u32 {0}
 
 //- /main.rs
 mod str;
@@ -2064,17 +2064,17 @@ fn fn_pointer_return() {
 fn block_modifiers_smoke_test() {
     check_infer(
         r#"
-//- minicore: future
+//- minicore: future, try
 async fn main() {
     let x = unsafe { 92 };
     let y = async { async { () }.await };
-    let z = try { () };
+    let z: core::ops::ControlFlow<(), _> = try { () };
     let w = const { 92 };
     let t = 'a: { 92 };
 }
         "#,
         expect![[r#"
-            16..162 '{     ...2 }; }': ()
+            16..193 '{     ...2 }; }': ()
             26..27 'x': i32
             30..43 'unsafe { 92 }': i32
             30..43 'unsafe { 92 }': i32
@@ -2086,17 +2086,17 @@ async fn main() {
             65..77 'async { () }': impl Future<Output = ()>
             65..83 'async ....await': ()
             73..75 '()': ()
-            95..96 'z': {unknown}
-            99..109 'try { () }': ()
-            99..109 'try { () }': {unknown}
-            105..107 '()': ()
-            119..120 'w': i32
-            123..135 'const { 92 }': i32
-            123..135 'const { 92 }': i32
-            131..133 '92': i32
-            145..146 't': i32
-            149..159 ''a: { 92 }': i32
-            155..157 '92': i32
+            95..96 'z': ControlFlow<(), ()>
+            130..140 'try { () }': ()
+            130..140 'try { () }': ControlFlow<(), ()>
+            136..138 '()': ()
+            150..151 'w': i32
+            154..166 'const { 92 }': i32
+            154..166 'const { 92 }': i32
+            162..164 '92': i32
+            176..177 't': i32
+            180..190 ''a: { 92 }': i32
+            186..188 '92': i32
         "#]],
     )
 }
@@ -3198,5 +3198,88 @@ fn func() {
     };
 }
     "#,
+    );
+}
+
+// FIXME
+#[test]
+fn castable_to() {
+    check_infer(
+        r#"
+//- minicore: sized
+#[lang = "owned_box"]
+pub struct Box<T: ?Sized> {
+    inner: *mut T,
+}
+impl<T> Box<T> {
+    fn new(t: T) -> Self { loop {} }
+}
+
+fn func() {
+    let x = Box::new([]) as Box<[i32; 0]>;
+}
+"#,
+        expect![[r#"
+            99..100 't': T
+            113..124 '{ loop {} }': Box<T>
+            115..122 'loop {}': !
+            120..122 '{}': ()
+            138..184 '{     ...0]>; }': ()
+            148..149 'x': Box<[i32; 0]>
+            152..160 'Box::new': fn new<[{unknown}; 0]>([{unknown}; 0]) -> Box<[{unknown}; 0]>
+            152..164 'Box::new([])': Box<[{unknown}; 0]>
+            152..181 'Box::n...2; 0]>': Box<[i32; 0]>
+            161..163 '[]': [{unknown}; 0]
+        "#]],
+    );
+}
+
+#[test]
+fn castable_to1() {
+    check_infer(
+        r#"
+struct Ark<T>(T);
+impl<T> Ark<T> {
+    fn foo(&self) -> *const T {
+        &self.0
+    }
+}
+fn f<T>(t: Ark<T>) {
+    Ark::foo(&t) as *const ();
+}
+"#,
+        expect![[r#"
+            47..51 'self': &Ark<T>
+            65..88 '{     ...     }': *const T
+            75..82 '&self.0': &T
+            76..80 'self': &Ark<T>
+            76..82 'self.0': T
+            99..100 't': Ark<T>
+            110..144 '{     ... (); }': ()
+            116..124 'Ark::foo': fn foo<T>(&Ark<T>) -> *const T
+            116..128 'Ark::foo(&t)': *const T
+            116..141 'Ark::f...nst ()': *const ()
+            125..127 '&t': &Ark<T>
+            126..127 't': Ark<T>
+        "#]],
+    );
+}
+
+// FIXME
+#[test]
+fn castable_to2() {
+    check_infer(
+        r#"
+fn func() {
+    let x = &0u32 as *const _;
+}
+"#,
+        expect![[r#"
+            10..44 '{     ...t _; }': ()
+            20..21 'x': *const {unknown}
+            24..29 '&0u32': &u32
+            24..41 '&0u32 ...onst _': *const {unknown}
+            25..29 '0u32': u32
+        "#]],
     );
 }

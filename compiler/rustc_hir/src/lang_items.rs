@@ -95,6 +95,14 @@ macro_rules! language_item_table {
                 }
             }
 
+            /// Returns the name of the `LangItem` enum variant.
+            // This method is used by Clippy for internal lints.
+            pub fn variant_name(self) -> &'static str {
+                match self {
+                    $( LangItem::$variant => stringify!($variant), )*
+                }
+            }
+
             pub fn target(self) -> Target {
                 match self {
                     $( LangItem::$variant => $target, )*
@@ -138,7 +146,7 @@ pub fn extract(attrs: &[ast::Attribute]) -> Option<(Symbol, Span)> {
 }
 
 language_item_table! {
-//  Variant name,            Name,                     Method name,                Target                  Generic requirements;
+//  Variant name,            Name,                     Getter method name,         Target                  Generic requirements;
     Sized,                   sym::sized,               sized_trait,                Target::Trait,          GenericRequirement::Exact(0);
     Unsize,                  sym::unsize,              unsize_trait,               Target::Trait,          GenericRequirement::Minimum(1);
     /// Trait injected by `#[derive(PartialEq)]`, (i.e. "Partial EQ").
@@ -224,6 +232,7 @@ language_item_table! {
     // is required to define it somewhere. Additionally, there are restrictions on crates that use
     // a weak lang item, but do not have it defined.
     Panic,                   sym::panic,               panic_fn,                   Target::Fn,             GenericRequirement::Exact(0);
+    PanicNounwind,           sym::panic_nounwind,      panic_nounwind,             Target::Fn,             GenericRequirement::Exact(0);
     PanicFmt,                sym::panic_fmt,           panic_fmt,                  Target::Fn,             GenericRequirement::None;
     PanicDisplay,            sym::panic_display,       panic_display,              Target::Fn,             GenericRequirement::None;
     ConstPanicFmt,           sym::const_panic_fmt,     const_panic_fmt,            Target::Fn,             GenericRequirement::None;
@@ -231,9 +240,17 @@ language_item_table! {
     PanicInfo,               sym::panic_info,          panic_info,                 Target::Struct,         GenericRequirement::None;
     PanicLocation,           sym::panic_location,      panic_location,             Target::Struct,         GenericRequirement::None;
     PanicImpl,               sym::panic_impl,          panic_impl,                 Target::Fn,             GenericRequirement::None;
-    PanicNoUnwind,           sym::panic_no_unwind,     panic_no_unwind,            Target::Fn,             GenericRequirement::Exact(0);
+    PanicCannotUnwind,       sym::panic_cannot_unwind, panic_cannot_unwind,        Target::Fn,             GenericRequirement::Exact(0);
     /// libstd panic entry point. Necessary for const eval to be able to catch it
     BeginPanic,              sym::begin_panic,         begin_panic_fn,             Target::Fn,             GenericRequirement::None;
+
+    // Lang items needed for `format_args!()`.
+    FormatAlignment,         sym::format_alignment,    format_alignment,           Target::Enum,           GenericRequirement::None;
+    FormatArgument,          sym::format_argument,     format_argument,            Target::Struct,         GenericRequirement::None;
+    FormatArguments,         sym::format_arguments,    format_arguments,           Target::Struct,         GenericRequirement::None;
+    FormatCount,             sym::format_count,        format_count,               Target::Enum,           GenericRequirement::None;
+    FormatPlaceholder,       sym::format_placeholder,  format_placeholder,         Target::Struct,         GenericRequirement::None;
+    FormatUnsafeArg,         sym::format_unsafe_arg,   format_unsafe_arg,          Target::Struct,         GenericRequirement::None;
 
     ExchangeMalloc,          sym::exchange_malloc,     exchange_malloc_fn,         Target::Fn,             GenericRequirement::None;
     BoxFree,                 sym::box_free,            box_free_fn,                Target::Fn,             GenericRequirement::Minimum(1);
@@ -270,12 +287,19 @@ language_item_table! {
     TryTraitBranch,          sym::branch,              branch_fn,                  Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     TryTraitFromYeet,        sym::from_yeet,           from_yeet_fn,               Target::Fn,             GenericRequirement::None;
 
+    PointerLike,             sym::pointer_like,        pointer_like,               Target::Trait,          GenericRequirement::Exact(0);
+
+    Poll,                    sym::Poll,                poll,                       Target::Enum,           GenericRequirement::None;
     PollReady,               sym::Ready,               poll_ready_variant,         Target::Variant,        GenericRequirement::None;
     PollPending,             sym::Pending,             poll_pending_variant,       Target::Variant,        GenericRequirement::None;
 
-    FromGenerator,           sym::from_generator,      from_generator_fn,          Target::Fn,             GenericRequirement::None;
+    // FIXME(swatinem): the following lang items are used for async lowering and
+    // should become obsolete eventually.
+    ResumeTy,                sym::ResumeTy,            resume_ty,                  Target::Struct,         GenericRequirement::None;
+    IdentityFuture,          sym::identity_future,     identity_future_fn,         Target::Fn,             GenericRequirement::None;
     GetContext,              sym::get_context,         get_context_fn,             Target::Fn,             GenericRequirement::None;
 
+    Context,                 sym::Context,             context,                    Target::Struct,         GenericRequirement::None;
     FuturePoll,              sym::poll,                future_poll_fn,             Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
 
     FromFrom,                sym::from,                from_fn,                    Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
@@ -302,6 +326,8 @@ language_item_table! {
     Range,                   sym::Range,               range_struct,               Target::Struct,         GenericRequirement::None;
     RangeToInclusive,        sym::RangeToInclusive,    range_to_inclusive_struct,  Target::Struct,         GenericRequirement::None;
     RangeTo,                 sym::RangeTo,             range_to_struct,            Target::Struct,         GenericRequirement::None;
+
+    String,                  sym::String,              string,                     Target::Struct,         GenericRequirement::None;
 }
 
 pub enum GenericRequirement {

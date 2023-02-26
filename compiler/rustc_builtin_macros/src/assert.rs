@@ -4,13 +4,14 @@ use crate::edition_panic::use_panic_2021;
 use rustc_ast::ptr::P;
 use rustc_ast::token;
 use rustc_ast::tokenstream::{DelimSpan, TokenStream};
-use rustc_ast::{Expr, ExprKind, MacArgs, MacCall, MacDelimiter, Path, PathSegment, UnOp};
+use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, MacDelimiter, Path, PathSegment, UnOp};
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, PResult};
 use rustc_expand::base::{DummyResult, ExtCtxt, MacEager, MacResult};
 use rustc_parse::parser::Parser;
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
+use thin_vec::thin_vec;
 
 pub fn expand_assert<'cx>(
     cx: &'cx mut ExtCtxt<'_>,
@@ -54,11 +55,11 @@ pub fn expand_assert<'cx>(
             call_site_span,
             ExprKind::MacCall(P(MacCall {
                 path: panic_path(),
-                args: P(MacArgs::Delimited(
-                    DelimSpan::from_single(call_site_span),
-                    MacDelimiter::Parenthesis,
+                args: P(DelimArgs {
+                    dspan: DelimSpan::from_single(call_site_span),
+                    delim: MacDelimiter::Parenthesis,
                     tokens,
-                )),
+                }),
                 prior_type_ascription: None,
             })),
         );
@@ -79,7 +80,7 @@ pub fn expand_assert<'cx>(
         let then = cx.expr_call_global(
             call_site_span,
             cx.std_path(&[sym::panicking, sym::panic]),
-            vec![cx.expr_str(
+            thin_vec![cx.expr_str(
                 DUMMY_SP,
                 Symbol::intern(&format!(
                     "assertion failed: {}",

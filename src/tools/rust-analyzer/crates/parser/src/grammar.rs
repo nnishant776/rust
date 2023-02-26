@@ -51,7 +51,7 @@ pub(crate) mod entry {
         use super::*;
 
         pub(crate) fn vis(p: &mut Parser<'_>) {
-            let _ = opt_visibility(p, false);
+            opt_visibility(p, false);
         }
 
         pub(crate) fn block(p: &mut Parser<'_>) {
@@ -70,10 +70,10 @@ pub(crate) mod entry {
             types::type_(p);
         }
         pub(crate) fn expr(p: &mut Parser<'_>) {
-            let _ = expressions::expr(p);
+            expressions::expr(p);
         }
         pub(crate) fn path(p: &mut Parser<'_>) {
-            let _ = paths::type_path(p);
+            paths::type_path(p);
         }
         pub(crate) fn item(p: &mut Parser<'_>) {
             items::item_or_macro(p, true);
@@ -199,6 +199,8 @@ impl BlockLike {
         self == BlockLike::Block
     }
 }
+
+const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub], T![crate]]);
 
 fn opt_visibility(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
     match p.current() {
@@ -339,4 +341,32 @@ fn error_block(p: &mut Parser<'_>, message: &str) {
     expressions::expr_block_contents(p);
     p.eat(T!['}']);
     m.complete(p, ERROR);
+}
+
+/// The `parser` passed this is required to at least consume one token if it returns `true`.
+/// If the `parser` returns false, parsing will stop.
+fn delimited(
+    p: &mut Parser<'_>,
+    bra: SyntaxKind,
+    ket: SyntaxKind,
+    delim: SyntaxKind,
+    first_set: TokenSet,
+    mut parser: impl FnMut(&mut Parser<'_>) -> bool,
+) {
+    p.bump(bra);
+    while !p.at(ket) && !p.at(EOF) {
+        if !parser(p) {
+            break;
+        }
+        if !p.at(delim) {
+            if p.at_ts(first_set) {
+                p.error(format!("expected {:?}", delim));
+            } else {
+                break;
+            }
+        } else {
+            p.bump(delim);
+        }
+    }
+    p.expect(ket);
 }

@@ -10,6 +10,10 @@ use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use rustc_target::spec::abi;
+use thin_vec::ThinVec;
+use tracing::debug;
+
+use crate::errors::ForbiddenLifetimeBound;
 
 macro_rules! gate_feature_fn {
     ($visitor: expr, $has_feature: expr, $span: expr, $name: expr, $explain: expr, $help: expr) => {{
@@ -136,6 +140,34 @@ impl<'a> PostExpansionVisitor<'a> {
         }
         ImplTraitVisitor { vis: self }.visit_ty(ty);
     }
+
+    fn check_late_bound_lifetime_defs(&self, params: &[ast::GenericParam]) {
+        // Check only lifetime parameters are present and that the lifetime
+        // parameters that are present have no bounds.
+        let non_lt_param_spans: Vec<_> = params
+            .iter()
+            .filter_map(|param| match param.kind {
+                ast::GenericParamKind::Lifetime { .. } => None,
+                _ => Some(param.ident.span),
+            })
+            .collect();
+        // FIXME: gate_feature_post doesn't really handle multispans...
+        if !non_lt_param_spans.is_empty() && !self.features.non_lifetime_binders {
+            feature_err(
+                &self.sess.parse_sess,
+                sym::non_lifetime_binders,
+                non_lt_param_spans,
+                crate::fluent_generated::ast_passes_forbidden_non_lifetime_param,
+            )
+            .emit();
+        }
+        for param in params {
+            if !param.bounds.is_empty() {
+                let spans: Vec<_> = param.bounds.iter().map(|b| b.span()).collect();
+                self.sess.emit_err(ForbiddenLifetimeBound { spans });
+            }
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
@@ -147,7 +179,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             ..
         }) = attr_info
         {
-            gate_feature_fn!(self, has_feature, attr.span, *name, descr);
+            gate_feature_fn!(self, has_feature, attr.span, *name, *descr);
         }
         // Check unstable flavors of the `#[doc]` attribute.
         if attr.has_name(sym::doc) {
@@ -198,8 +230,8 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_item(&mut self, i: &'a ast::Item) {
-        match i.kind {
-            ast::ItemKind::ForeignMod(ref foreign_module) => {
+        match &i.kind {
+            ast::ItemKind::ForeignMod(foreign_module) => {
                 if let Some(abi) = foreign_module.abi {
                     self.check_abi(abi, ast::Const::No);
                 }
@@ -220,7 +252,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
             ast::ItemKind::Struct(..) => {
                 for attr in self.sess.filter_by_name(&i.attrs, sym::repr) {
-                    for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
+                    for item in attr.meta_item_list().unwrap_or_else(ThinVec::new) {
                         if item.has_name(sym::simd) {
                             gate_feature_post!(
                                 &self,
@@ -233,8 +265,8 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 }
             }
 
-            ast::ItemKind::Impl(box ast::Impl { polarity, defaultness, ref of_trait, .. }) => {
-                if let ast::ImplPolarity::Negative(span) = polarity {
+            ast::ItemKind::Impl(box ast::Impl { polarity, defaultness, of_trait, .. }) => {
+                if let &ast::ImplPolarity::Negative(span) = polarity {
                     gate_feature_post!(
                         &self,
                         negative_impls,
@@ -267,7 +299,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 gate_feature_post!(&self, decl_macro, i.span, msg);
             }
 
-            ast::ItemKind::TyAlias(box ast::TyAlias { ty: Some(ref ty), .. }) => {
+            ast::ItemKind::TyAlias(box ast::TyAlias { ty: Some(ty), .. }) => {
                 self.check_impl_trait(&ty)
             }
 
@@ -302,10 +334,11 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_ty(&mut self, ty: &'a ast::Ty) {
-        match ty.kind {
-            ast::TyKind::BareFn(ref bare_fn_ty) => {
+        match &ty.kind {
+            ast::TyKind::BareFn(bare_fn_ty) => {
                 // Function pointers cannot be `const`
                 self.check_extern(bare_fn_ty.ext, ast::Const::No);
+                self.check_late_bound_lifetime_defs(&bare_fn_ty.generic_params);
             }
             ast::TyKind::Never => {
                 gate_feature_post!(&self, never_type, ty.span, "the `!` type is experimental");
@@ -318,8 +351,21 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         visit::walk_ty(self, ty)
     }
 
+    fn visit_generics(&mut self, g: &'a ast::Generics) {
+        for predicate in &g.where_clause.predicates {
+            match predicate {
+                ast::WherePredicate::BoundPredicate(bound_pred) => {
+                    // A type binding, eg `for<'c> Foo: Send+Clone+'c`
+                    self.check_late_bound_lifetime_defs(&bound_pred.bound_generic_params);
+                }
+                _ => {}
+            }
+        }
+        visit::walk_generics(self, g);
+    }
+
     fn visit_fn_ret_ty(&mut self, ret_ty: &'a ast::FnRetTy) {
-        if let ast::FnRetTy::Ty(ref output_ty) = *ret_ty {
+        if let ast::FnRetTy::Ty(output_ty) = ret_ty {
             if let ast::TyKind::Never = output_ty.kind {
                 // Do nothing.
             } else {
@@ -385,6 +431,14 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             ast::ExprKind::TryBlock(_) => {
                 gate_feature_post!(&self, try_blocks, e.span, "`try` expression is experimental");
             }
+            ast::ExprKind::Closure(box ast::Closure { constness: ast::Const::Yes(_), .. }) => {
+                gate_feature_post!(
+                    &self,
+                    const_closures,
+                    e.span,
+                    "const closures are experimental"
+                );
+            }
             _ => {}
         }
         visit::walk_expr(self, e)
@@ -429,10 +483,19 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         visit::walk_pat(self, pattern)
     }
 
+    fn visit_poly_trait_ref(&mut self, t: &'a ast::PolyTraitRef) {
+        self.check_late_bound_lifetime_defs(&t.bound_generic_params);
+        visit::walk_poly_trait_ref(self, t);
+    }
+
     fn visit_fn(&mut self, fn_kind: FnKind<'a>, span: Span, _: NodeId) {
         if let Some(header) = fn_kind.header() {
             // Stability of const fn methods are covered in `visit_assoc_item` below.
             self.check_extern(header.ext, header.constness);
+        }
+
+        if let FnKind::Closure(ast::ClosureBinder::For { generic_params, .. }, ..) = fn_kind {
+            self.check_late_bound_lifetime_defs(generic_params);
         }
 
         if fn_kind.ctxt() != Some(FnCtxt::Foreign) && fn_kind.decl().c_variadic() {
@@ -455,9 +518,9 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_assoc_item(&mut self, i: &'a ast::AssocItem, ctxt: AssocCtxt) {
-        let is_fn = match i.kind {
+        let is_fn = match &i.kind {
             ast::AssocItemKind::Fn(_) => true,
-            ast::AssocItemKind::Type(box ast::TyAlias { ref ty, .. }) => {
+            ast::AssocItemKind::Type(box ast::TyAlias { ty, .. }) => {
                 if let (Some(_), AssocCtxt::Trait) = (ty, ctxt) {
                     gate_feature_post!(
                         &self,
@@ -630,7 +693,7 @@ fn check_incompatible_features(sess: &Session) {
             {
                 let spans = vec![f1_span, f2_span];
                 sess.struct_span_err(
-                    spans.clone(),
+                    spans,
                     &format!(
                         "features `{}` and `{}` are incompatible, using them at the same time \
                         is not allowed",

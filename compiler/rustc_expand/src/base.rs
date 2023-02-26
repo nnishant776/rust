@@ -1,7 +1,11 @@
+#![deny(rustc::untranslatable_diagnostic)]
+
+use crate::errors;
 use crate::expand::{self, AstFragment, Invocation};
 use crate::module::DirOwnership;
 
 use rustc_ast::attr::MarkedAttrs;
+use rustc_ast::mut_visit::DummyAstNode;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Nonterminal};
 use rustc_ast::tokenstream::TokenStream;
@@ -16,19 +20,20 @@ use rustc_errors::{
 use rustc_lint_defs::builtin::PROC_MACRO_BACK_COMPAT;
 use rustc_lint_defs::{BufferedEarlyLint, BuiltinLintDiagnostics};
 use rustc_parse::{self, parser, MACRO_ARGUMENTS};
+use rustc_session::errors::report_lit_error;
 use rustc_session::{parse::ParseSess, Limit, Session};
 use rustc_span::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{BytePos, FileName, RealFileName, Span, DUMMY_SP};
+use rustc_span::{BytePos, FileName, Span, DUMMY_SP};
 use smallvec::{smallvec, SmallVec};
-
 use std::default::Default;
 use std::iter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use thin_vec::ThinVec;
 
 pub(crate) use rustc_span::hygiene::MacroKind;
 
@@ -55,21 +60,21 @@ pub enum Annotatable {
 
 impl Annotatable {
     pub fn span(&self) -> Span {
-        match *self {
-            Annotatable::Item(ref item) => item.span,
-            Annotatable::TraitItem(ref trait_item) => trait_item.span,
-            Annotatable::ImplItem(ref impl_item) => impl_item.span,
-            Annotatable::ForeignItem(ref foreign_item) => foreign_item.span,
-            Annotatable::Stmt(ref stmt) => stmt.span,
-            Annotatable::Expr(ref expr) => expr.span,
-            Annotatable::Arm(ref arm) => arm.span,
-            Annotatable::ExprField(ref field) => field.span,
-            Annotatable::PatField(ref fp) => fp.pat.span,
-            Annotatable::GenericParam(ref gp) => gp.ident.span,
-            Annotatable::Param(ref p) => p.span,
-            Annotatable::FieldDef(ref sf) => sf.span,
-            Annotatable::Variant(ref v) => v.span,
-            Annotatable::Crate(ref c) => c.spans.inner_span,
+        match self {
+            Annotatable::Item(item) => item.span,
+            Annotatable::TraitItem(trait_item) => trait_item.span,
+            Annotatable::ImplItem(impl_item) => impl_item.span,
+            Annotatable::ForeignItem(foreign_item) => foreign_item.span,
+            Annotatable::Stmt(stmt) => stmt.span,
+            Annotatable::Expr(expr) => expr.span,
+            Annotatable::Arm(arm) => arm.span,
+            Annotatable::ExprField(field) => field.span,
+            Annotatable::PatField(fp) => fp.pat.span,
+            Annotatable::GenericParam(gp) => gp.ident.span,
+            Annotatable::Param(p) => p.span,
+            Annotatable::FieldDef(sf) => sf.span,
+            Annotatable::Variant(v) => v.span,
+            Annotatable::Crate(c) => c.spans.inner_span,
         }
     }
 
@@ -242,14 +247,15 @@ pub enum ExpandResult<T, U> {
     Retry(U),
 }
 
-// `meta_item` is the attribute, and `item` is the item being modified.
 pub trait MultiItemModifier {
+    /// `meta_item` is the attribute, and `item` is the item being modified.
     fn expand(
         &self,
         ecx: &mut ExtCtxt<'_>,
         span: Span,
         meta_item: &ast::MetaItem,
         item: Annotatable,
+        is_derive_const: bool,
     ) -> ExpandResult<Vec<Annotatable>, Annotatable>;
 }
 
@@ -263,6 +269,7 @@ where
         span: Span,
         meta_item: &ast::MetaItem,
         item: Annotatable,
+        _is_derive_const: bool,
     ) -> ExpandResult<Vec<Annotatable>, Annotatable> {
         ExpandResult::Ready(self(ecx, span, meta_item, item))
     }
@@ -505,7 +512,7 @@ impl MacResult for MacEager {
             return Some(p);
         }
         if let Some(e) = self.expr {
-            if let ast::ExprKind::Lit(_) = e.kind {
+            if matches!(e.kind, ast::ExprKind::Lit(_) | ast::ExprKind::IncludedBytes(_)) {
                 return Some(P(ast::Pat {
                     id: ast::DUMMY_NODE_ID,
                     span: e.span,
@@ -548,7 +555,7 @@ impl DummyResult {
     pub fn raw_expr(sp: Span, is_error: bool) -> P<ast::Expr> {
         P(ast::Expr {
             id: ast::DUMMY_NODE_ID,
-            kind: if is_error { ast::ExprKind::Err } else { ast::ExprKind::Tup(Vec::new()) },
+            kind: if is_error { ast::ExprKind::Err } else { ast::ExprKind::Tup(ThinVec::new()) },
             span: sp,
             attrs: ast::AttrVec::new(),
             tokens: None,
@@ -564,7 +571,7 @@ impl DummyResult {
     pub fn raw_ty(sp: Span, is_error: bool) -> P<ast::Ty> {
         P(ast::Ty {
             id: ast::DUMMY_NODE_ID,
-            kind: if is_error { ast::TyKind::Err } else { ast::TyKind::Tup(Vec::new()) },
+            kind: if is_error { ast::TyKind::Err } else { ast::TyKind::Tup(ThinVec::new()) },
             span: sp,
             tokens: None,
         })
@@ -635,6 +642,10 @@ impl MacResult for DummyResult {
     fn make_variants(self: Box<DummyResult>) -> Option<SmallVec<[ast::Variant; 1]>> {
         Some(SmallVec::new())
     }
+
+    fn make_crate(self: Box<DummyResult>) -> Option<ast::Crate> {
+        Some(DummyAstNode::dummy())
+    }
 }
 
 /// A syntax extension kind.
@@ -674,8 +685,13 @@ pub enum SyntaxExtensionKind {
 
     /// A token-based derive macro.
     Derive(
-        /// An expander with signature TokenStream -> TokenStream (not yet).
+        /// An expander with signature TokenStream -> TokenStream.
         /// The produced TokenSteam is appended to the input TokenSteam.
+        ///
+        /// FIXME: The text above describes how this should work. Currently it
+        /// is handled identically to `LegacyDerive`. It should be migrated to
+        /// a token-based representation like `Bang` and `Attr`, instead of
+        /// using `MultiItemModifier`.
         Box<dyn MultiItemModifier + sync::Sync + sync::Send>,
     ),
 
@@ -781,26 +797,16 @@ impl SyntaxExtension {
             .unwrap_or_else(|| (None, helper_attrs));
         let (stability, const_stability, body_stability) = attr::find_stability(&sess, attrs, span);
         if let Some((_, sp)) = const_stability {
-            sess.parse_sess
-                .span_diagnostic
-                .struct_span_err(sp, "macros cannot have const stability attributes")
-                .span_label(sp, "invalid const stability attribute")
-                .span_label(
-                    sess.source_map().guess_head_span(span),
-                    "const stability attribute affects this macro",
-                )
-                .emit();
+            sess.emit_err(errors::MacroConstStability {
+                span: sp,
+                head_span: sess.source_map().guess_head_span(span),
+            });
         }
         if let Some((_, sp)) = body_stability {
-            sess.parse_sess
-                .span_diagnostic
-                .struct_span_err(sp, "macros cannot have body stability attributes")
-                .span_label(sp, "invalid body stability attribute")
-                .span_label(
-                    sess.source_map().guess_head_span(span),
-                    "body stability attribute affects this macro",
-                )
-                .emit();
+            sess.emit_err(errors::MacroBodyStability {
+                span: sp,
+                head_span: sess.source_map().guess_head_span(span),
+            });
         }
 
         SyntaxExtension {
@@ -873,7 +879,7 @@ impl SyntaxExtension {
 /// Error type that denotes indeterminacy.
 pub struct Indeterminate;
 
-pub type DeriveResolutions = Vec<(ast::Path, Annotatable, Option<Lrc<SyntaxExtension>>)>;
+pub type DeriveResolutions = Vec<(ast::Path, Annotatable, Option<Lrc<SyntaxExtension>>, bool)>;
 
 pub trait ResolverExpand {
     fn next_node_id(&mut self) -> NodeId;
@@ -952,7 +958,7 @@ pub trait LintStoreExpand {
         node_id: NodeId,
         attrs: &[Attribute],
         items: &[P<Item>],
-        name: &str,
+        name: Symbol,
     );
 }
 
@@ -1137,8 +1143,8 @@ impl<'a> ExtCtxt<'a> {
         self.sess.parse_sess.span_diagnostic.span_bug(sp, msg);
     }
     pub fn trace_macros_diag(&mut self) {
-        for (sp, notes) in self.expansions.iter() {
-            let mut db = self.sess.parse_sess.span_diagnostic.span_note_diag(*sp, "trace_macro");
+        for (span, notes) in self.expansions.iter() {
+            let mut db = self.sess.parse_sess.create_note(errors::TraceMacro { span: *span });
             for note in notes {
                 db.note(note);
             }
@@ -1192,13 +1198,11 @@ pub fn resolve_path(
                 .expect("attempting to resolve a file path in an external file"),
             FileName::DocTest(path, _) => path,
             other => {
-                return Err(parse_sess.span_diagnostic.struct_span_err(
+                return Err(errors::ResolveRelativePath {
                     span,
-                    &format!(
-                        "cannot resolve relative path in non-file source `{}`",
-                        parse_sess.source_map().filename_for_diagnostics(&other)
-                    ),
-                ));
+                    path: parse_sess.source_map().filename_for_diagnostics(&other).to_string(),
+                }
+                .into_diagnostic(&parse_sess.span_diagnostic));
             }
         };
         result.pop();
@@ -1214,6 +1218,8 @@ pub fn resolve_path(
 /// The returned bool indicates whether an applicable suggestion has already been
 /// added to the diagnostic to avoid emitting multiple suggestions. `Err(None)`
 /// indicates that an ast error was encountered.
+// FIXME(Nilstrieb) Make this function setup translatable
+#[allow(rustc::untranslatable_diagnostic)]
 pub fn expr_to_spanned_string<'a>(
     cx: &'a mut ExtCtxt<'_>,
     expr: P<ast::Expr>,
@@ -1224,10 +1230,10 @@ pub fn expr_to_spanned_string<'a>(
     let expr = cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr();
 
     Err(match expr.kind {
-        ast::ExprKind::Lit(ref l) => match l.kind {
-            ast::LitKind::Str(s, style) => return Ok((s, style, expr.span)),
-            ast::LitKind::ByteStr(_) => {
-                let mut err = cx.struct_span_err(l.span, err_msg);
+        ast::ExprKind::Lit(token_lit) => match ast::LitKind::from_token_lit(token_lit) {
+            Ok(ast::LitKind::Str(s, style)) => return Ok((s, style, expr.span)),
+            Ok(ast::LitKind::ByteStr(..)) => {
+                let mut err = cx.struct_span_err(expr.span, err_msg);
                 let span = expr.span.shrink_to_lo();
                 err.span_suggestion(
                     span.with_hi(span.lo() + BytePos(1)),
@@ -1237,8 +1243,12 @@ pub fn expr_to_spanned_string<'a>(
                 );
                 Some((err, true))
             }
-            ast::LitKind::Err => None,
-            _ => Some((cx.struct_span_err(l.span, err_msg), false)),
+            Ok(ast::LitKind::Err) => None,
+            Err(err) => {
+                report_lit_error(&cx.sess.parse_sess, err, token_lit, expr.span);
+                None
+            }
+            _ => Some((cx.struct_span_err(expr.span, err_msg), false)),
         },
         ast::ExprKind::Err => None,
         _ => Some((cx.struct_span_err(expr.span, err_msg), false)),
@@ -1268,9 +1278,9 @@ pub fn expr_to_string(
 /// compilation should call
 /// `cx.parse_sess.span_diagnostic.abort_if_errors()` (this should be
 /// done as rarely as possible).
-pub fn check_zero_tts(cx: &ExtCtxt<'_>, sp: Span, tts: TokenStream, name: &str) {
+pub fn check_zero_tts(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream, name: &str) {
     if !tts.is_empty() {
-        cx.span_err(sp, &format!("{} takes no arguments", name));
+        cx.emit_err(errors::TakesNoArguments { span, name });
     }
 }
 
@@ -1292,31 +1302,27 @@ pub fn parse_expr(p: &mut parser::Parser<'_>) -> Option<P<ast::Expr>> {
 /// expect exactly one string literal, or emit an error and return `None`.
 pub fn get_single_str_from_tts(
     cx: &mut ExtCtxt<'_>,
-    sp: Span,
+    span: Span,
     tts: TokenStream,
     name: &str,
 ) -> Option<Symbol> {
     let mut p = cx.new_parser_from_tts(tts);
     if p.token == token::Eof {
-        cx.span_err(sp, &format!("{} takes 1 argument", name));
+        cx.emit_err(errors::OnlyOneArgument { span, name });
         return None;
     }
     let ret = parse_expr(&mut p)?;
     let _ = p.eat(&token::Comma);
 
     if p.token != token::Eof {
-        cx.span_err(sp, &format!("{} takes 1 argument", name));
+        cx.emit_err(errors::OnlyOneArgument { span, name });
     }
     expr_to_string(cx, ret, "argument must be a string literal").map(|(s, _)| s)
 }
 
 /// Extracts comma-separated expressions from `tts`.
 /// On error, emit it, and return `None`.
-pub fn get_exprs_from_tts(
-    cx: &mut ExtCtxt<'_>,
-    sp: Span,
-    tts: TokenStream,
-) -> Option<Vec<P<ast::Expr>>> {
+pub fn get_exprs_from_tts(cx: &mut ExtCtxt<'_>, tts: TokenStream) -> Option<Vec<P<ast::Expr>>> {
     let mut p = cx.new_parser_from_tts(tts);
     let mut es = Vec::new();
     while p.token != token::Eof {
@@ -1331,7 +1337,7 @@ pub fn get_exprs_from_tts(
             continue;
         }
         if p.token != token::Eof {
-            cx.span_err(sp, "expected token: `,`");
+            cx.emit_err(errors::ExpectedCommaInList { span: p.token.span });
             return None;
         }
     }
@@ -1341,64 +1347,65 @@ pub fn get_exprs_from_tts(
 pub fn parse_macro_name_and_helper_attrs(
     diag: &rustc_errors::Handler,
     attr: &Attribute,
-    descr: &str,
+    macro_type: &str,
 ) -> Option<(Symbol, Vec<Symbol>)> {
     // Once we've located the `#[proc_macro_derive]` attribute, verify
     // that it's of the form `#[proc_macro_derive(Foo)]` or
     // `#[proc_macro_derive(Foo, attributes(A, ..))]`
     let list = attr.meta_item_list()?;
     if list.len() != 1 && list.len() != 2 {
-        diag.span_err(attr.span, "attribute must have either one or two arguments");
+        diag.emit_err(errors::AttrNoArguments { span: attr.span });
         return None;
     }
     let Some(trait_attr) = list[0].meta_item() else {
-        diag.span_err(list[0].span(), "not a meta item");
+        diag.emit_err(errors::NotAMetaItem {span: list[0].span()});
         return None;
     };
     let trait_ident = match trait_attr.ident() {
         Some(trait_ident) if trait_attr.is_word() => trait_ident,
         _ => {
-            diag.span_err(trait_attr.span, "must only be one word");
+            diag.emit_err(errors::OnlyOneWord { span: trait_attr.span });
             return None;
         }
     };
 
     if !trait_ident.name.can_be_raw() {
-        diag.span_err(
-            trait_attr.span,
-            &format!("`{}` cannot be a name of {} macro", trait_ident, descr),
-        );
+        diag.emit_err(errors::CannotBeNameOfMacro {
+            span: trait_attr.span,
+            trait_ident,
+            macro_type,
+        });
     }
 
     let attributes_attr = list.get(1);
     let proc_attrs: Vec<_> = if let Some(attr) = attributes_attr {
         if !attr.has_name(sym::attributes) {
-            diag.span_err(attr.span(), "second argument must be `attributes`");
+            diag.emit_err(errors::ArgumentNotAttributes { span: attr.span() });
         }
         attr.meta_item_list()
             .unwrap_or_else(|| {
-                diag.span_err(attr.span(), "attribute must be of form: `attributes(foo, bar)`");
+                diag.emit_err(errors::AttributesWrongForm { span: attr.span() });
                 &[]
             })
             .iter()
             .filter_map(|attr| {
                 let Some(attr) = attr.meta_item() else {
-                    diag.span_err(attr.span(), "not a meta item");
+                    diag.emit_err(errors::AttributeMetaItem { span: attr.span() });
                     return None;
                 };
 
                 let ident = match attr.ident() {
                     Some(ident) if attr.is_word() => ident,
                     _ => {
-                        diag.span_err(attr.span, "must only be one word");
+                        diag.emit_err(errors::AttributeSingleWord { span: attr.span });
                         return None;
                     }
                 };
                 if !ident.name.can_be_raw() {
-                    diag.span_err(
-                        attr.span,
-                        &format!("`{}` cannot be a name of derive helper attribute", ident),
-                    );
+                    diag.emit_err(errors::HelperAttributeNameInvalid {
+                        span: attr.span,
+                        name: ident,
+                    });
                 }
 
                 Some(ident.name)
@@ -1424,8 +1431,10 @@ fn pretty_printing_compatibility_hack(item: &Item, sess: &ParseSess) -> bool {
             if let [variant] = &*enum_def.variants {
                 if variant.ident.name == sym::Input {
                     let filename = sess.source_map().span_to_filename(item.ident.span);
-                    if let FileName::Real(RealFileName::LocalPath(path)) = filename {
-                        if let Some(c) = path
+                    if let FileName::Real(real) = filename {
+                        if let Some(c) = real
+                            .local_path()
+                            .unwrap_or(Path::new(""))
                             .components()
                             .flat_map(|c| c.as_os_str().to_str())
                             .find(|c| c.starts_with("rental") || c.starts_with("allsorts-rental"))
@@ -1433,7 +1442,7 @@ fn pretty_printing_compatibility_hack(item: &Item, sess: &ParseSess) -> bool {
                             let crate_matches = if c.starts_with("allsorts-rental") {
                                 true
                             } else {
-                                let mut version = c.trim_start_matches("rental-").split(".");
+                                let mut version = c.trim_start_matches("rental-").split('.');
                                 version.next() == Some("0")
                                     && version.next() == Some("5")
                                     && version

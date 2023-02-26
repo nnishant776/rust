@@ -80,7 +80,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             return Ok(false);
         }
 
-        let req_align = this.read_scalar(align_op)?.to_machine_usize(this)?;
+        let req_align = this.read_target_usize(align_op)?;
 
         // Stop if the alignment is not a power of two.
         if !req_align.is_power_of_two() {
@@ -89,6 +89,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         let ptr = this.read_pointer(ptr_op)?;
+        // If this carries no provenance, treat it like an integer.
+        if ptr.provenance.is_none() {
+            // Use actual implementation.
+            return Ok(false);
+        }
+
         if let Ok((alloc_id, _offset, _)) = this.ptr_try_get_alloc_id(ptr) {
             // Only do anything if we can identify the allocation this goes to.
             let (_size, cur_align, _kind) = this.get_alloc_info(alloc_id);
@@ -100,7 +106,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         // Return error result (usize::MAX), and jump to caller.
-        this.write_scalar(Scalar::from_machine_usize(this.machine_usize_max(), this), dest)?;
+        this.write_scalar(Scalar::from_target_usize(this.target_usize_max(), this), dest)?;
         this.go_to_block(ret);
         Ok(true)
     }

@@ -4,9 +4,10 @@
 //! That's useful because it means other passes (e.g. promotion) can rely on `const`s
 //! to be const-safe.
 
-use std::convert::TryFrom;
 use std::fmt::{Display, Write};
 use std::num::NonZeroUsize;
+
+use either::{Left, Right};
 
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashSet;
@@ -22,18 +23,18 @@ use std::hash::Hash;
 // for the validation errors
 use super::UndefinedBehaviorInfo::*;
 use super::{
-    CheckInAllocMsg, GlobalAlloc, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy, Machine,
-    MemPlaceMeta, OpTy, Scalar, ValueVisitor,
+    AllocId, CheckInAllocMsg, GlobalAlloc, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy,
+    Machine, MemPlaceMeta, OpTy, Pointer, Scalar, ValueVisitor,
 };
 
 macro_rules! throw_validation_failure {
-    ($where:expr, { $( $what_fmt:expr ),+ } $( expected { $( $expected_fmt:expr ),+ } )?) => {{
+    ($where:expr, { $( $what_fmt:tt )* } $( expected { $( $expected_fmt:tt )* } )?) => {{
         let mut msg = String::new();
         msg.push_str("encountered ");
-        write!(&mut msg, $($what_fmt),+).unwrap();
+        write!(&mut msg, $($what_fmt)*).unwrap();
         $(
             msg.push_str(", but expected ");
-            write!(&mut msg, $($expected_fmt),+).unwrap();
+            write!(&mut msg, $($expected_fmt)*).unwrap();
         )?
         let path = rustc_middle::ty::print::with_no_trimmed_paths!({
             let where_ = &$where;
@@ -81,7 +82,7 @@ macro_rules! throw_validation_failure {
 ///
 macro_rules! try_validation {
     ($e:expr, $where:expr,
-    $( $( $p:pat_param )|+ => { $( $what_fmt:expr ),+ } $( expected { $( $expected_fmt:expr ),+ } )? ),+ $(,)?
+    $( $( $p:pat_param )|+ => { $( $what_fmt:tt )* } $( expected { $( $expected_fmt:tt )* } )? ),+ $(,)?
     ) => {{
         match $e {
             Ok(x) => x,
@@ -92,7 +93,7 @@ macro_rules! try_validation {
                     InterpError::UndefinedBehavior($($p)|+) =>
                        throw_validation_failure!(
                             $where,
-                            { $( $what_fmt ),+ } $( expected { $( $expected_fmt ),+ } )?
+                            { $( $what_fmt )* } $( expected { $( $expected_fmt )* } )?
                         )
                 ),+,
                 #[allow(unreachable_patterns)]
@@ -174,7 +175,7 @@ fn write_path(out: &mut String, path: &[PathElem]) {
             TupleElem(idx) => write!(out, ".{}", idx),
             ArrayElem(idx) => write!(out, "[{}]", idx),
             // `.<deref>` does not match Rust syntax, but it is more readable for long paths -- and
-            // some of the other items here also are not Rust syntax.  Actually we can't
+            // some of the other items here also are not Rust syntax. Actually we can't
             // even use the usual syntax because we are just showing the projections,
             // not the root.
             Deref => write!(out, ".<deref>"),
@@ -334,7 +335,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
     ) -> InterpResult<'tcx> {
         let tail = self.ecx.tcx.struct_tail_erasing_lifetimes(pointee.ty, self.ecx.param_env);
         match tail.kind() {
-            ty::Dynamic(..) => {
+            ty::Dynamic(_, _, ty::Dyn) => {
                 let vtable = meta.unwrap_meta().to_pointer(self.ecx)?;
                 // Make sure it is a genuine vtable pointer.
                 let (_ty, _trait) = try_validation!(
@@ -347,7 +348,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 // FIXME: check if the type/trait match what ty::Dynamic says?
             }
             ty::Slice(..) | ty::Str => {
-                let _len = meta.unwrap_meta().to_machine_usize(self.ecx)?;
+                let _len = meta.unwrap_meta().to_target_usize(self.ecx)?;
                 // We do not check that `len * elem_size <= isize::MAX`:
                 // that is only required for references, and there it falls out of the
                 // "dereferenceable" check performed by Stacked Borrows.
@@ -398,12 +399,15 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 {
                     "an unaligned {kind} (required {} byte alignment but found {})",
                     required.bytes(),
-                    has.bytes()
+                    has.bytes(),
                 },
             DanglingIntPointer(0, _) =>
                 { "a null {kind}" },
             DanglingIntPointer(i, _) =>
-                { "a dangling {kind} (address {i:#x} is unallocated)" },
+                {
+                    "a dangling {kind} ({pointer} has no provenance)",
+                    pointer = Pointer::<Option<AllocId>>::from_addr_invalid(*i),
+                },
             PointerOutOfBounds { .. } =>
                 { "a dangling {kind} (going beyond the bounds of its allocation)" },
             // This cannot happen during const-eval (because interning already detects
@@ -418,7 +422,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
             )
         }
         // Recursive checking
-        if let Some(ref mut ref_tracking) = self.ref_tracking {
+        if let Some(ref_tracking) = self.ref_tracking.as_deref_mut() {
             // Proceed recursively even for ZST, no reason to skip them!
             // `!` is a ZST and we want to validate it.
             if let Ok((alloc_id, _offset, _prov)) = self.ecx.ptr_try_get_alloc_id(place.ptr) {
@@ -483,7 +487,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
     }
 
     /// Check if this is a value of primitive type, and if yes check the validity of the value
-    /// at that type.  Return `true` if the type is indeed primitive.
+    /// at that type. Return `true` if the type is indeed primitive.
     fn try_visit_primitive(
         &mut self,
         value: &OpTy<'tcx, M::Provenance>,
@@ -600,8 +604,8 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
             | ty::Placeholder(..)
             | ty::Bound(..)
             | ty::Param(..)
-            | ty::Opaque(..)
-            | ty::Projection(..)
+            | ty::Alias(..)
+            | ty::GeneratorWitnessMIR(..)
             | ty::GeneratorWitness(..) => bug!("Encountered invalid type {:?}", ty),
         }
     }
@@ -623,7 +627,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 // Can only happen during CTFE.
                 // We support 2 kinds of ranges here: full range, and excluding zero.
                 if start == 1 && end == max_value {
-                    // Only null is the niche.  So make sure the ptr is NOT null.
+                    // Only null is the niche. So make sure the ptr is NOT null.
                     if self.ecx.scalar_may_be_null(scalar)? {
                         throw_validation_failure!(self.path,
                             { "a potentially null pointer" }
@@ -759,7 +763,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
         // Recursively walk the value at its type.
         self.walk_value(op)?;
 
-        // *After* all of this, check the ABI.  We need to check the ABI to handle
+        // *After* all of this, check the ABI. We need to check the ABI to handle
         // types like `NonNull` where the `Scalar` info is more restrictive than what
         // the fields say (`rustc_layout_scalar_valid_range_start`).
         // But in most cases, this will just propagate what the fields say,
@@ -783,18 +787,10 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                 }
             }
             Abi::ScalarPair(a_layout, b_layout) => {
-                // There is no `rustc_layout_scalar_valid_range_start` for pairs, so
-                // we would validate these things as we descend into the fields,
-                // but that can miss bugs in layout computation. Layout computation
-                // is subtle due to enums having ScalarPair layout, where one field
-                // is the discriminant.
-                if cfg!(debug_assertions)
-                    && !a_layout.is_uninit_valid()
-                    && !b_layout.is_uninit_valid()
-                {
-                    // We can only proceed if *both* scalars need to be initialized.
-                    // FIXME: find a way to also check ScalarPair when one side can be uninit but
-                    // the other must be init.
+                // We can only proceed if *both* scalars need to be initialized.
+                // FIXME: find a way to also check ScalarPair when one side can be uninit but
+                // the other must be init.
+                if !a_layout.is_uninit_valid() && !b_layout.is_uninit_valid() {
                     let (a, b) =
                         self.read_immediate(op, "initiailized scalar value")?.to_scalar_pair();
                     self.visit_scalar(a, a_layout)?;
@@ -852,9 +848,9 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                     return Ok(());
                 }
                 // Now that we definitely have a non-ZST array, we know it lives in memory.
-                let mplace = match op.try_as_mplace() {
-                    Ok(mplace) => mplace,
-                    Err(imm) => match *imm {
+                let mplace = match op.as_mplace_or_imm() {
+                    Left(mplace) => mplace,
+                    Right(imm) => match *imm {
                         Immediate::Uninit =>
                             throw_validation_failure!(self.path, { "uninitialized bytes" }),
                         Immediate::Scalar(..) | Immediate::ScalarPair(..) =>
@@ -865,10 +861,10 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                 // Optimization: we just check the entire range at once.
                 // NOTE: Keep this in sync with the handling of integer and float
                 // types above, in `visit_primitive`.
-                // In run-time mode, we accept pointers in here.  This is actually more
+                // In run-time mode, we accept pointers in here. This is actually more
                 // permissive than a per-element check would be, e.g., we accept
                 // a &[u8] that contains a pointer even though bytewise checking would
-                // reject it.  However, that's good: We don't inherently want
+                // reject it. However, that's good: We don't inherently want
                 // to reject those pointers, we just do not have the machinery to
                 // talk about parts of a pointer.
                 // We also accept uninit, for consistency with the slow path.

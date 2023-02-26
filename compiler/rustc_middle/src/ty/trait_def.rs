@@ -1,6 +1,6 @@
 use crate::traits::specialization_graph;
 use crate::ty::fast_reject::{self, SimplifiedType, TreatParams};
-use crate::ty::visit::TypeVisitable;
+use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{Ident, Ty, TyCtxt};
 use hir::def_id::LOCAL_CRATE;
 use rustc_hir as hir;
@@ -30,6 +30,15 @@ pub struct TraitDef {
     /// that all its associated items have defaults that cannot be overridden,
     /// and thus `impl`s of it are allowed to overlap.
     pub is_marker: bool,
+
+    /// If `true`, then this trait has to `#[rustc_coinductive]` attribute or
+    /// is an auto trait. This indicates that trait solver cycles involving an
+    /// `X: ThisTrait` goal are accepted.
+    ///
+    /// In the future all traits should be coinductive, but we need a better
+    /// formal understanding of what exactly that means and should probably
+    /// also have already switched to the new trait solver.
+    pub is_coinductive: bool,
 
     /// If `true`, then this trait has the `#[rustc_skip_array_during_method_dispatch]`
     /// attribute, indicating that editions before 2021 should not consider this trait
@@ -81,28 +90,6 @@ impl TraitImpls {
 }
 
 impl<'tcx> TraitDef {
-    pub fn new(
-        def_id: DefId,
-        unsafety: hir::Unsafety,
-        paren_sugar: bool,
-        has_auto_impl: bool,
-        is_marker: bool,
-        skip_array_during_method_dispatch: bool,
-        specialization_kind: TraitSpecializationKind,
-        must_implement_one_of: Option<Box<[Ident]>>,
-    ) -> TraitDef {
-        TraitDef {
-            def_id,
-            unsafety,
-            paren_sugar,
-            has_auto_impl,
-            is_marker,
-            skip_array_during_method_dispatch,
-            specialization_kind,
-            must_implement_one_of,
-        }
-    }
-
     pub fn ancestors(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -211,7 +198,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 }
 
-// Query provider for `trait_impls_of`.
+/// Query provider for `trait_impls_of`.
 pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> TraitImpls {
     let mut impls = TraitImpls::default();
 
@@ -238,7 +225,7 @@ pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> Trait
     for &impl_def_id in tcx.hir().trait_impls(trait_id) {
         let impl_def_id = impl_def_id.to_def_id();
 
-        let impl_self_ty = tcx.type_of(impl_def_id);
+        let impl_self_ty = tcx.type_of(impl_def_id).subst_identity();
         if impl_self_ty.references_error() {
             continue;
         }
@@ -255,7 +242,7 @@ pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> Trait
     impls
 }
 
-// Query provider for `incoherent_impls`.
+/// Query provider for `incoherent_impls`.
 pub(super) fn incoherent_impls_provider(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &[DefId] {
     let mut impls = Vec::new();
 

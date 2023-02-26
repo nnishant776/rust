@@ -27,7 +27,7 @@ use rustc_index::vec::IndexVec;
 use rustc_middle::mir;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
-use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TypeVisitable};
+use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TypeVisitableExt};
 use rustc_session::config::{self, DebugInfo};
 use rustc_session::Session;
 use rustc_span::symbol::Symbol;
@@ -39,6 +39,7 @@ use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::iter;
+use std::ops::Range;
 
 mod create_scope_map;
 pub mod gdb;
@@ -163,12 +164,14 @@ impl<'ll> DebugInfoBuilderMethods for Builder<'_, 'll, '_> {
         variable_alloca: Self::Value,
         direct_offset: Size,
         indirect_offsets: &[Size],
+        fragment: Option<Range<Size>>,
     ) {
-        // Convert the direct and indirect offsets to address ops.
+        // Convert the direct and indirect offsets and fragment byte range to address ops.
         // FIXME(eddyb) use `const`s instead of getting the values via FFI,
         // the values should match the ones in the DWARF standard anyway.
         let op_deref = || unsafe { llvm::LLVMRustDIBuilderCreateOpDeref() };
         let op_plus_uconst = || unsafe { llvm::LLVMRustDIBuilderCreateOpPlusUconst() };
+        let op_llvm_fragment = || unsafe { llvm::LLVMRustDIBuilderCreateOpLLVMFragment() };
         let mut addr_ops = SmallVec::<[u64; 8]>::new();
 
         if direct_offset.bytes() > 0 {
@@ -181,6 +184,13 @@ impl<'ll> DebugInfoBuilderMethods for Builder<'_, 'll, '_> {
                 addr_ops.push(op_plus_uconst());
                 addr_ops.push(offset.bytes() as u64);
             }
+        }
+        if let Some(fragment) = fragment {
+            // `DW_OP_LLVM_fragment` takes as arguments the fragment's
+            // offset and size, both of them in bits.
+            addr_ops.push(op_llvm_fragment());
+            addr_ops.push(fragment.start.bits() as u64);
+            addr_ops.push((fragment.end - fragment.start).bits() as u64);
         }
 
         unsafe {
@@ -498,7 +508,7 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
                     let impl_self_ty = cx.tcx.subst_and_normalize_erasing_regions(
                         instance.substs,
                         ty::ParamEnv::reveal_all(),
-                        cx.tcx.type_of(impl_def_id),
+                        cx.tcx.type_of(impl_def_id).skip_binder(),
                     );
 
                     // Only "class" methods are generally understood by LLVM,

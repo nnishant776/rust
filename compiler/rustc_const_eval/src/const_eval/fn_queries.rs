@@ -17,7 +17,8 @@ pub fn is_unstable_const_fn(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Symbol> {
 
 pub fn is_parent_const_impl_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     let parent_id = tcx.local_parent(def_id);
-    tcx.def_kind(parent_id) == DefKind::Impl && tcx.constness(parent_id) == hir::Constness::Const
+    matches!(tcx.def_kind(parent_id), DefKind::Impl { .. })
+        && tcx.constness(parent_id) == hir::Constness::Const
 }
 
 /// Checks whether an item is considered to be `const`. If it is a constructor, it is const. If
@@ -41,6 +42,7 @@ fn constness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Constness {
             };
             if is_const { hir::Constness::Const } else { hir::Constness::NotConst }
         }
+        hir::Node::Expr(e) if let hir::ExprKind::Closure(c) = e.kind => c.constness,
         _ => {
             if let Some(fn_kind) = node.fn_kind() {
                 if fn_kind.constness() == hir::Constness::Const {
@@ -65,7 +67,7 @@ fn is_promotable_const_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
                 if cfg!(debug_assertions) && stab.promotable {
                     let sig = tcx.fn_sig(def_id);
                     assert_eq!(
-                        sig.unsafety(),
+                        sig.skip_binder().unsafety(),
                         hir::Unsafety::Normal,
                         "don't mark const unsafe fns as promotable",
                         // https://github.com/rust-lang/rust/pull/53851#issuecomment-418760682

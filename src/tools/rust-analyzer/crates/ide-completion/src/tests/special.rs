@@ -2,10 +2,26 @@
 
 use expect_test::{expect, Expect};
 
-use crate::tests::{check_edit, completion_list_no_kw};
+use crate::tests::{
+    check_edit, completion_list, completion_list_no_kw, completion_list_with_trigger_character,
+};
+
+fn check_no_kw(ra_fixture: &str, expect: Expect) {
+    let actual = completion_list_no_kw(ra_fixture);
+    expect.assert_eq(&actual)
+}
 
 fn check(ra_fixture: &str, expect: Expect) {
-    let actual = completion_list_no_kw(ra_fixture);
+    let actual = completion_list(ra_fixture);
+    expect.assert_eq(&actual)
+}
+
+pub(crate) fn check_with_trigger_character(
+    ra_fixture: &str,
+    trigger_character: Option<char>,
+    expect: Expect,
+) {
+    let actual = completion_list_with_trigger_character(ra_fixture, trigger_character);
     expect.assert_eq(&actual)
 }
 
@@ -50,9 +66,9 @@ fn _alpha() {}
 
 #[test]
 fn completes_prelude() {
-    check(
+    check_no_kw(
         r#"
-//- /main.rs crate:main deps:std
+//- /main.rs edition:2018 crate:main deps:std
 fn foo() { let x: $0 }
 
 //- /std/lib.rs crate:std
@@ -72,9 +88,9 @@ pub mod prelude {
 
 #[test]
 fn completes_prelude_macros() {
-    check(
+    check_no_kw(
         r#"
-//- /main.rs crate:main deps:std
+//- /main.rs edition:2018 crate:main deps:std
 fn f() {$0}
 
 //- /std/lib.rs crate:std
@@ -101,21 +117,21 @@ mod macros {
 
 #[test]
 fn completes_std_prelude_if_core_is_defined() {
-    check(
+    check_no_kw(
         r#"
 //- /main.rs crate:main deps:core,std
 fn foo() { let x: $0 }
 
 //- /core/lib.rs crate:core
 pub mod prelude {
-    pub mod rust_2018 {
+    pub mod rust_2021 {
         pub struct Option;
     }
 }
 
 //- /std/lib.rs crate:std deps:core
 pub mod prelude {
-    pub mod rust_2018 {
+    pub mod rust_2021 {
         pub struct String;
     }
 }
@@ -131,7 +147,7 @@ pub mod prelude {
 
 #[test]
 fn respects_doc_hidden() {
-    check(
+    check_no_kw(
         r#"
 //- /lib.rs crate:lib deps:std
 fn f() {
@@ -159,7 +175,7 @@ pub mod prelude {
 
 #[test]
 fn respects_doc_hidden_in_assoc_item_list() {
-    check(
+    check_no_kw(
         r#"
 //- /lib.rs crate:lib deps:std
 struct S;
@@ -186,7 +202,7 @@ pub mod prelude {
 
 #[test]
 fn associated_item_visibility() {
-    check(
+    check_no_kw(
         r#"
 //- /lib.rs crate:lib new_source_root:library
 pub struct S;
@@ -213,7 +229,7 @@ fn foo() { let _ = lib::S::$0 }
 
 #[test]
 fn completes_union_associated_method() {
-    check(
+    check_no_kw(
         r#"
 union U {};
 impl U { fn m() { } }
@@ -228,7 +244,7 @@ fn foo() { let _ = U::$0 }
 
 #[test]
 fn completes_trait_associated_method_1() {
-    check(
+    check_no_kw(
         r#"
 trait Trait { fn m(); }
 
@@ -242,7 +258,7 @@ fn foo() { let _ = Trait::$0 }
 
 #[test]
 fn completes_trait_associated_method_2() {
-    check(
+    check_no_kw(
         r#"
 trait Trait { fn m(); }
 
@@ -259,7 +275,7 @@ fn foo() { let _ = S::$0 }
 
 #[test]
 fn completes_trait_associated_method_3() {
-    check(
+    check_no_kw(
         r#"
 trait Trait { fn m(); }
 
@@ -276,7 +292,7 @@ fn foo() { let _ = <S as Trait>::$0 }
 
 #[test]
 fn completes_ty_param_assoc_ty() {
-    check(
+    check_no_kw(
         r#"
 trait Super {
     type Ty;
@@ -309,7 +325,7 @@ fn foo<T: Sub>() { T::$0 }
 
 #[test]
 fn completes_self_param_assoc_ty() {
-    check(
+    check_no_kw(
         r#"
 trait Super {
     type Ty;
@@ -349,7 +365,7 @@ impl<T> Sub for Wrap<T> {
 
 #[test]
 fn completes_type_alias() {
-    check(
+    check_no_kw(
         r#"
 struct S;
 impl S { fn foo() {} }
@@ -367,7 +383,7 @@ fn main() { T::$0; }
 
 #[test]
 fn completes_qualified_macros() {
-    check(
+    check_no_kw(
         r#"
 #[macro_export]
 macro_rules! foo { () => {} }
@@ -383,7 +399,7 @@ fn main() { let _ = crate::$0 }
 
 #[test]
 fn does_not_complete_non_fn_macros() {
-    check(
+    check_no_kw(
         r#"
 mod m {
     #[rustc_builtin_macro]
@@ -394,7 +410,7 @@ fn f() {m::$0}
 "#,
         expect![[r#""#]],
     );
-    check(
+    check_no_kw(
         r#"
 mod m {
     #[rustc_builtin_macro]
@@ -409,7 +425,7 @@ fn f() {m::$0}
 
 #[test]
 fn completes_reexported_items_under_correct_name() {
-    check(
+    check_no_kw(
         r#"
 fn foo() { self::m::$0 }
 
@@ -466,7 +482,7 @@ mod p {
 
 #[test]
 fn completes_in_simple_macro_call() {
-    check(
+    check_no_kw(
         r#"
 macro_rules! m { ($e:expr) => { $e } }
 fn main() { m!(self::f$0); }
@@ -481,7 +497,7 @@ fn foo() {}
 
 #[test]
 fn function_mod_share_name() {
-    check(
+    check_no_kw(
         r#"
 fn foo() { self::m::$0 }
 
@@ -499,7 +515,7 @@ mod m {
 
 #[test]
 fn completes_hashmap_new() {
-    check(
+    check_no_kw(
         r#"
 struct RandomState;
 struct HashMap<K, V, S = RandomState> {}
@@ -520,7 +536,7 @@ fn foo() {
 #[test]
 fn completes_variant_through_self() {
     cov_mark::check!(completes_variant_through_self);
-    check(
+    check_no_kw(
         r#"
 enum Foo {
     Bar,
@@ -543,7 +559,7 @@ impl Foo {
 
 #[test]
 fn completes_non_exhaustive_variant_within_the_defining_crate() {
-    check(
+    check_no_kw(
         r#"
 enum Foo {
     #[non_exhaustive]
@@ -561,7 +577,7 @@ fn foo(self) {
             "#]],
     );
 
-    check(
+    check_no_kw(
         r#"
 //- /main.rs crate:main deps:e
 fn foo(self) {
@@ -584,7 +600,7 @@ enum Foo {
 #[test]
 fn completes_primitive_assoc_const() {
     cov_mark::check!(completes_primitive_assoc_const);
-    check(
+    check_no_kw(
         r#"
 //- /lib.rs crate:lib deps:core
 fn f() {
@@ -609,7 +625,7 @@ impl u8 {
 #[test]
 fn completes_variant_through_alias() {
     cov_mark::check!(completes_variant_through_alias);
-    check(
+    check_no_kw(
         r#"
 enum Foo {
     Bar
@@ -627,7 +643,7 @@ fn main() {
 
 #[test]
 fn respects_doc_hidden2() {
-    check(
+    check_no_kw(
         r#"
 //- /lib.rs crate:lib deps:dep
 fn f() {
@@ -656,7 +672,7 @@ pub mod m {}
 
 #[test]
 fn type_anchor_empty() {
-    check(
+    check_no_kw(
         r#"
 trait Foo {
     fn foo() -> Self;
@@ -679,7 +695,7 @@ fn bar() -> Bar {
 
 #[test]
 fn type_anchor_type() {
-    check(
+    check_no_kw(
         r#"
 trait Foo {
     fn foo() -> Self;
@@ -706,7 +722,7 @@ fn bar() -> Bar {
 
 #[test]
 fn type_anchor_type_trait() {
-    check(
+    check_no_kw(
         r#"
 trait Foo {
     fn foo() -> Self;
@@ -732,7 +748,7 @@ fn bar() -> Bar {
 
 #[test]
 fn completes_fn_in_pub_trait_generated_by_macro() {
-    check(
+    check_no_kw(
         r#"
 mod other_mod {
     macro_rules! make_method {
@@ -766,7 +782,7 @@ fn main() {
 
 #[test]
 fn completes_fn_in_pub_trait_generated_by_recursive_macro() {
-    check(
+    check_no_kw(
         r#"
 mod other_mod {
     macro_rules! make_method {
@@ -806,7 +822,7 @@ fn main() {
 
 #[test]
 fn completes_const_in_pub_trait_generated_by_macro() {
-    check(
+    check_no_kw(
         r#"
 mod other_mod {
     macro_rules! make_const {
@@ -838,7 +854,7 @@ fn main() {
 
 #[test]
 fn completes_locals_from_macros() {
-    check(
+    check_no_kw(
         r#"
 
 macro_rules! x {
@@ -866,7 +882,7 @@ fn main() {
 
 #[test]
 fn regression_12644() {
-    check(
+    check_no_kw(
         r#"
 macro_rules! __rust_force_expr {
     ($e:expr) => {
@@ -892,4 +908,83 @@ fn f() {
             me foo() fn(self)
         "#]],
     );
+}
+
+#[test]
+fn completes_after_colon_with_trigger() {
+    check_with_trigger_character(
+        r#"
+//- minicore: option
+fn foo { ::$0 }
+"#,
+        Some(':'),
+        expect![[r#"
+            md core
+        "#]],
+    );
+    check_with_trigger_character(
+        r#"
+//- minicore: option
+fn foo { /* test */::$0 }
+"#,
+        Some(':'),
+        expect![[r#"
+            md core
+        "#]],
+    );
+
+    check_with_trigger_character(
+        r#"
+fn foo { crate::$0 }
+"#,
+        Some(':'),
+        expect![[r#"
+            fn foo() fn()
+        "#]],
+    );
+
+    check_with_trigger_character(
+        r#"
+fn foo { crate:$0 }
+"#,
+        Some(':'),
+        expect![""],
+    );
+}
+
+#[test]
+fn completes_after_colon_without_trigger() {
+    check_with_trigger_character(
+        r#"
+fn foo { crate::$0 }
+"#,
+        None,
+        expect![[r#"
+            fn foo() fn()
+        "#]],
+    );
+
+    check_with_trigger_character(
+        r#"
+fn foo { crate:$0 }
+"#,
+        None,
+        expect![""],
+    );
+}
+
+#[test]
+fn no_completions_in_invalid_path() {
+    check(
+        r#"
+fn foo { crate:::$0 }
+"#,
+        expect![""],
+    );
+    check_no_kw(
+        r#"
+fn foo { crate::::$0 }
+"#,
+        expect![""],
+    )
 }

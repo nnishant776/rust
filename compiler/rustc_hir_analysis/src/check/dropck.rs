@@ -27,7 +27,7 @@ use rustc_middle::ty::{self, Predicate, Ty, TyCtxt};
 ///    cannot do `struct S<T>; impl<T:Clone> Drop for S<T> { ... }`).
 ///
 pub fn check_drop_impl(tcx: TyCtxt<'_>, drop_impl_did: DefId) -> Result<(), ErrorGuaranteed> {
-    let dtor_self_type = tcx.type_of(drop_impl_did);
+    let dtor_self_type = tcx.type_of(drop_impl_did).subst_identity();
     let dtor_predicates = tcx.predicates_of(drop_impl_did);
     match dtor_self_type.kind() {
         ty::Adt(adt_def, self_to_impl_substs) => {
@@ -46,7 +46,7 @@ pub fn check_drop_impl(tcx: TyCtxt<'_>, drop_impl_did: DefId) -> Result<(), Erro
             )
         }
         _ => {
-            // Destructors only work on nominal types.  This was
+            // Destructors only work on nominal types. This was
             // already checked by coherence, but compilation may
             // not have been terminated.
             let span = tcx.def_span(drop_impl_did);
@@ -71,7 +71,7 @@ fn ensure_drop_params_and_item_params_correspond<'tcx>(
 
     let drop_impl_span = tcx.def_span(drop_impl_did);
     let item_span = tcx.def_span(self_type_did);
-    let self_descr = tcx.def_kind(self_type_did).descr(self_type_did);
+    let self_descr = tcx.def_descr(self_type_did);
     let mut err =
         struct_span_err!(tcx.sess, drop_impl_span, E0366, "`Drop` impls cannot be specialized");
     match arg {
@@ -183,19 +183,27 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
             let predicate = predicate.kind();
             let p = p.kind();
             match (predicate.skip_binder(), p.skip_binder()) {
-                (ty::PredicateKind::Trait(a), ty::PredicateKind::Trait(b)) => {
-                    relator.relate(predicate.rebind(a), p.rebind(b)).is_ok()
-                }
-                (ty::PredicateKind::Projection(a), ty::PredicateKind::Projection(b)) => {
-                    relator.relate(predicate.rebind(a), p.rebind(b)).is_ok()
-                }
+                (
+                    ty::PredicateKind::Clause(ty::Clause::Trait(a)),
+                    ty::PredicateKind::Clause(ty::Clause::Trait(b)),
+                ) => relator.relate(predicate.rebind(a), p.rebind(b)).is_ok(),
+                (
+                    ty::PredicateKind::Clause(ty::Clause::Projection(a)),
+                    ty::PredicateKind::Clause(ty::Clause::Projection(b)),
+                ) => relator.relate(predicate.rebind(a), p.rebind(b)).is_ok(),
                 (
                     ty::PredicateKind::ConstEvaluatable(a),
                     ty::PredicateKind::ConstEvaluatable(b),
                 ) => relator.relate(predicate.rebind(a), predicate.rebind(b)).is_ok(),
                 (
-                    ty::PredicateKind::TypeOutlives(ty::OutlivesPredicate(ty_a, lt_a)),
-                    ty::PredicateKind::TypeOutlives(ty::OutlivesPredicate(ty_b, lt_b)),
+                    ty::PredicateKind::Clause(ty::Clause::TypeOutlives(ty::OutlivesPredicate(
+                        ty_a,
+                        lt_a,
+                    ))),
+                    ty::PredicateKind::Clause(ty::Clause::TypeOutlives(ty::OutlivesPredicate(
+                        ty_b,
+                        lt_b,
+                    ))),
                 ) => {
                     relator.relate(predicate.rebind(ty_a), p.rebind(ty_b)).is_ok()
                         && relator.relate(predicate.rebind(lt_a), p.rebind(lt_b)).is_ok()
@@ -209,7 +217,7 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
 
         if !assumptions_in_impl_context.iter().copied().any(predicate_matches_closure) {
             let item_span = tcx.def_span(self_type_did);
-            let self_descr = tcx.def_kind(self_type_did).descr(self_type_did.to_def_id());
+            let self_descr = tcx.def_descr(self_type_did.to_def_id());
             let reported = struct_span_err!(
                 tcx.sess,
                 predicate_sp,
@@ -225,9 +233,10 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
     result
 }
 
-// This is an implementation of the TypeRelation trait with the
-// aim of simply comparing for equality (without side-effects).
-// It is not intended to be used anywhere else other than here.
+/// This is an implementation of the [`TypeRelation`] trait with the
+/// aim of simply comparing for equality (without side-effects).
+///
+/// It is not intended to be used anywhere else other than here.
 pub(crate) struct SimpleEqRelation<'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
@@ -244,6 +253,10 @@ impl<'tcx> TypeRelation<'tcx> for SimpleEqRelation<'tcx> {
         self.tcx
     }
 
+    fn intercrate(&self) -> bool {
+        false
+    }
+
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.param_env
     }
@@ -254,6 +267,10 @@ impl<'tcx> TypeRelation<'tcx> for SimpleEqRelation<'tcx> {
 
     fn a_is_expected(&self) -> bool {
         true
+    }
+
+    fn mark_ambiguous(&mut self) {
+        bug!()
     }
 
     fn relate_with_variance<T: Relate<'tcx>>(

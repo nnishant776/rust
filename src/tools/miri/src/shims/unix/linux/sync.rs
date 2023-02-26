@@ -37,12 +37,12 @@ pub fn futex<'tcx>(
     let addr = MPlaceTy::from_aligned_ptr(addr, this.machine.layouts.i32);
     let addr_usize = addr.ptr.addr().bytes();
 
-    let futex_private = this.eval_libc_i32("FUTEX_PRIVATE_FLAG")?;
-    let futex_wait = this.eval_libc_i32("FUTEX_WAIT")?;
-    let futex_wait_bitset = this.eval_libc_i32("FUTEX_WAIT_BITSET")?;
-    let futex_wake = this.eval_libc_i32("FUTEX_WAKE")?;
-    let futex_wake_bitset = this.eval_libc_i32("FUTEX_WAKE_BITSET")?;
-    let futex_realtime = this.eval_libc_i32("FUTEX_CLOCK_REALTIME")?;
+    let futex_private = this.eval_libc_i32("FUTEX_PRIVATE_FLAG");
+    let futex_wait = this.eval_libc_i32("FUTEX_WAIT");
+    let futex_wait_bitset = this.eval_libc_i32("FUTEX_WAIT_BITSET");
+    let futex_wake = this.eval_libc_i32("FUTEX_WAKE");
+    let futex_wake_bitset = this.eval_libc_i32("FUTEX_WAKE_BITSET");
+    let futex_realtime = this.eval_libc_i32("FUTEX_CLOCK_REALTIME");
 
     // FUTEX_PRIVATE enables an optimization that stops it from working across processes.
     // Miri doesn't support that anyway, so we ignore that flag.
@@ -79,9 +79,9 @@ pub fn futex<'tcx>(
             };
 
             if bitset == 0 {
-                let einval = this.eval_libc("EINVAL")?;
+                let einval = this.eval_libc("EINVAL");
                 this.set_last_error(einval)?;
-                this.write_scalar(Scalar::from_machine_isize(-1, this), dest)?;
+                this.write_scalar(Scalar::from_target_isize(-1, this), dest)?;
                 return Ok(());
             }
 
@@ -90,7 +90,8 @@ pub fn futex<'tcx>(
             let timeout_time = if this.ptr_is_null(timeout.ptr)? {
                 None
             } else {
-                if op & futex_realtime != 0 {
+                let realtime = op & futex_realtime == futex_realtime;
+                if realtime {
                     this.check_no_isolation(
                         "`futex` syscall with `op=FUTEX_WAIT` and non-null timeout with `FUTEX_CLOCK_REALTIME`",
                     )?;
@@ -98,22 +99,22 @@ pub fn futex<'tcx>(
                 let duration = match this.read_timespec(&timeout)? {
                     Some(duration) => duration,
                     None => {
-                        let einval = this.eval_libc("EINVAL")?;
+                        let einval = this.eval_libc("EINVAL");
                         this.set_last_error(einval)?;
-                        this.write_scalar(Scalar::from_machine_isize(-1, this), dest)?;
+                        this.write_scalar(Scalar::from_target_isize(-1, this), dest)?;
                         return Ok(());
                     }
                 };
                 Some(if wait_bitset {
                     // FUTEX_WAIT_BITSET uses an absolute timestamp.
-                    if op & futex_realtime != 0 {
+                    if realtime {
                         Time::RealTime(SystemTime::UNIX_EPOCH.checked_add(duration).unwrap())
                     } else {
                         Time::Monotonic(this.machine.clock.anchor().checked_add(duration).unwrap())
                     }
                 } else {
                     // FUTEX_WAIT uses a relative timestamp.
-                    if op & futex_realtime != 0 {
+                    if realtime {
                         Time::RealTime(SystemTime::now().checked_add(duration).unwrap())
                     } else {
                         Time::Monotonic(this.machine.clock.now().checked_add(duration).unwrap())
@@ -172,7 +173,7 @@ pub fn futex<'tcx>(
                 this.block_thread(thread);
                 this.futex_wait(addr_usize, thread, bitset);
                 // Succesfully waking up from FUTEX_WAIT always returns zero.
-                this.write_scalar(Scalar::from_machine_isize(0, this), dest)?;
+                this.write_scalar(Scalar::from_target_isize(0, this), dest)?;
                 // Register a timeout callback if a timeout was specified.
                 // This callback will override the return value when the timeout triggers.
                 if let Some(timeout_time) = timeout_time {
@@ -183,7 +184,7 @@ pub fn futex<'tcx>(
                     }
 
                     impl<'tcx> VisitTags for Callback<'tcx> {
-                        fn visit_tags(&self, visit: &mut dyn FnMut(SbTag)) {
+                        fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
                             let Callback { thread: _, addr_usize: _, dest } = self;
                             dest.visit_tags(visit);
                         }
@@ -193,9 +194,9 @@ pub fn futex<'tcx>(
                         fn call(&self, this: &mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx> {
                             this.unblock_thread(self.thread);
                             this.futex_remove_waiter(self.addr_usize, self.thread);
-                            let etimedout = this.eval_libc("ETIMEDOUT")?;
+                            let etimedout = this.eval_libc("ETIMEDOUT");
                             this.set_last_error(etimedout)?;
-                            this.write_scalar(Scalar::from_machine_isize(-1, this), &self.dest)?;
+                            this.write_scalar(Scalar::from_target_isize(-1, this), &self.dest)?;
 
                             Ok(())
                         }
@@ -210,9 +211,9 @@ pub fn futex<'tcx>(
             } else {
                 // The futex value doesn't match the expected value, so we return failure
                 // right away without sleeping: -1 and errno set to EAGAIN.
-                let eagain = this.eval_libc("EAGAIN")?;
+                let eagain = this.eval_libc("EAGAIN");
                 this.set_last_error(eagain)?;
-                this.write_scalar(Scalar::from_machine_isize(-1, this), dest)?;
+                this.write_scalar(Scalar::from_target_isize(-1, this), dest)?;
             }
         }
         // FUTEX_WAKE: (int *addr, int op = FUTEX_WAKE, int val)
@@ -236,9 +237,9 @@ pub fn futex<'tcx>(
                 u32::MAX
             };
             if bitset == 0 {
-                let einval = this.eval_libc("EINVAL")?;
+                let einval = this.eval_libc("EINVAL");
                 this.set_last_error(einval)?;
-                this.write_scalar(Scalar::from_machine_isize(-1, this), dest)?;
+                this.write_scalar(Scalar::from_target_isize(-1, this), dest)?;
                 return Ok(());
             }
             // Together with the SeqCst fence in futex_wait, this makes sure that futex_wait
@@ -256,7 +257,7 @@ pub fn futex<'tcx>(
                     break;
                 }
             }
-            this.write_scalar(Scalar::from_machine_isize(n, this), dest)?;
+            this.write_scalar(Scalar::from_target_isize(n, this), dest)?;
         }
         op => throw_unsup_format!("Miri does not support `futex` syscall with op={}", op),
     }

@@ -1,18 +1,19 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(box_patterns)]
-#![feature(try_blocks)]
-#![feature(once_cell)]
 #![feature(associated_type_bounds)]
-#![feature(strict_provenance)]
-#![feature(int_roundings)]
+#![feature(box_patterns)]
 #![feature(if_let_guard)]
+#![feature(int_roundings)]
+#![feature(let_chains)]
 #![feature(never_type)]
+#![feature(once_cell)]
+#![feature(strict_provenance)]
+#![feature(try_blocks)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
-//! have to be implemented by each backends.
+//! have to be implemented by each backend.
 
 #[macro_use]
 extern crate rustc_macros;
@@ -24,7 +25,9 @@ extern crate rustc_middle;
 use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
 use rustc_hir::def_id::CrateNum;
+use rustc_macros::fluent_messages;
 use rustc_middle::dep_graph::WorkProduct;
 use rustc_middle::middle::dependency_format::Dependencies;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
@@ -41,6 +44,7 @@ use std::path::{Path, PathBuf};
 
 pub mod back;
 pub mod base;
+pub mod codegen_attrs;
 pub mod common;
 pub mod coverageinfo;
 pub mod debuginfo;
@@ -51,6 +55,8 @@ pub mod mir;
 pub mod mono_item;
 pub mod target_features;
 pub mod traits;
+
+fluent_messages! { "../locales/en-US.ftl" }
 
 pub struct ModuleCodegen<M> {
     /// The name of the module. When the crate may be saved between
@@ -115,7 +121,7 @@ pub struct NativeLib {
     pub name: Option<Symbol>,
     pub filename: Option<Symbol>,
     pub cfg: Option<ast::MetaItem>,
-    pub verbatim: Option<bool>,
+    pub verbatim: bool,
     pub dll_imports: Vec<cstore::DllImport>,
 }
 
@@ -126,7 +132,7 @@ impl From<&cstore::NativeLib> for NativeLib {
             filename: lib.filename,
             name: lib.name,
             cfg: lib.cfg.clone(),
-            verbatim: lib.verbatim,
+            verbatim: lib.verbatim.unwrap_or(false),
             dll_imports: lib.dll_imports.clone(),
         }
     }
@@ -157,6 +163,7 @@ pub struct CrateInfo {
     pub dependency_formats: Lrc<Dependencies>,
     pub windows_subsystem: Option<String>,
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
+    pub feature_packed_bundled_libs: bool, // unstable feature flag.
 }
 
 #[derive(Encodable, Decodable)]
@@ -179,6 +186,7 @@ pub fn provide(providers: &mut Providers) {
     crate::back::symbol_export::provide(providers);
     crate::base::provide(providers);
     crate::target_features::provide(providers);
+    crate::codegen_attrs::provide(providers);
 }
 
 pub fn provide_extern(providers: &mut ExternProviders) {

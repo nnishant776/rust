@@ -206,7 +206,7 @@ pub fn world_symbols(db: &RootDatabase, query: Query) -> Vec<FileSymbol> {
 }
 
 pub fn crate_symbols(db: &RootDatabase, krate: Crate, query: Query) -> Vec<FileSymbol> {
-    let _p = profile::span("crate_symbols").detail(|| format!("{:?}", query));
+    let _p = profile::span("crate_symbols").detail(|| format!("{query:?}"));
 
     let modules = krate.modules(db);
     let indices: Vec<_> = modules
@@ -323,10 +323,10 @@ impl Query {
                         if symbol.name != self.query {
                             continue;
                         }
-                    } else if self.case_sensitive {
-                        if self.query.chars().any(|c| !symbol.name.contains(c)) {
-                            continue;
-                        }
+                    } else if self.case_sensitive
+                        && self.query.chars().any(|c| !symbol.name.contains(c))
+                    {
+                        continue;
                     }
 
                     res.push(symbol.clone());

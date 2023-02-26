@@ -407,6 +407,8 @@ impl Trait {
     pub fn auto_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![auto]) }
     pub fn trait_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![trait]) }
     pub fn assoc_item_list(&self) -> Option<AssocItemList> { support::child(&self.syntax) }
+    pub fn eq_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![=]) }
+    pub fn semicolon_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![;]) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -840,6 +842,7 @@ impl ast::HasAttrs for ClosureExpr {}
 impl ClosureExpr {
     pub fn for_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![for]) }
     pub fn generic_param_list(&self) -> Option<GenericParamList> { support::child(&self.syntax) }
+    pub fn const_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![const]) }
     pub fn static_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![static]) }
     pub fn async_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![async]) }
     pub fn move_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![move]) }
@@ -1058,6 +1061,17 @@ pub struct YieldExpr {
 impl ast::HasAttrs for YieldExpr {}
 impl YieldExpr {
     pub fn yield_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![yield]) }
+    pub fn expr(&self) -> Option<Expr> { support::child(&self.syntax) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct YeetExpr {
+    pub(crate) syntax: SyntaxNode,
+}
+impl ast::HasAttrs for YeetExpr {}
+impl YeetExpr {
+    pub fn do_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![do]) }
+    pub fn yeet_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![yeet]) }
     pub fn expr(&self) -> Option<Expr> { support::child(&self.syntax) }
 }
 
@@ -1539,6 +1553,7 @@ pub enum Expr {
     TupleExpr(TupleExpr),
     WhileExpr(WhileExpr),
     YieldExpr(YieldExpr),
+    YeetExpr(YeetExpr),
     LetExpr(LetExpr),
     UnderscoreExpr(UnderscoreExpr),
 }
@@ -2692,6 +2707,17 @@ impl AstNode for YieldExpr {
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
+impl AstNode for YeetExpr {
+    fn can_cast(kind: SyntaxKind) -> bool { kind == YEET_EXPR }
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
 impl AstNode for LetExpr {
     fn can_cast(kind: SyntaxKind) -> bool { kind == LET_EXPR }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
@@ -3380,6 +3406,9 @@ impl From<WhileExpr> for Expr {
 impl From<YieldExpr> for Expr {
     fn from(node: YieldExpr) -> Expr { Expr::YieldExpr(node) }
 }
+impl From<YeetExpr> for Expr {
+    fn from(node: YeetExpr) -> Expr { Expr::YeetExpr(node) }
+}
 impl From<LetExpr> for Expr {
     fn from(node: LetExpr) -> Expr { Expr::LetExpr(node) }
 }
@@ -3420,6 +3449,7 @@ impl AstNode for Expr {
                 | TUPLE_EXPR
                 | WHILE_EXPR
                 | YIELD_EXPR
+                | YEET_EXPR
                 | LET_EXPR
                 | UNDERSCORE_EXPR
         )
@@ -3456,6 +3486,7 @@ impl AstNode for Expr {
             TUPLE_EXPR => Expr::TupleExpr(TupleExpr { syntax }),
             WHILE_EXPR => Expr::WhileExpr(WhileExpr { syntax }),
             YIELD_EXPR => Expr::YieldExpr(YieldExpr { syntax }),
+            YEET_EXPR => Expr::YeetExpr(YeetExpr { syntax }),
             LET_EXPR => Expr::LetExpr(LetExpr { syntax }),
             UNDERSCORE_EXPR => Expr::UnderscoreExpr(UnderscoreExpr { syntax }),
             _ => return None,
@@ -3494,6 +3525,7 @@ impl AstNode for Expr {
             Expr::TupleExpr(it) => &it.syntax,
             Expr::WhileExpr(it) => &it.syntax,
             Expr::YieldExpr(it) => &it.syntax,
+            Expr::YeetExpr(it) => &it.syntax,
             Expr::LetExpr(it) => &it.syntax,
             Expr::UnderscoreExpr(it) => &it.syntax,
         }
@@ -3890,7 +3922,7 @@ impl AnyHasArgList {
 impl AstNode for AnyHasArgList {
     fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, CALL_EXPR | METHOD_CALL_EXPR) }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasArgList { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasArgList { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -3961,6 +3993,7 @@ impl AstNode for AnyHasAttrs {
                 | TUPLE_EXPR
                 | WHILE_EXPR
                 | YIELD_EXPR
+                | YEET_EXPR
                 | LET_EXPR
                 | UNDERSCORE_EXPR
                 | STMT_LIST
@@ -3974,7 +4007,7 @@ impl AstNode for AnyHasAttrs {
         )
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasAttrs { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasAttrs { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4011,7 +4044,7 @@ impl AstNode for AnyHasDocComments {
         )
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasDocComments { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasDocComments { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4026,7 +4059,7 @@ impl AstNode for AnyHasGenericParams {
         matches!(kind, ENUM | FN | IMPL | STRUCT | TRAIT | TYPE_ALIAS | UNION)
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasGenericParams { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasGenericParams { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4039,7 +4072,7 @@ impl AnyHasLoopBody {
 impl AstNode for AnyHasLoopBody {
     fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, FOR_EXPR | LOOP_EXPR | WHILE_EXPR) }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasLoopBody { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasLoopBody { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4052,7 +4085,7 @@ impl AnyHasModuleItem {
 impl AstNode for AnyHasModuleItem {
     fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, MACRO_ITEMS | SOURCE_FILE | ITEM_LIST) }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasModuleItem { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasModuleItem { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4087,7 +4120,7 @@ impl AstNode for AnyHasName {
         )
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasName { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasName { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4105,7 +4138,7 @@ impl AstNode for AnyHasTypeBounds {
         )
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasTypeBounds { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasTypeBounds { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4139,7 +4172,7 @@ impl AstNode for AnyHasVisibility {
         )
     }
     fn cast(syntax: SyntaxNode) -> Option<Self> {
-        Self::can_cast(syntax.kind()).then(|| AnyHasVisibility { syntax })
+        Self::can_cast(syntax.kind()).then_some(AnyHasVisibility { syntax })
     }
     fn syntax(&self) -> &SyntaxNode { &self.syntax }
 }
@@ -4649,6 +4682,11 @@ impl std::fmt::Display for WhileExpr {
     }
 }
 impl std::fmt::Display for YieldExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for YeetExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

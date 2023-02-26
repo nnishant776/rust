@@ -2,7 +2,7 @@
 //!
 //! The idea with `rustc_lexer` is to make a reusable library,
 //! by separating out pure lexing and rustc-specific concerns, like spans,
-//! error reporting, and interning.  So, rustc_lexer operates directly on `&str`,
+//! error reporting, and interning. So, rustc_lexer operates directly on `&str`,
 //! produces simple tokens which are a pair of type-tag and a bit of original text,
 //! and does not report errors, instead storing them as flags on the token.
 //!
@@ -34,7 +34,6 @@ pub use crate::cursor::Cursor;
 use self::LiteralKind::*;
 use self::TokenKind::*;
 use crate::cursor::EOF_CHAR;
-use std::convert::TryFrom;
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -88,13 +87,15 @@ pub enum TokenKind {
     /// tokens.
     UnknownPrefix,
 
-    /// Examples: `"12_u8"`, `"1.0e-40"`, `b"123`.
+    /// Examples: `12u8`, `1.0e-40`, `b"123"`. Note that `_` is an invalid
+    /// suffix, but may be present here on string and float literals. Users of
+    /// this type will need to check for and reject that case.
     ///
     /// See [LiteralKind] for more details.
     Literal { kind: LiteralKind, suffix_start: u32 },
 
     /// "'a"
-    Lifetime { starts_with_number: bool },
+    Lifetime { starts_with_number: bool, contains_emoji: bool },
 
     // One-char tokens:
     /// ";"
@@ -165,11 +166,15 @@ pub enum DocStyle {
     Inner,
 }
 
+// Note that the suffix is *not* considered when deciding the `LiteralKind` in
+// this type. This means that float literals like `1f32` are classified by this
+// type as `Int`. (Compare against `rustc_ast::token::LitKind` and
+// `rustc_ast::ast::LitKind.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LiteralKind {
-    /// "12_u8", "0o100", "0b120i99"
+    /// "12_u8", "0o100", "0b120i99", "1f32".
     Int { base: Base, empty_int: bool },
-    /// "12.34f32", "0b100.100"
+    /// "12.34f32", "1e3", but not "1f32`.
     Float { base: Base, empty_exponent: bool },
     /// "'a'", "'\\'", "'''", "';"
     Char { terminated: bool },
@@ -203,13 +208,13 @@ pub enum RawStrError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Base {
     /// Literal starts with "0b".
-    Binary,
+    Binary = 2,
     /// Literal starts with "0o".
-    Octal,
-    /// Literal starts with "0x".
-    Hexadecimal,
+    Octal = 8,
     /// Literal doesn't contain a prefix.
-    Decimal,
+    Decimal = 10,
+    /// Literal starts with "0x".
+    Hexadecimal = 16,
 }
 
 /// `rustc` allows files to have a shebang, e.g. "#!/usr/bin/rustrun",
@@ -625,7 +630,13 @@ impl Cursor<'_> {
             // If the first symbol is valid for identifier, it can be a lifetime.
             // Also check if it's a number for a better error reporting (so '0 will
             // be reported as invalid lifetime and not as unterminated char literal).
-            is_id_start(self.first()) || self.first().is_digit(10)
+            // We also have to account for potential `'🐱` emojis to avoid reporting
+            // it as an unterminated char literal.
+            is_id_start(self.first())
+                || self.first().is_digit(10)
+                // FIXME(#108019): `unic-emoji-char` seems to have data tables only up to Unicode
+                // 5.0, but Unicode is already newer than this.
+                || unic_emoji_char::is_emoji(self.first())
         };
 
         if !can_be_a_lifetime {
@@ -638,16 +649,33 @@ impl Cursor<'_> {
             return Literal { kind, suffix_start };
         }
 
-        // Either a lifetime or a character literal with
-        // length greater than 1.
+        // Either a lifetime or a character literal.
 
         let starts_with_number = self.first().is_digit(10);
+        let mut contains_emoji = false;
 
-        // Skip the literal contents.
-        // First symbol can be a number (which isn't a valid identifier start),
-        // so skip it without any checks.
-        self.bump();
-        self.eat_while(is_id_continue);
+        // FIXME(#108019): `unic-emoji-char` seems to have data tables only up to Unicode
+        // 5.0, but Unicode is already newer than this.
+        if unic_emoji_char::is_emoji(self.first()) {
+            contains_emoji = true;
+        } else {
+            // Skip the literal contents.
+            // First symbol can be a number (which isn't a valid identifier start),
+            // so skip it without any checks.
+            self.bump();
+        }
+        self.eat_while(|c| {
+            if is_id_continue(c) {
+                true
+            // FIXME(#108019): `unic-emoji-char` seems to have data tables only up to Unicode
+            // 5.0, but Unicode is already newer than this.
+            } else if unic_emoji_char::is_emoji(c) {
+                contains_emoji = true;
+                true
+            } else {
+                false
+            }
+        });
 
         // Check if after skipping literal contents we've met a closing
         // single quote (which means that user attempted to create a
@@ -657,7 +685,7 @@ impl Cursor<'_> {
             let kind = Char { terminated: true };
             Literal { kind, suffix_start: self.pos_within_token() }
         } else {
-            Lifetime { starts_with_number }
+            Lifetime { starts_with_number, contains_emoji }
         }
     }
 
@@ -840,12 +868,13 @@ impl Cursor<'_> {
         self.eat_decimal_digits()
     }
 
-    // Eats the suffix of the literal, e.g. "_u8".
+    // Eats the suffix of the literal, e.g. "u8".
     fn eat_literal_suffix(&mut self) {
         self.eat_identifier();
     }
 
-    // Eats the identifier.
+    // Eats the identifier. Note: succeeds on `_`, which isn't a valid
+    // identifier.
     fn eat_identifier(&mut self) {
         if !is_id_start(self.first()) {
             return;

@@ -29,6 +29,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             code-target: win32-x64
           - os: windows-latest
+            target: i686-pc-windows-msvc
+            code-target: win32-ia32
+          - os: windows-latest
             target: aarch64-pc-windows-msvc
             code-target: win32-arm64
           - os: ubuntu-20.04
@@ -232,6 +235,10 @@ jobs:
           path: dist
       - uses: actions/download-artifact@v1
         with:
+          name: dist-i686-pc-windows-msvc
+          path: dist
+      - uses: actions/download-artifact@v1
+        with:
           name: dist-aarch64-pc-windows-msvc
           path: dist
       - run: ls -al ./dist
@@ -257,8 +264,7 @@ jobs:
       - name: Publish Extension (OpenVSX, release)
         if: github.ref == 'refs/heads/release' && (github.repository == 'rust-analyzer/rust-analyzer' || github.repository == 'rust-lang/rust-analyzer')
         working-directory: ./editors/code
-        # token from https://dev.azure.com/rust-analyzer/
-        run: npx ovsx publish --pat ${{ secrets.OPENVSX_TOKEN }} --packagePath ../../dist/rust-analyzer-*.vsix || true
+        run: npx ovsx publish --pat ${{ secrets.OPENVSX_TOKEN }} --packagePath ../../dist/rust-analyzer-*.vsix
         timeout-minutes: 2
 
       - name: Publish Extension (Code Marketplace, nightly)
@@ -269,5 +275,5 @@ jobs:
       - name: Publish Extension (OpenVSX, nightly)
         if: github.ref != 'refs/heads/release' && (github.repository == 'rust-analyzer/rust-analyzer' || github.repository == 'rust-lang/rust-analyzer')
         working-directory: ./editors/code
-        run: npx ovsx publish --pat ${{ secrets.OPENVSX_TOKEN }} --packagePath ../../dist/rust-analyzer-*.vsix || true
+        run: npx ovsx publish --pat ${{ secrets.OPENVSX_TOKEN }} --packagePath ../../dist/rust-analyzer-*.vsix
         timeout-minutes: 2

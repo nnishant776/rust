@@ -4,6 +4,7 @@
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(let_chains)]
+#![feature(drain_filter)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -12,6 +13,7 @@ extern crate tracing;
 extern crate rustc_middle;
 
 mod chalk;
+mod codegen;
 mod dropck_outlives;
 mod evaluate_obligation;
 mod implied_outlives_bounds;
@@ -31,4 +33,5 @@ pub fn provide(p: &mut Providers) {
     normalize_projection_ty::provide(p);
     normalize_erasing_regions::provide(p);
     type_op::provide(p);
+    p.codegen_select_candidate = codegen::codegen_select_candidate;
 }

@@ -51,8 +51,7 @@
 use rustc_middle::hir::place::*;
 use rustc_middle::ty::adjustment;
 use rustc_middle::ty::fold::TypeFoldable;
-use rustc_middle::ty::visit::TypeVisitable;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
@@ -127,13 +126,13 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
 
     fn resolve_vars_if_possible<T>(&self, value: T) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         self.infcx.resolve_vars_if_possible(value)
     }
 
     fn is_tainted_by_errors(&self) -> bool {
-        self.infcx.is_tainted_by_errors()
+        self.infcx.tainted_by_errors().is_some()
     }
 
     fn resolve_type_vars_or_error(
@@ -155,8 +154,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             None if self.is_tainted_by_errors() => Err(()),
             None => {
                 bug!(
-                    "no type for node {}: {} in mem_categorization",
-                    id,
+                    "no type for node {} in mem_categorization",
                     self.tcx().hir().node_to_string(id)
                 );
             }
@@ -603,7 +601,6 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
         }
     }
 
-    // FIXME(#19596) This is a workaround, but there should be a better way to do this
     fn cat_pattern_<F>(
         &self,
         mut place_with_id: PlaceWithHirId<'tcx>,
@@ -736,7 +733,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             }
 
             PatKind::Box(ref subpat) | PatKind::Ref(ref subpat, _) => {
-                // box p1, &p1, &mut p1.  we can ignore the mutability of
+                // box p1, &p1, &mut p1. we can ignore the mutability of
                 // PatKind::Ref since that information is already contained
                 // in the type.
                 let subplace = self.cat_deref(pat, place_with_id)?;

@@ -53,9 +53,8 @@ impl DefPathTable {
             //
             // See the documentation for DefPathHash for more information.
             panic!(
-                "found DefPathHash collision between {:?} and {:?}. \
-                    Compilation cannot continue.",
-                def_path1, def_path2
+                "found DefPathHash collision between {def_path1:?} and {def_path2:?}. \
+                    Compilation cannot continue."
             );
         }
 
@@ -93,7 +92,7 @@ impl DefPathTable {
 /// The definition table containing node definitions.
 /// It holds the `DefPathTable` for `LocalDefId`s/`DefPath`s.
 /// It also stores mappings to convert `LocalDefId`s to/from `HirId`s.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Definitions {
     table: DefPathTable,
     next_disambiguator: FxHashMap<(LocalDefId, DefPathData), u32>,
@@ -224,7 +223,7 @@ impl DefPath {
         let mut s = String::with_capacity(self.data.len() * 16);
 
         for component in &self.data {
-            write!(s, "::{}", component).unwrap();
+            write!(s, "::{component}").unwrap();
         }
 
         s
@@ -240,7 +239,7 @@ impl DefPath {
         for component in &self.data {
             s.extend(opt_delimiter);
             opt_delimiter = Some('-');
-            write!(s, "{}", component).unwrap();
+            write!(s, "{component}").unwrap();
         }
 
         s
@@ -281,6 +280,8 @@ pub enum DefPathData {
     AnonConst,
     /// An `impl Trait` type node.
     ImplTrait,
+    /// `impl Trait` generated associated type node.
+    ImplTraitAssocTy,
 }
 
 impl Definitions {
@@ -368,10 +369,6 @@ impl Definitions {
         LocalDefId { local_def_index: self.table.allocate(key, def_path_hash) }
     }
 
-    pub fn iter_local_def_id(&self) -> impl Iterator<Item = LocalDefId> + '_ {
-        self.table.def_path_hashes.indices().map(|local_def_index| LocalDefId { local_def_index })
-    }
-
     #[inline(always)]
     pub fn local_def_path_hash_to_def_id(
         &self,
@@ -389,6 +386,10 @@ impl Definitions {
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
         &self.table.def_path_hash_to_index
     }
+
+    pub fn num_definitions(&self) -> usize {
+        self.table.def_path_hashes.len()
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -404,7 +405,7 @@ impl DefPathData {
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => Some(name),
 
             Impl | ForeignMod | CrateRoot | Use | GlobalAsm | ClosureExpr | Ctor | AnonConst
-            | ImplTrait => None,
+            | ImplTrait | ImplTraitAssocTy => None,
         }
     }
 
@@ -423,7 +424,7 @@ impl DefPathData {
             ClosureExpr => DefPathDataName::Anon { namespace: sym::closure },
             Ctor => DefPathDataName::Anon { namespace: sym::constructor },
             AnonConst => DefPathDataName::Anon { namespace: sym::constant },
-            ImplTrait => DefPathDataName::Anon { namespace: sym::opaque },
+            ImplTrait | ImplTraitAssocTy => DefPathDataName::Anon { namespace: sym::opaque },
         }
     }
 }
@@ -433,7 +434,7 @@ impl fmt::Display for DefPathData {
         match self.name() {
             DefPathDataName::Named(name) => f.write_str(name.as_str()),
             // FIXME(#70334): this will generate legacy {{closure}}, {{impl}}, etc
-            DefPathDataName::Anon { namespace } => write!(f, "{{{{{}}}}}", namespace),
+            DefPathDataName::Anon { namespace } => write!(f, "{{{{{namespace}}}}}"),
         }
     }
 }

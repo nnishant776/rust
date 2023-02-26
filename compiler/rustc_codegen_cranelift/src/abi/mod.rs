@@ -7,6 +7,7 @@ mod returning;
 use cranelift_module::ModuleError;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::layout::FnAbiOf;
+use rustc_session::Session;
 use rustc_target::abi::call::{Conv, FnAbi};
 use rustc_target::spec::abi::Abi;
 
@@ -22,24 +23,8 @@ fn clif_sig_from_fn_abi<'tcx>(
     default_call_conv: CallConv,
     fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
 ) -> Signature {
-    let call_conv = match fn_abi.conv {
-        Conv::Rust | Conv::C => default_call_conv,
-        Conv::RustCold => CallConv::Cold,
-        Conv::X86_64SysV => CallConv::SystemV,
-        Conv::X86_64Win64 => CallConv::WindowsFastcall,
-        Conv::ArmAapcs
-        | Conv::CCmseNonSecureCall
-        | Conv::Msp430Intr
-        | Conv::PtxKernel
-        | Conv::X86Fastcall
-        | Conv::X86Intr
-        | Conv::X86Stdcall
-        | Conv::X86ThisCall
-        | Conv::X86VectorCall
-        | Conv::AmdGpuKernel
-        | Conv::AvrInterrupt
-        | Conv::AvrNonBlockingInterrupt => todo!("{:?}", fn_abi.conv),
-    };
+    let call_conv = conv_to_call_conv(tcx.sess, fn_abi.conv, default_call_conv);
+
     let inputs = fn_abi.args.iter().map(|arg_abi| arg_abi.get_abi_param(tcx).into_iter()).flatten();
 
     let (return_ptr, returns) = fn_abi.ret.get_abi_return(tcx);
@@ -49,15 +34,44 @@ fn clif_sig_from_fn_abi<'tcx>(
     Signature { params, returns, call_conv }
 }
 
+pub(crate) fn conv_to_call_conv(sess: &Session, c: Conv, default_call_conv: CallConv) -> CallConv {
+    match c {
+        Conv::Rust | Conv::C => default_call_conv,
+        Conv::RustCold => CallConv::Cold,
+        Conv::X86_64SysV => CallConv::SystemV,
+        Conv::X86_64Win64 => CallConv::WindowsFastcall,
+
+        // Should already get a back compat warning
+        Conv::X86Fastcall | Conv::X86Stdcall | Conv::X86ThisCall | Conv::X86VectorCall => {
+            default_call_conv
+        }
+
+        Conv::X86Intr => sess.fatal("x86-interrupt call conv not yet implemented"),
+
+        Conv::ArmAapcs => sess.fatal("aapcs call conv not yet implemented"),
+        Conv::CCmseNonSecureCall => {
+            sess.fatal("C-cmse-nonsecure-call call conv is not yet implemented");
+        }
+
+        Conv::Msp430Intr
+        | Conv::PtxKernel
+        | Conv::AmdGpuKernel
+        | Conv::AvrInterrupt
+        | Conv::AvrNonBlockingInterrupt => {
+            unreachable!("tried to use {c:?} call conv which only exists on an unsupported target");
+        }
+    }
+}
+
 pub(crate) fn get_function_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
-    triple: &target_lexicon::Triple,
+    default_call_conv: CallConv,
     inst: Instance<'tcx>,
 ) -> Signature {
     assert!(!inst.substs.needs_infer());
     clif_sig_from_fn_abi(
         tcx,
-        CallConv::triple_default(triple),
+        default_call_conv,
         &RevealAllLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
     )
 }
@@ -69,7 +83,7 @@ pub(crate) fn import_function<'tcx>(
     inst: Instance<'tcx>,
 ) -> FuncId {
     let name = tcx.symbol_name(inst).name;
-    let sig = get_function_sig(tcx, module.isa().triple(), inst);
+    let sig = get_function_sig(tcx, module.target_config().default_call_conv, inst);
     match module.declare_function(name, Linkage::Import, &sig) {
         Ok(func_id) => func_id,
         Err(ModuleError::IncompatibleDeclaration(_)) => tcx.sess.fatal(&format!(
@@ -156,6 +170,12 @@ fn make_local_place<'tcx>(
     layout: TyAndLayout<'tcx>,
     is_ssa: bool,
 ) -> CPlace<'tcx> {
+    if layout.is_unsized() {
+        fx.tcx.sess.span_fatal(
+            fx.mir.local_decls[local].source_info.span,
+            "unsized locals are not yet supported",
+        );
+    }
     let place = if is_ssa {
         if let rustc_target::abi::Abi::ScalarPair(_, _) = layout.abi {
             CPlace::new_var_pair(fx, local, layout)
@@ -336,18 +356,16 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     destination: Place<'tcx>,
     target: Option<BasicBlock>,
 ) {
-    let fn_ty = fx.monomorphize(func.ty(fx.mir, fx.tcx));
-    let fn_sig =
-        fx.tcx.normalize_erasing_late_bound_regions(ParamEnv::reveal_all(), fn_ty.fn_sig(fx.tcx));
+    let func = codegen_operand(fx, func);
+    let fn_sig = func.layout().ty.fn_sig(fx.tcx);
 
     let ret_place = codegen_place(fx, destination);
 
     // Handle special calls like intrinsics and empty drop glue.
-    let instance = if let ty::FnDef(def_id, substs) = *fn_ty.kind() {
-        let instance = ty::Instance::resolve(fx.tcx, ty::ParamEnv::reveal_all(), def_id, substs)
-            .unwrap()
-            .unwrap()
-            .polymorphize(fx.tcx);
+    let instance = if let ty::FnDef(def_id, substs) = *func.layout().ty.kind() {
+        let instance =
+            ty::Instance::expect_resolve(fx.tcx, ty::ParamEnv::reveal_all(), def_id, substs)
+                .polymorphize(fx.tcx);
 
         if fx.tcx.symbol_name(instance).name.starts_with("llvm.") {
             crate::intrinsics::codegen_llvm_intrinsic_call(
@@ -386,17 +404,17 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         None
     };
 
-    let extra_args = &args[fn_sig.inputs().len()..];
-    let extra_args = fx
-        .tcx
-        .mk_type_list(extra_args.iter().map(|op_arg| fx.monomorphize(op_arg.ty(fx.mir, fx.tcx))));
+    let extra_args = &args[fn_sig.inputs().skip_binder().len()..];
+    let extra_args = fx.tcx.mk_type_list_from_iter(
+        extra_args.iter().map(|op_arg| fx.monomorphize(op_arg.ty(fx.mir, fx.tcx))),
+    );
     let fn_abi = if let Some(instance) = instance {
         RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(instance, extra_args)
     } else {
-        RevealAllLayoutCx(fx.tcx).fn_abi_of_fn_ptr(fn_ty.fn_sig(fx.tcx), extra_args)
+        RevealAllLayoutCx(fx.tcx).fn_abi_of_fn_ptr(fn_sig, extra_args)
     };
 
-    let is_cold = if fn_sig.abi == Abi::RustCold {
+    let is_cold = if fn_sig.abi() == Abi::RustCold {
         true
     } else {
         instance
@@ -413,7 +431,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     }
 
     // Unpack arguments tuple for closures
-    let mut args = if fn_sig.abi == Abi::RustCall {
+    let mut args = if fn_sig.abi() == Abi::RustCall {
         assert_eq!(args.len(), 2, "rust-call abi requires two arguments");
         let self_arg = codegen_call_argument_operand(fx, &args[0]);
         let pack_arg = codegen_call_argument_operand(fx, &args[1]);
@@ -481,7 +499,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
                 fx.add_comment(nop_inst, "indirect call");
             }
 
-            let func = codegen_operand(fx, func).load_scalar(fx);
+            let func = func.load_scalar(fx);
             let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
             let sig = fx.bcx.import_signature(sig);
 
@@ -512,11 +530,11 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         };
 
         // FIXME find a cleaner way to support varargs
-        if fn_sig.c_variadic {
-            if !matches!(fn_sig.abi, Abi::C { .. }) {
+        if fn_sig.c_variadic() {
+            if !matches!(fn_sig.abi(), Abi::C { .. }) {
                 fx.tcx.sess.span_fatal(
                     source_info.span,
-                    &format!("Variadic call for non-C abi {:?}", fn_sig.abi),
+                    &format!("Variadic call for non-C abi {:?}", fn_sig.abi()),
                 );
             }
             let sig_ref = fx.bcx.func.dfg.call_signature(call_inst).unwrap();

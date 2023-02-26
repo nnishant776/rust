@@ -17,7 +17,7 @@ use crate::{
     db::{self, AstDatabase},
     fixup,
     name::{AsName, Name},
-    HirFileId, HirFileIdRepr, InFile, MacroCallKind, MacroCallLoc, MacroDefKind, MacroFile,
+    HirFileId, InFile, MacroCallKind, MacroCallLoc, MacroDefKind, MacroFile,
 };
 
 #[derive(Clone, Debug)]
@@ -128,7 +128,7 @@ struct HygieneInfo {
     attr_input_or_mac_def_start: Option<InFile<TextSize>>,
 
     macro_def: Arc<TokenExpander>,
-    macro_arg: Arc<(tt::Subtree, mbe::TokenMap, fixup::SyntaxFixupUndoInfo)>,
+    macro_arg: Arc<(crate::tt::Subtree, mbe::TokenMap, fixup::SyntaxFixupUndoInfo)>,
     macro_arg_shift: mbe::Shift,
     exp_map: Arc<mbe::TokenMap>,
 }
@@ -191,7 +191,7 @@ fn make_hygiene_info(
             let tt = ast_id
                 .to_node(db)
                 .doc_comments_and_attrs()
-                .nth(invoc_attr_index as usize)
+                .nth(invoc_attr_index.ast_index())
                 .and_then(Either::left)?
                 .token_tree()?;
             Some(InFile::new(ast_id.file_id, tt))
@@ -216,9 +216,9 @@ fn make_hygiene_info(
 
 impl HygieneFrame {
     pub(crate) fn new(db: &dyn AstDatabase, file_id: HirFileId) -> HygieneFrame {
-        let (info, krate, local_inner) = match file_id.0 {
-            HirFileIdRepr::FileId(_) => (None, None, false),
-            HirFileIdRepr::MacroFile(macro_file) => {
+        let (info, krate, local_inner) = match file_id.macro_file() {
+            None => (None, None, false),
+            Some(macro_file) => {
                 let loc = db.lookup_intern_macro_call(macro_file.macro_call_id);
                 let info =
                     make_hygiene_info(db, macro_file, &loc).map(|info| (loc.kind.file_id(), info));

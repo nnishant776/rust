@@ -10,7 +10,7 @@
 use crate::mir;
 use crate::traits::query::NoSolution;
 use crate::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder};
-use crate::ty::{self, EarlyBinder, SubstsRef, Ty, TyCtxt};
+use crate::ty::{self, EarlyBinder, SubstsRef, Ty, TyCtxt, TypeVisitableExt};
 
 #[derive(Debug, Copy, Clone, HashStable, TyEncodable, TyDecodable)]
 pub enum NormalizationError<'tcx> {
@@ -38,7 +38,7 @@ impl<'tcx> TyCtxt<'tcx> {
     #[tracing::instrument(level = "debug", skip(self, param_env))]
     pub fn normalize_erasing_regions<T>(self, param_env: ty::ParamEnv<'tcx>, value: T) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         debug!(
             "normalize_erasing_regions::<{}>(value={:?}, param_env={:?})",
@@ -70,7 +70,7 @@ impl<'tcx> TyCtxt<'tcx> {
         value: T,
     ) -> Result<T, NormalizationError<'tcx>>
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         debug!(
             "try_normalize_erasing_regions::<{}>(value={:?}, param_env={:?})",
@@ -107,7 +107,7 @@ impl<'tcx> TyCtxt<'tcx> {
         value: ty::Binder<'tcx, T>,
     ) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         let value = self.erase_late_bound_regions(value);
         self.normalize_erasing_regions(param_env, value)
@@ -127,7 +127,7 @@ impl<'tcx> TyCtxt<'tcx> {
         value: ty::Binder<'tcx, T>,
     ) -> Result<T, NormalizationError<'tcx>>
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         let value = self.erase_late_bound_regions(value);
         self.try_normalize_erasing_regions(param_env, value)
@@ -145,7 +145,7 @@ impl<'tcx> TyCtxt<'tcx> {
         value: T,
     ) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         debug!(
             "subst_and_normalize_erasing_regions(\
@@ -169,7 +169,7 @@ impl<'tcx> TyCtxt<'tcx> {
         value: T,
     ) -> Result<T, NormalizationError<'tcx>>
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         debug!(
             "subst_and_normalize_erasing_regions(\
@@ -202,8 +202,8 @@ impl<'tcx> NormalizeAfterErasingRegionsFolder<'tcx> {
     }
 }
 
-impl<'tcx> TypeFolder<'tcx> for NormalizeAfterErasingRegionsFolder<'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for NormalizeAfterErasingRegionsFolder<'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -238,10 +238,10 @@ impl<'tcx> TryNormalizeAfterErasingRegionsFolder<'tcx> {
     }
 }
 
-impl<'tcx> FallibleTypeFolder<'tcx> for TryNormalizeAfterErasingRegionsFolder<'tcx> {
+impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for TryNormalizeAfterErasingRegionsFolder<'tcx> {
     type Error = NormalizationError<'tcx>;
 
-    fn tcx(&self) -> TyCtxt<'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 

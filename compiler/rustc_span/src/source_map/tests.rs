@@ -344,6 +344,10 @@ fn map_path_prefix(mapping: &FilePathMapping, p: &str) -> String {
     mapping.map_prefix(path(p)).0.to_string_lossy().to_string()
 }
 
+fn reverse_map_prefix(mapping: &FilePathMapping, p: &str) -> Option<String> {
+    mapping.reverse_map_prefix_heuristically(&path(p)).map(|q| q.to_string_lossy().to_string())
+}
+
 #[test]
 fn path_prefix_remapping() {
     // Relative to relative
@@ -387,7 +391,7 @@ fn path_prefix_remapping_expand_to_absolute() {
     let working_directory = path("/foo");
     let working_directory = RealFileName::Remapped {
         local_path: Some(working_directory.clone()),
-        virtual_name: mapping.map_prefix(working_directory).0,
+        virtual_name: mapping.map_prefix(working_directory).0.into_owned(),
     };
 
     assert_eq!(working_directory.remapped_path_if_available(), path("FOO"));
@@ -481,6 +485,45 @@ fn path_prefix_remapping_expand_to_absolute() {
 }
 
 #[test]
+fn path_prefix_remapping_reverse() {
+    // Ignores options without alphanumeric chars.
+    {
+        let mapping =
+            &FilePathMapping::new(vec![(path("abc"), path("/")), (path("def"), path("."))]);
+
+        assert_eq!(reverse_map_prefix(mapping, "/hello.rs"), None);
+        assert_eq!(reverse_map_prefix(mapping, "./hello.rs"), None);
+    }
+
+    // Returns `None` if multiple options match.
+    {
+        let mapping = &FilePathMapping::new(vec![
+            (path("abc"), path("/redacted")),
+            (path("def"), path("/redacted")),
+        ]);
+
+        assert_eq!(reverse_map_prefix(mapping, "/redacted/hello.rs"), None);
+    }
+
+    // Distinct reverse mappings.
+    {
+        let mapping = &FilePathMapping::new(vec![
+            (path("abc"), path("/redacted")),
+            (path("def/ghi"), path("/fake/dir")),
+        ]);
+
+        assert_eq!(
+            reverse_map_prefix(mapping, "/redacted/path/hello.rs"),
+            Some(path_str("abc/path/hello.rs"))
+        );
+        assert_eq!(
+            reverse_map_prefix(mapping, "/fake/dir/hello.rs"),
+            Some(path_str("def/ghi/hello.rs"))
+        );
+    }
+}
+
+#[test]
 fn test_next_point() {
     let sm = SourceMap::new(FilePathMapping::empty());
     sm.new_source_file(PathBuf::from("example.rs").into(), "a…b".to_string());
@@ -511,16 +554,17 @@ fn test_next_point() {
     assert_eq!(span.lo().0, 4);
     assert_eq!(span.hi().0, 5);
 
-    // A non-empty span at the last byte should advance to create an empty
-    // span pointing at the end of the file.
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
     let span = Span::with_root_ctxt(BytePos(4), BytePos(5));
     let span = sm.next_point(span);
     assert_eq!(span.lo().0, 5);
-    assert_eq!(span.hi().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
 
-    // Empty span pointing just past the last byte.
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
     let span = Span::with_root_ctxt(BytePos(5), BytePos(5));
     let span = sm.next_point(span);
     assert_eq!(span.lo().0, 5);
-    assert_eq!(span.hi().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
 }

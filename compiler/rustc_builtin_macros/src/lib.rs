@@ -21,8 +21,10 @@ extern crate tracing;
 
 use crate::deriving::*;
 
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
 use rustc_expand::base::{MacroExpanderFn, ResolverExpand, SyntaxExtensionKind};
 use rustc_expand::proc_macro::BangProcMacro;
+use rustc_macros::fluent_messages;
 use rustc_span::symbol::sym;
 
 mod alloc_error_handler;
@@ -45,6 +47,7 @@ mod log_syntax;
 mod source_util;
 mod test;
 mod trace_macros;
+mod type_ascribe;
 mod util;
 
 pub mod asm;
@@ -52,6 +55,8 @@ pub mod cmdline_attrs;
 pub mod proc_macro_harness;
 pub mod standard_library_imports;
 pub mod test_harness;
+
+fluent_messages! { "../locales/en-US.ftl" }
 
 pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
     let mut register = |name, kind| resolver.register_builtin_macro(name, kind);
@@ -92,6 +97,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         unreachable: edition_panic::expand_unreachable,
         stringify: source_util::expand_stringify,
         trace_macros: trace_macros::expand_trace_macros,
+        type_ascribe: type_ascribe::expand_type_ascribe,
     }
 
     register_attr! {
@@ -99,7 +105,8 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         bench: test::expand_bench,
         cfg_accessible: cfg_accessible::Expander,
         cfg_eval: cfg_eval::expand,
-        derive: derive::Expander,
+        derive: derive::Expander(false),
+        derive_const: derive::Expander(true),
         global_allocator: global_allocator::expand,
         test: test::expand_test,
         test_case: test::expand_test_case,

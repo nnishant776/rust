@@ -1,12 +1,15 @@
 //! Errors emitted by codegen_ssa
 
 use crate::back::command::Command;
+use crate::fluent_generated as fluent;
 use rustc_errors::{
-    fluent, DiagnosticArgValue, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
+    DiagnosticArgValue, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
     IntoDiagnosticArg,
 };
 use rustc_macros::Diagnostic;
+use rustc_middle::ty::Ty;
 use rustc_span::{Span, Symbol};
+use rustc_type_ir::FloatTy;
 use std::borrow::Cow;
 use std::io::Error;
 use std::path::{Path, PathBuf};
@@ -352,5 +355,629 @@ impl IntoDiagnostic<'_> for LinkingFailed<'_> {
                 .note(fluent::codegen_ssa_use_cargo_directive);
         }
         diag
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_link_exe_unexpected_error)]
+pub struct LinkExeUnexpectedError;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_repair_vs_build_tools)]
+pub struct RepairVSBuildTools;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_missing_cpp_build_tool_component)]
+pub struct MissingCppBuildToolComponent;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_select_cpp_build_tool_workload)]
+pub struct SelectCppBuildToolWorkload;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_visual_studio_not_installed)]
+pub struct VisualStudioNotInstalled;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_linker_not_found)]
+#[note]
+pub struct LinkerNotFound {
+    pub linker_path: PathBuf,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unable_to_exe_linker)]
+#[note]
+#[note(codegen_ssa_command_note)]
+pub struct UnableToExeLinker {
+    pub linker_path: PathBuf,
+    pub error: Error,
+    pub command_formatted: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_msvc_missing_linker)]
+pub struct MsvcMissingLinker;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_check_installed_visual_studio)]
+pub struct CheckInstalledVisualStudio;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unsufficient_vs_code_product)]
+pub struct UnsufficientVSCodeProduct;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_processing_dymutil_failed)]
+#[note]
+pub struct ProcessingDymutilFailed {
+    pub status: ExitStatus,
+    pub output: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unable_to_run_dsymutil)]
+#[note]
+pub struct UnableToRunDsymutil {
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_stripping_debu_info_failed)]
+#[note]
+pub struct StrippingDebugInfoFailed<'a> {
+    pub util: &'a str,
+    pub status: ExitStatus,
+    pub output: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unable_to_run)]
+pub struct UnableToRun<'a> {
+    pub util: &'a str,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_linker_file_stem)]
+pub struct LinkerFileStem;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_static_library_native_artifacts)]
+pub struct StaticLibraryNativeArtifacts;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_link_script_unavailable)]
+pub struct LinkScriptUnavailable;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_link_script_write_failure)]
+pub struct LinkScriptWriteFailure {
+    pub path: PathBuf,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_failed_to_write)]
+pub struct FailedToWrite {
+    pub path: PathBuf,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unable_to_write_debugger_visualizer)]
+pub struct UnableToWriteDebuggerVisualizer {
+    pub path: PathBuf,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_rlib_archive_build_failure)]
+pub struct RlibArchiveBuildFailure {
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_option_gcc_only)]
+pub struct OptionGccOnly;
+
+#[derive(Diagnostic)]
+pub enum ExtractBundledLibsError<'a> {
+    #[diag(codegen_ssa_extract_bundled_libs_open_file)]
+    OpenFile { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_mmap_file)]
+    MmapFile { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_parse_archive)]
+    ParseArchive { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_read_entry)]
+    ReadEntry { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_archive_member)]
+    ArchiveMember { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_convert_name)]
+    ConvertName { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_write_file)]
+    WriteFile { rlib: &'a Path, error: Box<dyn std::error::Error> },
+
+    #[diag(codegen_ssa_extract_bundled_libs_write_file)]
+    ExtractSection { rlib: &'a Path, error: Box<dyn std::error::Error> },
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unsupported_arch)]
+pub struct UnsupportedArch<'a> {
+    pub arch: &'a str,
+    pub os: &'a str,
+}
+
+#[derive(Diagnostic)]
+pub enum AppleSdkRootError<'a> {
+    #[diag(codegen_ssa_apple_sdk_error_sdk_path)]
+    SdkPath { sdk_name: &'a str, error: Error },
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_read_file)]
+pub struct ReadFileError {
+    pub message: std::io::Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unsupported_link_self_contained)]
+pub struct UnsupportedLinkSelfContained;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_archive_build_failure)]
+// Public for rustc_codegen_llvm::back::archive
+pub struct ArchiveBuildFailure {
+    pub error: std::io::Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unknown_archive_kind)]
+// Public for rustc_codegen_llvm::back::archive
+pub struct UnknownArchiveKind<'a> {
+    pub kind: &'a str,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_expected_used_symbol)]
+pub struct ExpectedUsedSymbol {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_multiple_main_functions)]
+#[help]
+pub struct MultipleMainFunctions {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_metadata_object_file_write)]
+pub struct MetadataObjectFileWrite {
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_invalid_windows_subsystem)]
+pub struct InvalidWindowsSubsystem {
+    pub subsystem: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_erroneous_constant)]
+pub struct ErroneousConstant {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_polymorphic_constant_too_generic)]
+pub struct PolymorphicConstantTooGeneric {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_shuffle_indices_evaluation)]
+pub struct ShuffleIndicesEvaluation {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_missing_memory_ordering)]
+pub struct MissingMemoryOrdering;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unknown_atomic_ordering)]
+pub struct UnknownAtomicOrdering;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_atomic_compare_exchange)]
+pub struct AtomicCompareExchange;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unknown_atomic_operation)]
+pub struct UnknownAtomicOperation;
+
+#[derive(Diagnostic)]
+pub enum InvalidMonomorphization<'tcx> {
+    #[diag(codegen_ssa_invalid_monomorphization_basic_integer_type, code = "E0511")]
+    BasicIntegerType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_basic_float_type, code = "E0511")]
+    BasicFloatType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_float_to_int_unchecked, code = "E0511")]
+    FloatToIntUnchecked {
+        #[primary_span]
+        span: Span,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_vector, code = "E0511")]
+    FloatingPointVector {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        f_ty: FloatTy,
+        in_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_type, code = "E0511")]
+    FloatingPointType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_unrecognized_intrinsic, code = "E0511")]
+    UnrecognizedIntrinsic {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_argument, code = "E0511")]
+    SimdArgument {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_input, code = "E0511")]
+    SimdInput {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_first, code = "E0511")]
+    SimdFirst {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_second, code = "E0511")]
+    SimdSecond {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_third, code = "E0511")]
+    SimdThird {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_return, code = "E0511")]
+    SimdReturn {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_invalid_bitmask, code = "E0511")]
+    InvalidBitmask {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        mask_ty: Ty<'tcx>,
+        expected_int_bits: u64,
+        expected_bytes: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_return_length_input_type, code = "E0511")]
+    ReturnLengthInputType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_len: u64,
+        in_ty: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+        out_len: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_second_argument_length, code = "E0511")]
+    SecondArgumentLength {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_len: u64,
+        in_ty: Ty<'tcx>,
+        arg_ty: Ty<'tcx>,
+        out_len: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_third_argument_length, code = "E0511")]
+    ThirdArgumentLength {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_len: u64,
+        in_ty: Ty<'tcx>,
+        arg_ty: Ty<'tcx>,
+        out_len: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_return_integer_type, code = "E0511")]
+    ReturnIntegerType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ret_ty: Ty<'tcx>,
+        out_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_simd_shuffle, code = "E0511")]
+    SimdShuffle {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_return_length, code = "E0511")]
+    ReturnLength {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_len: u64,
+        ret_ty: Ty<'tcx>,
+        out_len: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_return_element, code = "E0511")]
+    ReturnElement {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_elem: Ty<'tcx>,
+        in_ty: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+        out_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_not_constant, code = "E0511")]
+    ShuffleIndexNotConstant {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        arg_idx: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_out_of_bounds, code = "E0511")]
+    ShuffleIndexOutOfBounds {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        arg_idx: u64,
+        total_len: u128,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_inserted_type, code = "E0511")]
+    InsertedType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_elem: Ty<'tcx>,
+        in_ty: Ty<'tcx>,
+        out_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_return_type, code = "E0511")]
+    ReturnType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_elem: Ty<'tcx>,
+        in_ty: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_expected_return_type, code = "E0511")]
+    ExpectedReturnType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_ty: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_mismatched_lengths, code = "E0511")]
+    MismatchedLengths {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        m_len: u64,
+        v_len: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_mask_type, code = "E0511")]
+    MaskType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_vector_argument, code = "E0511")]
+    VectorArgument {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_ty: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_cannot_return, code = "E0511")]
+    CannotReturn {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ret_ty: Ty<'tcx>,
+        expected_int_bits: u64,
+        expected_bytes: u64,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_expected_element_type, code = "E0511")]
+    ExpectedElementType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        expected_element: Ty<'tcx>,
+        second_arg: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+        in_ty: Ty<'tcx>,
+        mutability: ExpectedPointerMutability,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_third_arg_element_type, code = "E0511")]
+    ThirdArgElementType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        expected_element: Ty<'tcx>,
+        third_arg: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size, code = "E0511")]
+    UnsupportedSymbolOfSize {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        symbol: Symbol,
+        in_ty: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+        size: u64,
+        ret_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol, code = "E0511")]
+    UnsupportedSymbol {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        symbol: Symbol,
+        in_ty: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_cast_fat_pointer, code = "E0511")]
+    CastFatPointer {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_expected_pointer, code = "E0511")]
+    ExpectedPointer {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_expected_usize, code = "E0511")]
+    ExpectedUsize {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_cast, code = "E0511")]
+    UnsupportedCast {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_ty: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+        out_elem: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_operation, code = "E0511")]
+    UnsupportedOperation {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_ty: Ty<'tcx>,
+        in_elem: Ty<'tcx>,
+    },
+
+    #[diag(codegen_ssa_invalid_monomorphization_expected_vector_element_type, code = "E0511")]
+    ExpectedVectorElementType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        expected_element: Ty<'tcx>,
+        vector_type: Ty<'tcx>,
+    },
+}
+
+pub enum ExpectedPointerMutability {
+    Mut,
+    Not,
+}
+
+impl IntoDiagnosticArg for ExpectedPointerMutability {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        match self {
+            ExpectedPointerMutability::Mut => DiagnosticArgValue::Str(Cow::Borrowed("*mut")),
+            ExpectedPointerMutability::Not => DiagnosticArgValue::Str(Cow::Borrowed("*_")),
+        }
     }
 }

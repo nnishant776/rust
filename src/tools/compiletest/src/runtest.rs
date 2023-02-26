@@ -32,7 +32,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::str;
 
 use glob::glob;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use tracing::*;
 
 use crate::extract_gdb_version;
@@ -44,15 +44,16 @@ use debugger::{check_debugger_output, DebuggerCommands};
 #[cfg(test)]
 mod tests;
 
+const FAKE_SRC_BASE: &str = "fake-test-src-base";
+
 #[cfg(windows)]
 fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
     use std::sync::Mutex;
     use winapi::um::errhandlingapi::SetErrorMode;
     use winapi::um::winbase::SEM_NOGPFAULTERRORBOX;
 
-    lazy_static! {
-        static ref LOCK: Mutex<()> = Mutex::new(());
-    }
+    static LOCK: Mutex<()> = Mutex::new(());
+
     // Error mode is a global variable, so lock it so only one thread will change it
     let _lock = LOCK.lock().unwrap();
 
@@ -117,8 +118,12 @@ pub fn run(config: Config, testpaths: &TestPaths, revision: Option<&str>) {
     }
     debug!("running {:?}", testpaths.file.display());
     let mut props = TestProps::from_file(&testpaths.file, revision, &config);
+
+    // For non-incremental (i.e. regular UI) tests, the incremental directory
+    // takes into account the revision name, since the revisions are independent
+    // of each other and can race.
     if props.incremental {
-        props.incremental_dir = Some(incremental_dir(&config, testpaths));
+        props.incremental_dir = Some(incremental_dir(&config, testpaths, revision));
     }
 
     let cx = TestCx { config: &config, props: &props, testpaths, revision };
@@ -208,11 +213,13 @@ enum WillExecute {
     Disabled,
 }
 
-/// Should `--emit metadata` be used?
+/// What value should be passed to `--emit`?
 #[derive(Copy, Clone)]
-enum EmitMetadata {
-    Yes,
-    No,
+enum Emit {
+    None,
+    Metadata,
+    LlvmIr,
+    Asm,
 }
 
 impl<'test> TestCx<'test> {
@@ -412,7 +419,7 @@ impl<'test> TestCx<'test> {
         }
 
         let should_run = self.run_if_enabled();
-        let mut proc_res = self.compile_test(should_run, EmitMetadata::No);
+        let mut proc_res = self.compile_test(should_run, Emit::None);
 
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
@@ -658,7 +665,7 @@ impl<'test> TestCx<'test> {
 
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compile_result = self.compile_test(should_run, EmitMetadata::No);
+        let compile_result = self.compile_test(should_run, Emit::None);
         if !compile_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compile_result);
         }
@@ -709,7 +716,7 @@ impl<'test> TestCx<'test> {
             script_str.push_str("\n");
         }
 
-        script_str.push_str("\nqq\n"); // Quit the debugger (including remote debugger, if any)
+        script_str.push_str("qq\n"); // Quit the debugger (including remote debugger, if any)
 
         // Write the script into a file
         debug!("script_str = {}", script_str);
@@ -778,7 +785,7 @@ impl<'test> TestCx<'test> {
 
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compiler_run_result = self.compile_test(should_run, EmitMetadata::No);
+        let compiler_run_result = self.compile_test(should_run, Emit::None);
         if !compiler_run_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compiler_run_result);
         }
@@ -1010,7 +1017,7 @@ impl<'test> TestCx<'test> {
     fn run_debuginfo_lldb_test_no_opt(&self) {
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compile_result = self.compile_test(should_run, EmitMetadata::No);
+        let compile_result = self.compile_test(should_run, Emit::None);
         if !compile_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compile_result);
         }
@@ -1322,12 +1329,19 @@ impl<'test> TestCx<'test> {
             return;
         }
 
+        // On Windows, translate all '\' path separators to '/'
+        let file_name = format!("{}", self.testpaths.file.display()).replace(r"\", "/");
+
         // On Windows, keep all '\' path separators to match the paths reported in the JSON output
         // from the compiler
-        let os_file_name = self.testpaths.file.display().to_string();
-
-        // on windows, translate all '\' path separators to '/'
-        let file_name = format!("{}", self.testpaths.file.display()).replace(r"\", "/");
+        let diagnostic_file_name = if self.props.remap_src_base {
+            let mut p = PathBuf::from(FAKE_SRC_BASE);
+            p.push(&self.testpaths.relative_dir);
+            p.push(self.testpaths.file.file_name().unwrap());
+            p.display().to_string()
+        } else {
+            self.testpaths.file.display().to_string()
+        };
 
         // If the testcase being checked contains at least one expected "help"
         // message, then we'll ensure that all "help" messages are expected.
@@ -1337,7 +1351,7 @@ impl<'test> TestCx<'test> {
         let expect_note = expected_errors.iter().any(|ee| ee.kind == Some(ErrorKind::Note));
 
         // Parse the JSON output from the compiler and extract out the messages.
-        let actual_errors = json::parse_output(&os_file_name, &proc_res.stderr, proc_res);
+        let actual_errors = json::parse_output(&diagnostic_file_name, &proc_res.stderr, proc_res);
         let mut unexpected = Vec::new();
         let mut found = vec![false; expected_errors.len()];
         for actual_error in &actual_errors {
@@ -1426,21 +1440,21 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn should_emit_metadata(&self, pm: Option<PassMode>) -> EmitMetadata {
+    fn should_emit_metadata(&self, pm: Option<PassMode>) -> Emit {
         match (pm, self.props.fail_mode, self.config.mode) {
-            (Some(PassMode::Check), ..) | (_, Some(FailMode::Check), Ui) => EmitMetadata::Yes,
-            _ => EmitMetadata::No,
+            (Some(PassMode::Check), ..) | (_, Some(FailMode::Check), Ui) => Emit::Metadata,
+            _ => Emit::None,
         }
     }
 
-    fn compile_test(&self, will_execute: WillExecute, emit_metadata: EmitMetadata) -> ProcRes {
-        self.compile_test_general(will_execute, emit_metadata, self.props.local_pass_mode())
+    fn compile_test(&self, will_execute: WillExecute, emit: Emit) -> ProcRes {
+        self.compile_test_general(will_execute, emit, self.props.local_pass_mode())
     }
 
     fn compile_test_general(
         &self,
         will_execute: WillExecute,
-        emit_metadata: EmitMetadata,
+        emit: Emit,
         local_pm: Option<PassMode>,
     ) -> ProcRes {
         // Only use `make_exe_name` when the test ends up being executed.
@@ -1472,10 +1486,13 @@ impl<'test> TestCx<'test> {
             _ => AllowUnused::No,
         };
 
-        let mut rustc =
-            self.make_compile_args(&self.testpaths.file, output_file, emit_metadata, allow_unused);
-
-        rustc.arg("-L").arg(&self.aux_output_dir_name());
+        let rustc = self.make_compile_args(
+            &self.testpaths.file,
+            output_file,
+            emit,
+            allow_unused,
+            LinkToAux::Yes,
+        );
 
         self.compose_and_run_compiler(rustc, None)
     }
@@ -1702,8 +1719,13 @@ impl<'test> TestCx<'test> {
         // Create the directory for the stdout/stderr files.
         create_dir_all(aux_cx.output_base_dir()).unwrap();
         let input_file = &aux_testpaths.file;
-        let mut aux_rustc =
-            aux_cx.make_compile_args(input_file, aux_output, EmitMetadata::No, AllowUnused::No);
+        let mut aux_rustc = aux_cx.make_compile_args(
+            input_file,
+            aux_output,
+            Emit::None,
+            AllowUnused::No,
+            LinkToAux::No,
+        );
 
         for key in &aux_props.unset_rustc_env {
             aux_rustc.env_remove(key);
@@ -1831,8 +1853,9 @@ impl<'test> TestCx<'test> {
         &self,
         input_file: &Path,
         output_file: TargetLocation,
-        emit_metadata: EmitMetadata,
+        emit: Emit,
         allow_unused: AllowUnused,
+        link_to_aux: LinkToAux,
     ) -> Command {
         let is_aux = input_file.components().map(|c| c.as_os_str()).any(|c| c == "auxiliary");
         let is_rustdoc = self.is_rustdoc() && !is_aux;
@@ -1913,7 +1936,15 @@ impl<'test> TestCx<'test> {
                     rustc.args(&["--json", "future-incompat"]);
                 }
                 rustc.arg("-Ccodegen-units=1");
+                // Hide line numbers to reduce churn
                 rustc.arg("-Zui-testing");
+                // Hide libstd sources from ui tests to make sure we generate the stderr
+                // output that users will see.
+                // Without this, we may be producing good diagnostics in-tree but users
+                // will not see half the information.
+                rustc.arg("-Zsimulate-remapped-rust-src-base=/rustc/FAKE_PREFIX");
+                rustc.arg("-Ztranslate-remapped-path-to-local-path=no");
+
                 rustc.arg("-Zdeduplicate-diagnostics=no");
                 // FIXME: use this for other modes too, for perf?
                 rustc.arg("-Cstrip=debuginfo");
@@ -1947,8 +1978,26 @@ impl<'test> TestCx<'test> {
             }
         }
 
-        if let (false, EmitMetadata::Yes) = (is_rustdoc, emit_metadata) {
-            rustc.args(&["--emit", "metadata"]);
+        if self.props.remap_src_base {
+            rustc.arg(format!(
+                "--remap-path-prefix={}={}",
+                self.config.src_base.display(),
+                FAKE_SRC_BASE,
+            ));
+        }
+
+        match emit {
+            Emit::None => {}
+            Emit::Metadata if is_rustdoc => {}
+            Emit::Metadata => {
+                rustc.args(&["--emit", "metadata"]);
+            }
+            Emit::LlvmIr => {
+                rustc.args(&["--emit", "llvm-ir"]);
+            }
+            Emit::Asm => {
+                rustc.args(&["--emit", "asm"]);
+            }
         }
 
         if !is_rustdoc {
@@ -1978,7 +2027,10 @@ impl<'test> TestCx<'test> {
                 rustc.args(&["-Zpolonius"]);
             }
             Some(CompareMode::Chalk) => {
-                rustc.args(&["-Zchalk"]);
+                rustc.args(&["-Ztrait-solver=chalk"]);
+            }
+            Some(CompareMode::NextSolver) => {
+                rustc.args(&["-Ztrait-solver=next"]);
             }
             Some(CompareMode::SplitDwarf) if self.config.target.contains("windows") => {
                 rustc.args(&["-Csplit-debuginfo=unpacked", "-Zunstable-options"]);
@@ -2012,6 +2064,10 @@ impl<'test> TestCx<'test> {
         // Use dynamic musl for tests because static doesn't allow creating dylibs
         if self.config.host.contains("musl") || self.is_vxworks_pure_dynamic() {
             rustc.arg("-Ctarget-feature=-crt-static");
+        }
+
+        if let LinkToAux::Yes = link_to_aux {
+            rustc.arg("-L").arg(self.aux_output_dir_name());
         }
 
         rustc.args(&self.props.compile_flags);
@@ -2065,9 +2121,7 @@ impl<'test> TestCx<'test> {
                 .parent()
                 .unwrap() // chop off `ui`
                 .parent()
-                .unwrap() // chop off `test`
-                .parent()
-                .unwrap(); // chop off `src`
+                .unwrap(); // chop off `tests`
             args.push(src.join("src/etc/wasm32-shim.js").display().to_string());
         }
 
@@ -2205,13 +2259,15 @@ impl<'test> TestCx<'test> {
     // codegen tests (using FileCheck)
 
     fn compile_test_and_save_ir(&self) -> ProcRes {
-        let aux_dir = self.aux_output_dir_name();
-
         let output_file = TargetLocation::ThisDirectory(self.output_base_dir());
         let input_file = &self.testpaths.file;
-        let mut rustc =
-            self.make_compile_args(input_file, output_file, EmitMetadata::No, AllowUnused::No);
-        rustc.arg("-L").arg(aux_dir).arg("--emit=llvm-ir");
+        let rustc = self.make_compile_args(
+            input_file,
+            output_file,
+            Emit::LlvmIr,
+            AllowUnused::No,
+            LinkToAux::Yes,
+        );
 
         self.compose_and_run_compiler(rustc, None)
     }
@@ -2223,14 +2279,11 @@ impl<'test> TestCx<'test> {
 
         let output_file = TargetLocation::ThisFile(output_path.clone());
         let input_file = &self.testpaths.file;
-        let mut rustc =
-            self.make_compile_args(input_file, output_file, EmitMetadata::No, AllowUnused::No);
 
-        rustc.arg("-L").arg(self.aux_output_dir_name());
-
+        let mut emit = Emit::None;
         match self.props.assembly_output.as_ref().map(AsRef::as_ref) {
             Some("emit-asm") => {
-                rustc.arg("--emit=asm");
+                emit = Emit::Asm;
             }
 
             Some("ptx-linker") => {
@@ -2240,6 +2293,9 @@ impl<'test> TestCx<'test> {
             Some(_) => self.fatal("unknown 'assembly-output' header"),
             None => self.fatal("missing 'assembly-output' header"),
         }
+
+        let rustc =
+            self.make_compile_args(input_file, output_file, emit, AllowUnused::No, LinkToAux::Yes);
 
         (self.compose_and_run_compiler(rustc, None), output_path)
     }
@@ -2264,6 +2320,8 @@ impl<'test> TestCx<'test> {
         } else {
             filecheck.args(&["--check-prefixes", &prefixes]);
         }
+        // Provide more context on failures.
+        filecheck.args(&["--dump-input-context", "100"]);
         self.compose_and_run(filecheck, "", None, None)
     }
 
@@ -2365,10 +2423,10 @@ impl<'test> TestCx<'test> {
         let mut rustc = new_rustdoc.make_compile_args(
             &new_rustdoc.testpaths.file,
             output_file,
-            EmitMetadata::No,
+            Emit::None,
             AllowUnused::Yes,
+            LinkToAux::Yes,
         );
-        rustc.arg("-L").arg(&new_rustdoc.aux_output_dir_name());
         new_rustdoc.build_all_auxiliary(&mut rustc);
 
         let proc_res = new_rustdoc.document(&compare_dir);
@@ -2641,7 +2699,7 @@ impl<'test> TestCx<'test> {
     fn run_codegen_units_test(&self) {
         assert!(self.revision.is_none(), "revisions not relevant here");
 
-        let proc_res = self.compile_test(WillExecute::No, EmitMetadata::No);
+        let proc_res = self.compile_test(WillExecute::No, Emit::None);
 
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
@@ -2789,11 +2847,10 @@ impl<'test> TestCx<'test> {
         // the form <crate-name1>.<crate-disambiguator1>-in-<crate-name2>.<crate-disambiguator2>,
         // remove all crate-disambiguators.
         fn remove_crate_disambiguator_from_cgu(cgu: &str) -> String {
-            lazy_static! {
-                static ref RE: Regex =
-                    Regex::new(r"^[^\.]+(?P<d1>\.[[:alnum:]]+)(-in-[^\.]+(?P<d2>\.[[:alnum:]]+))?")
-                        .unwrap();
-            }
+            static RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r"^[^\.]+(?P<d1>\.[[:alnum:]]+)(-in-[^\.]+(?P<d2>\.[[:alnum:]]+))?")
+                    .unwrap()
+            });
 
             let captures =
                 RE.captures(cgu).unwrap_or_else(|| panic!("invalid cgu name encountered: {}", cgu));
@@ -2891,7 +2948,7 @@ impl<'test> TestCx<'test> {
 
     fn run_rmake_test(&self) {
         let cwd = env::current_dir().unwrap();
-        let src_root = self.config.src_base.parent().unwrap().parent().unwrap().parent().unwrap();
+        let src_root = self.config.src_base.parent().unwrap().parent().unwrap();
         let src_root = cwd.join(&src_root);
 
         let tmpdir = cwd.join(self.output_base_name());
@@ -2958,6 +3015,10 @@ impl<'test> TestCx<'test> {
 
         if let Some(ref llvm_bin_dir) = self.config.llvm_bin_dir {
             cmd.env("LLVM_BIN_DIR", llvm_bin_dir);
+        }
+
+        if let Some(ref remote_test_client) = self.config.remote_test_client {
+            cmd.env("REMOTE_TEST_CLIENT", remote_test_client);
         }
 
         // We don't want RUSTFLAGS set from the outside to interfere with
@@ -3107,12 +3168,12 @@ impl<'test> TestCx<'test> {
                 // 'uploaded "$TEST_BUILD_DIR/<test_executable>, waiting for result"'
                 // is printed to stdout by the client and then captured in the ProcRes,
                 // so it needs to be removed when comparing the run-pass test execution output
-                lazy_static! {
-                    static ref REMOTE_TEST_RE: Regex = Regex::new(
+                static REMOTE_TEST_RE: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(
                         "^uploaded \"\\$TEST_BUILD_DIR(/[[:alnum:]_\\-.]+)+\", waiting for result\n"
                     )
-                    .unwrap();
-                }
+                    .unwrap()
+                });
                 REMOTE_TEST_RE
                     .replace(
                         &self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout),
@@ -3154,7 +3215,7 @@ impl<'test> TestCx<'test> {
         if let Some(FailMode::Build) = self.props.fail_mode {
             // Make sure a build-fail test cannot fail due to failing analysis (e.g. typeck).
             let pm = Some(PassMode::Check);
-            let proc_res = self.compile_test_general(WillExecute::No, EmitMetadata::Yes, pm);
+            let proc_res = self.compile_test_general(WillExecute::No, Emit::Metadata, pm);
             self.check_if_test_should_compile(&proc_res, pm);
         }
 
@@ -3312,13 +3373,13 @@ impl<'test> TestCx<'test> {
         if self.props.run_rustfix && self.config.compare_mode.is_none() {
             // And finally, compile the fixed code and make sure it both
             // succeeds and has no diagnostics.
-            let mut rustc = self.make_compile_args(
+            let rustc = self.make_compile_args(
                 &self.testpaths.file.with_extension(UI_FIXED),
                 TargetLocation::ThisFile(self.make_exe_name()),
                 emit_metadata,
                 AllowUnused::No,
+                LinkToAux::Yes,
             );
-            rustc.arg("-L").arg(&self.aux_output_dir_name());
             let res = self.compose_and_run_compiler(rustc, None);
             if !res.status.success() {
                 self.fatal_proc_rec("failed to compile fixed code", &res);
@@ -3502,22 +3563,35 @@ impl<'test> TestCx<'test> {
         let parent_dir = self.testpaths.file.parent().unwrap();
         normalize_path(parent_dir, "$DIR");
 
-        // Paths into the libstd/libcore
-        let base_dir = self.config.src_base.parent().unwrap().parent().unwrap().parent().unwrap();
-        let src_dir = base_dir.join("library");
-        normalize_path(&src_dir, "$SRC_DIR");
+        if self.props.remap_src_base {
+            let mut remapped_parent_dir = PathBuf::from(FAKE_SRC_BASE);
+            if self.testpaths.relative_dir != Path::new("") {
+                remapped_parent_dir.push(&self.testpaths.relative_dir);
+            }
+            normalize_path(&remapped_parent_dir, "$DIR");
+        }
 
-        // `ui-fulldeps` tests can show paths to the compiler source when testing macros from
-        // `rustc_macros`
-        // eg. /home/user/rust/compiler
-        let compiler_src_dir = base_dir.join("compiler");
-        normalize_path(&compiler_src_dir, "$COMPILER_DIR");
-
-        if let Some(virtual_rust_source_base_dir) =
-            option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(PathBuf::from)
-        {
-            normalize_path(&virtual_rust_source_base_dir.join("library"), "$SRC_DIR");
-            normalize_path(&virtual_rust_source_base_dir.join("compiler"), "$COMPILER_DIR");
+        let source_bases = &[
+            // Source base on the current filesystem (calculated as parent of `tests/$suite`):
+            Some(self.config.src_base.parent().unwrap().parent().unwrap().into()),
+            // Source base on the sysroot (from the src components downloaded by `download-rustc`):
+            Some(self.config.sysroot_base.join("lib").join("rustlib").join("src").join("rust")),
+            // Virtual `/rustc/$sha` remapped paths (if `remap-debuginfo` is enabled):
+            option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(PathBuf::from),
+            // Virtual `/rustc/$sha` coming from download-rustc:
+            std::env::var_os("FAKE_DOWNLOAD_RUSTC_PREFIX").map(PathBuf::from),
+            // Tests using -Zsimulate-remapped-rust-src-base should use this fake path
+            Some("/rustc/FAKE_PREFIX".into()),
+        ];
+        for base_dir in source_bases {
+            if let Some(base_dir) = base_dir {
+                // Paths into the libstd/libcore
+                normalize_path(&base_dir.join("library"), "$SRC_DIR");
+                // `ui-fulldeps` tests can show paths to the compiler source when testing macros from
+                // `rustc_macros`
+                // eg. /home/user/rust/compiler
+                normalize_path(&base_dir.join("compiler"), "$COMPILER_DIR");
+            }
         }
 
         // Paths into the build directory
@@ -3544,10 +3618,8 @@ impl<'test> TestCx<'test> {
         // with placeholders as we do not want tests needing updated when compiler source code
         // changes.
         // eg. $SRC_DIR/libcore/mem.rs:323:14 becomes $SRC_DIR/libcore/mem.rs:LL:COL
-        lazy_static! {
-            static ref SRC_DIR_RE: Regex =
-                Regex::new("SRC_DIR(.+):\\d+:\\d+(: \\d+:\\d+)?").unwrap();
-        }
+        static SRC_DIR_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new("SRC_DIR(.+):\\d+:\\d+(: \\d+:\\d+)?").unwrap());
 
         normalized = SRC_DIR_RE.replace_all(&normalized, "SRC_DIR$1:LL:COL").into_owned();
 
@@ -3558,19 +3630,17 @@ impl<'test> TestCx<'test> {
         // since they duplicate actual errors and make the output hard to read.
         // This mirrors the regex in src/tools/tidy/src/style.rs, please update
         // both if either are changed.
-        lazy_static! {
-            static ref ANNOTATION_RE: Regex = Regex::new("\\s*//(\\[.*\\])?~.*").unwrap();
-        }
+        static ANNOTATION_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new("\\s*//(\\[.*\\])?~.*").unwrap());
 
         normalized = ANNOTATION_RE.replace_all(&normalized, "").into_owned();
 
         // This code normalizes various hashes in v0 symbol mangling that is
         // emitted in the ui and mir-opt tests.
-        lazy_static! {
-            static ref V0_CRATE_HASH_PREFIX_RE: Regex =
-                Regex::new(r"_R.*?Cs[0-9a-zA-Z]+_").unwrap();
-            static ref V0_CRATE_HASH_RE: Regex = Regex::new(r"Cs[0-9a-zA-Z]+_").unwrap();
-        }
+        static V0_CRATE_HASH_PREFIX_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"_R.*?Cs[0-9a-zA-Z]+_").unwrap());
+        static V0_CRATE_HASH_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"Cs[0-9a-zA-Z]+_").unwrap());
 
         const V0_CRATE_HASH_PLACEHOLDER: &str = r"CsCRATE_HASH_";
         if V0_CRATE_HASH_PREFIX_RE.is_match(&normalized) {
@@ -3579,10 +3649,9 @@ impl<'test> TestCx<'test> {
                 V0_CRATE_HASH_RE.replace_all(&normalized, V0_CRATE_HASH_PLACEHOLDER).into_owned();
         }
 
-        lazy_static! {
-            static ref V0_BACK_REF_PREFIX_RE: Regex = Regex::new(r"\(_R.*?B[0-9a-zA-Z]_").unwrap();
-            static ref V0_BACK_REF_RE: Regex = Regex::new(r"B[0-9a-zA-Z]_").unwrap();
-        }
+        static V0_BACK_REF_PREFIX_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\(_R.*?B[0-9a-zA-Z]_").unwrap());
+        static V0_BACK_REF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"B[0-9a-zA-Z]_").unwrap());
 
         const V0_BACK_REF_PLACEHOLDER: &str = r"B<REF>_";
         if V0_BACK_REF_PREFIX_RE.is_match(&normalized) {
@@ -3605,21 +3674,23 @@ impl<'test> TestCx<'test> {
     /// Replaces backslashes in paths with forward slashes, and replaces CRLF line endings
     /// with LF.
     fn normalize_platform_differences(output: &str) -> String {
-        lazy_static! {
-            /// Used to find Windows paths.
-            ///
-            /// It's not possible to detect paths in the error messages generally, but this is a
-            /// decent enough heuristic.
-            static ref PATH_BACKSLASH_RE: Regex = Regex::new(r#"(?x)
+        /// Used to find Windows paths.
+        ///
+        /// It's not possible to detect paths in the error messages generally, but this is a
+        /// decent enough heuristic.
+        static PATH_BACKSLASH_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(
+                r#"(?x)
                 (?:
                   # Match paths that don't include spaces.
                   (?:\\[\pL\pN\.\-_']+)+\.\pL+
                 |
                   # If the path starts with a well-known root, then allow spaces.
                   \$(?:DIR|SRC_DIR|TEST_BUILD_DIR|BUILD_DIR|LIB_DIR)(?:\\[\pL\pN\.\-_' ]+)+
-                )"#
-            ).unwrap();
-        }
+                )"#,
+            )
+            .unwrap()
+        });
 
         let output = output.replace(r"\\", r"\");
 
@@ -3849,6 +3920,11 @@ enum TargetLocation {
 }
 
 enum AllowUnused {
+    Yes,
+    No,
+}
+
+enum LinkToAux {
     Yes,
     No,
 }

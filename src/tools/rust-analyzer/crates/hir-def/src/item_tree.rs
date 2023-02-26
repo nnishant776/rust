@@ -48,10 +48,12 @@ use base_db::CrateId;
 use either::Either;
 use hir_expand::{
     ast_id_map::FileAstId,
+    attrs::RawAttrs,
     hygiene::Hygiene,
     name::{name, AsName, Name},
     ExpandTo, HirFileId, InFile,
 };
+use intern::Interned;
 use la_arena::{Arena, Idx, IdxRange, RawIdx};
 use profile::Count;
 use rustc_hash::FxHashMap;
@@ -60,10 +62,9 @@ use stdx::never;
 use syntax::{ast, match_ast, SyntaxKind};
 
 use crate::{
-    attr::{Attrs, RawAttrs},
+    attr::Attrs,
     db::DefDatabase,
     generics::GenericParams,
-    intern::Interned,
     path::{path, AssociatedTypeBinding, GenericArgs, ImportAlias, ModPath, Path, PathKind},
     type_ref::{Mutability, TraitRef, TypeBound, TypeRef},
     visibility::RawVisibility,
@@ -105,12 +106,13 @@ pub struct ItemTree {
 
 impl ItemTree {
     pub(crate) fn file_item_tree_query(db: &dyn DefDatabase, file_id: HirFileId) -> Arc<ItemTree> {
-        let _p = profile::span("file_item_tree_query").detail(|| format!("{:?}", file_id));
+        let _p = profile::span("file_item_tree_query").detail(|| format!("{file_id:?}"));
         let syntax = match db.parse_or_expand(file_id) {
             Some(node) => node,
             None => return Default::default(),
         };
-        if never!(syntax.kind() == SyntaxKind::ERROR) {
+        if never!(syntax.kind() == SyntaxKind::ERROR, "{:?} from {:?} {}", file_id, syntax, syntax)
+        {
             // FIXME: not 100% sure why these crop up, but return an empty tree to avoid a panic
             return Default::default();
         }
@@ -120,7 +122,7 @@ impl ItemTree {
         let mut item_tree = match_ast! {
             match syntax {
                 ast::SourceFile(file) => {
-                    top_attrs = Some(RawAttrs::new(db, &file, ctx.hygiene()));
+                    top_attrs = Some(RawAttrs::new(db.upcast(), &file, ctx.hygiene()));
                     ctx.lower_module_items(&file)
                 },
                 ast::MacroItems(items) => {
@@ -132,7 +134,7 @@ impl ItemTree {
                     ctx.lower_macro_stmts(stmts)
                 },
                 _ => {
-                    panic!("cannot create item tree from {:?} {}", syntax, syntax);
+                    panic!("cannot create item tree for file {file_id:?} from {syntax:?} {syntax}");
                 },
             }
         };
@@ -152,7 +154,11 @@ impl ItemTree {
 
     /// Returns the inner attributes of the source file.
     pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: CrateId) -> Attrs {
-        self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone().filter(db, krate)
+        Attrs::filter(
+            db,
+            krate,
+            self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone(),
+        )
     }
 
     pub(crate) fn raw_attrs(&self, of: AttrOwner) -> &RawAttrs {
@@ -160,7 +166,7 @@ impl ItemTree {
     }
 
     pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
-        self.raw_attrs(of).clone().filter(db, krate)
+        Attrs::filter(db, krate, self.raw_attrs(of).clone())
     }
 
     pub fn pretty_print(&self) -> String {
@@ -666,7 +672,8 @@ pub struct Trait {
     pub generic_params: Interned<GenericParams>,
     pub is_auto: bool,
     pub is_unsafe: bool,
-    pub items: Box<[AssocItem]>,
+    /// This is [`None`] if this Trait is a trait alias.
+    pub items: Option<Box<[AssocItem]>>,
     pub ast_id: FileAstId<ast::Trait>,
 }
 

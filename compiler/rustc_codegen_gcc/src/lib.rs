@@ -73,7 +73,8 @@ use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModul
 use rustc_codegen_ssa::target_features::supported_target_features;
 use rustc_codegen_ssa::traits::{CodegenBackend, ExtraBackendMethods, ModuleBufferMethods, ThinBufferMethods, WriteBackendMethods};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{ErrorGuaranteed, Handler};
+use rustc_errors::{DiagnosticMessage, ErrorGuaranteed, Handler, SubdiagnosticMessage};
+use rustc_macros::fluent_messages;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
@@ -83,6 +84,8 @@ use rustc_session::Session;
 use rustc_span::Symbol;
 use rustc_span::fatal_error::FatalError;
 use tempfile::TempDir;
+
+fluent_messages! { "../locales/en-US.ftl" }
 
 pub struct PrintOnPanic<F: Fn() -> String>(pub F);
 
@@ -100,6 +103,10 @@ pub struct GccCodegenBackend {
 }
 
 impl CodegenBackend for GccCodegenBackend {
+    fn locale_resource(&self) -> &'static str {
+        crate::DEFAULT_LOCALE_RESOURCE
+    }
+
     fn init(&self, sess: &Session) {
         if sess.lto() != Lto::No {
             sess.emit_warning(LTONotSupported {});
@@ -161,7 +168,7 @@ impl ExtraBackendMethods for GccCodegenBackend {
         mods
     }
 
-    fn compile_codegen_unit<'tcx>(&self, tcx: TyCtxt<'tcx>, cgu_name: Symbol) -> (ModuleCodegen<Self::Module>, u64) {
+    fn compile_codegen_unit(&self, tcx: TyCtxt<'_>, cgu_name: Symbol) -> (ModuleCodegen<Self::Module>, u64) {
         base::compile_codegen_unit(tcx, cgu_name, *self.supports_128bit_integers.lock().expect("lock"))
     }
 
@@ -200,6 +207,7 @@ unsafe impl Sync for GccContext {}
 impl WriteBackendMethods for GccCodegenBackend {
     type Module = GccContext;
     type TargetMachine = ();
+    type TargetMachineError = ();
     type ModuleBuffer = ModuleBuffer;
     type ThinData = ();
     type ThinBuffer = ThinBuffer;
@@ -315,10 +323,10 @@ pub fn target_features(sess: &Session, allow_unstable: bool) -> Vec<Symbol> {
                 false
             }
             /*
-               adx, aes, avx, avx2, avx512bf16, avx512bitalg, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512gfni,
-               avx512ifma, avx512pf, avx512vaes, avx512vbmi, avx512vbmi2, avx512vl, avx512vnni, avx512vp2intersect, avx512vpclmulqdq,
-               avx512vpopcntdq, bmi1, bmi2, cmpxchg16b, ermsb, f16c, fma, fxsr, lzcnt, movbe, pclmulqdq, popcnt, rdrand, rdseed, rtm,
-               sha, sse, sse2, sse3, sse4.1, sse4.2, sse4a, ssse3, tbm, xsave, xsavec, xsaveopt, xsaves
+               adx, aes, avx, avx2, avx512bf16, avx512bitalg, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512ifma,
+               avx512pf, avx512vbmi, avx512vbmi2, avx512vl, avx512vnni, avx512vp2intersect, avx512vpopcntdq,
+               bmi1, bmi2, cmpxchg16b, ermsb, f16c, fma, fxsr, gfni, lzcnt, movbe, pclmulqdq, popcnt, rdrand, rdseed, rtm,
+               sha, sse, sse2, sse3, sse4.1, sse4.2, sse4a, ssse3, tbm, vaes, vpclmulqdq, xsave, xsavec, xsaveopt, xsaves
              */
             //false
         })

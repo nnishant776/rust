@@ -32,8 +32,9 @@ impl<'tcx> PlaceTy<'tcx> {
     /// not carry a `Ty` for `T`.)
     ///
     /// Note that the resulting type has not been normalized.
+    #[instrument(level = "debug", skip(tcx), ret)]
     pub fn field_ty(self, tcx: TyCtxt<'tcx>, f: Field) -> Ty<'tcx> {
-        let answer = match self.ty.kind() {
+        match self.ty.kind() {
             ty::Adt(adt_def, substs) => {
                 let variant_def = match self.variant_index {
                     None => adt_def.non_enum_variant(),
@@ -47,9 +48,7 @@ impl<'tcx> PlaceTy<'tcx> {
             }
             ty::Tuple(tys) => tys[f.index()],
             _ => bug!("extracting field of non-tuple non-adt: {:?}", self),
-        };
-        debug!("field_ty self: {:?} f: {:?} yields: {:?}", self, f, answer);
-        answer
+        }
     }
 
     /// Convenience wrapper around `projection_ty_core` for
@@ -98,7 +97,7 @@ impl<'tcx> PlaceTy<'tcx> {
                     ty::Slice(..) => self.ty,
                     ty::Array(inner, _) if !from_end => tcx.mk_array(*inner, (to - from) as u64),
                     ty::Array(inner, size) if from_end => {
-                        let size = size.eval_usize(tcx, param_env);
+                        let size = size.eval_target_usize(tcx, param_env);
                         let len = size - (from as u64) - (to as u64);
                         tcx.mk_array(*inner, len)
                     }
@@ -163,10 +162,10 @@ impl<'tcx> Rvalue<'tcx> {
         match *self {
             Rvalue::Use(ref operand) => operand.ty(local_decls, tcx),
             Rvalue::Repeat(ref operand, count) => {
-                tcx.mk_ty(ty::Array(operand.ty(local_decls, tcx), count))
+                tcx.mk_array_with_const_len(operand.ty(local_decls, tcx), count)
             }
             Rvalue::ThreadLocalRef(did) => {
-                let static_ty = tcx.type_of(did);
+                let static_ty = tcx.type_of(did).subst_identity();
                 if tcx.is_mutable_static(did) {
                     tcx.mk_mut_ptr(static_ty)
                 } else if tcx.is_foreign_item(did) {
@@ -195,20 +194,20 @@ impl<'tcx> Rvalue<'tcx> {
                 let lhs_ty = lhs.ty(local_decls, tcx);
                 let rhs_ty = rhs.ty(local_decls, tcx);
                 let ty = op.ty(tcx, lhs_ty, rhs_ty);
-                tcx.intern_tup(&[ty, tcx.types.bool])
+                tcx.mk_tup(&[ty, tcx.types.bool])
             }
             Rvalue::UnaryOp(UnOp::Not | UnOp::Neg, ref operand) => operand.ty(local_decls, tcx),
             Rvalue::Discriminant(ref place) => place.ty(local_decls, tcx).ty.discriminant_ty(tcx),
             Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _) => tcx.types.usize,
             Rvalue::Aggregate(ref ak, ref ops) => match **ak {
                 AggregateKind::Array(ty) => tcx.mk_array(ty, ops.len() as u64),
-                AggregateKind::Tuple => tcx.mk_tup(ops.iter().map(|op| op.ty(local_decls, tcx))),
-                AggregateKind::Adt(did, _, substs, _, _) => {
-                    tcx.bound_type_of(did).subst(tcx, substs)
+                AggregateKind::Tuple => {
+                    tcx.mk_tup_from_iter(ops.iter().map(|op| op.ty(local_decls, tcx)))
                 }
-                AggregateKind::Closure(did, substs) => tcx.mk_closure(did.to_def_id(), substs),
+                AggregateKind::Adt(did, _, substs, _, _) => tcx.type_of(did).subst(tcx, substs),
+                AggregateKind::Closure(did, substs) => tcx.mk_closure(did, substs),
                 AggregateKind::Generator(did, substs, movability) => {
-                    tcx.mk_generator(did.to_def_id(), substs, movability)
+                    tcx.mk_generator(did, substs, movability)
                 }
             },
             Rvalue::ShallowInitBox(_, ty) => tcx.mk_box(ty),
@@ -234,7 +233,7 @@ impl<'tcx> Operand<'tcx> {
     {
         match self {
             &Operand::Copy(ref l) | &Operand::Move(ref l) => l.ty(local_decls, tcx).ty,
-            &Operand::Constant(ref c) => c.literal.ty(),
+            Operand::Constant(c) => c.literal.ty(),
         }
     }
 }

@@ -156,22 +156,23 @@ pub fn completions(
 
     // prevent `(` from triggering unwanted completion noise
     if trigger_character == Some('(') {
-        if let CompletionAnalysis::NameRef(NameRefContext { kind, .. }) = &analysis {
-            if let NameRefKind::Path(
-                path_ctx @ PathCompletionCtx { kind: PathKind::Vis { has_in_token }, .. },
-            ) = kind
-            {
-                completions::vis::complete_vis_path(&mut completions, ctx, path_ctx, has_in_token);
-            }
+        if let CompletionAnalysis::NameRef(NameRefContext {
+            kind:
+                NameRefKind::Path(
+                    path_ctx @ PathCompletionCtx { kind: PathKind::Vis { has_in_token }, .. },
+                ),
+            ..
+        }) = analysis
+        {
+            completions::vis::complete_vis_path(&mut completions, ctx, path_ctx, has_in_token);
         }
-        // prevent `(` from triggering unwanted completion noise
         return Some(completions.into());
     }
 
     {
         let acc = &mut completions;
 
-        match &analysis {
+        match analysis {
             CompletionAnalysis::Name(name_ctx) => completions::complete_name(acc, ctx, name_ctx),
             CompletionAnalysis::NameRef(name_ref_ctx) => {
                 completions::complete_name_ref(acc, ctx, name_ref_ctx)

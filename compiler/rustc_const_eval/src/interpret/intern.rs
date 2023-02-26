@@ -30,15 +30,15 @@ use super::{
 use crate::const_eval;
 
 pub trait CompileTimeMachine<'mir, 'tcx, T> = Machine<
-    'mir,
-    'tcx,
-    MemoryKind = T,
-    Provenance = AllocId,
-    ExtraFnVal = !,
-    FrameExtra = (),
-    AllocExtra = (),
-    MemoryMap = FxIndexMap<AllocId, (MemoryKind<T>, Allocation)>,
->;
+        'mir,
+        'tcx,
+        MemoryKind = T,
+        Provenance = AllocId,
+        ExtraFnVal = !,
+        FrameExtra = (),
+        AllocExtra = (),
+        MemoryMap = FxIndexMap<AllocId, (MemoryKind<T>, Allocation)>,
+    >;
 
 struct InternVisitor<'rt, 'mir, 'tcx, M: CompileTimeMachine<'mir, 'tcx, const_eval::MemoryKind>> {
     /// The ectx from which we intern.
@@ -59,7 +59,7 @@ struct InternVisitor<'rt, 'mir, 'tcx, M: CompileTimeMachine<'mir, 'tcx, const_ev
 
 #[derive(Copy, Clone, Debug, PartialEq, Hash, Eq)]
 enum InternMode {
-    /// A static and its current mutability.  Below shared references inside a `static mut`,
+    /// A static and its current mutability. Below shared references inside a `static mut`,
     /// this is *immutable*, and below mutable references inside an `UnsafeCell`, this
     /// is *mutable*.
     Static(hir::Mutability),
@@ -134,8 +134,8 @@ fn intern_shallow<'rt, 'mir, 'tcx, M: CompileTimeMachine<'mir, 'tcx, const_eval:
         alloc.mutability = Mutability::Not;
     };
     // link the alloc id to the actual allocation
-    leftover_allocations.extend(alloc.provenance().iter().map(|&(_, alloc_id)| alloc_id));
-    let alloc = tcx.intern_const_alloc(alloc);
+    leftover_allocations.extend(alloc.provenance().ptrs().iter().map(|&(_, alloc_id)| alloc_id));
+    let alloc = tcx.mk_const_alloc(alloc);
     tcx.set_alloc_id_memory(alloc_id, alloc);
     None
 }
@@ -242,7 +242,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: CompileTimeMachine<'mir, 'tcx, const_eval::Memory
             let mplace = self.ecx.ref_to_mplace(&value)?;
             assert_eq!(mplace.layout.ty, referenced_ty);
             // Handle trait object vtables.
-            if let ty::Dynamic(..) =
+            if let ty::Dynamic(_, _, ty::Dyn) =
                 tcx.struct_tail_erasing_lifetimes(referenced_ty, self.ecx.param_env).kind()
             {
                 let ptr = mplace.meta.unwrap_meta().to_pointer(&tcx)?;
@@ -296,7 +296,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: CompileTimeMachine<'mir, 'tcx, const_eval::Memory
                         }
                     }
                     InternMode::Const => {
-                        // Ignore `UnsafeCell`, everything is immutable.  Validity does some sanity
+                        // Ignore `UnsafeCell`, everything is immutable. Validity does some sanity
                         // checking for mutable references that we encounter -- they must all be
                         // ZST.
                         InternMode::Const
@@ -330,7 +330,7 @@ pub enum InternKind {
 
 /// Intern `ret` and everything it references.
 ///
-/// This *cannot raise an interpreter error*.  Doing so is left to validation, which
+/// This *cannot raise an interpreter error*. Doing so is left to validation, which
 /// tracks where in the value we are and thus can show much better error messages.
 #[instrument(level = "debug", skip(ecx))]
 pub fn intern_const_alloc_recursive<
@@ -379,7 +379,7 @@ pub fn intern_const_alloc_recursive<
             inside_unsafe_cell: false,
         }
         .visit_value(&mplace);
-        // We deliberately *ignore* interpreter errors here.  When there is a problem, the remaining
+        // We deliberately *ignore* interpreter errors here. When there is a problem, the remaining
         // references are "leftover"-interned, and later validation will show a proper error
         // and point at the right part of the value causing the problem.
         match res {
@@ -437,9 +437,9 @@ pub fn intern_const_alloc_recursive<
                     alloc.mutability = Mutability::Not;
                 }
             }
-            let alloc = tcx.intern_const_alloc(alloc);
+            let alloc = tcx.mk_const_alloc(alloc);
             tcx.set_alloc_id_memory(alloc_id, alloc);
-            for &(_, alloc_id) in alloc.inner().provenance().iter() {
+            for &(_, alloc_id) in alloc.inner().provenance().ptrs().iter() {
                 if leftover_allocations.insert(alloc_id) {
                     todo.push(alloc_id);
                 }
@@ -454,7 +454,7 @@ pub fn intern_const_alloc_recursive<
             return Err(reported);
         } else if ecx.tcx.try_get_global_alloc(alloc_id).is_none() {
             // We have hit an `AllocId` that is neither in local or global memory and isn't
-            // marked as dangling by local memory.  That should be impossible.
+            // marked as dangling by local memory. That should be impossible.
             span_bug!(ecx.tcx.span, "encountered unknown alloc id {:?}", alloc_id);
         }
     }
@@ -479,6 +479,6 @@ impl<'mir, 'tcx: 'mir, M: super::intern::CompileTimeMachine<'mir, 'tcx, !>>
         f(self, &dest.into())?;
         let mut alloc = self.memory.alloc_map.remove(&dest.ptr.provenance.unwrap()).unwrap().1;
         alloc.mutability = Mutability::Not;
-        Ok(self.tcx.intern_const_alloc(alloc))
+        Ok(self.tcx.mk_const_alloc(alloc))
     }
 }

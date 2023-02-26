@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_infer::infer::InferCtxt;
 use rustc_middle::mir::visit::TyContext;
 use rustc_middle::mir::visit::Visitor;
@@ -7,7 +9,7 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::visit::TypeVisitable;
-use rustc_middle::ty::{self, RegionVid, Ty};
+use rustc_middle::ty::{self, RegionVid, Ty, TyCtxt};
 
 use crate::{
     borrow_set::BorrowSet, facts::AllFacts, location::LocationTable, nll::ToRegionVid,
@@ -163,7 +165,7 @@ impl<'cx, 'tcx> ConstraintGeneration<'cx, 'tcx> {
     /// `location`.
     fn add_regular_live_constraint<T>(&mut self, live_ty: T, location: Location)
     where
-        T: TypeVisitable<'tcx>,
+        T: TypeVisitable<TyCtxt<'tcx>>,
     {
         debug!("add_regular_live_constraint(live_ty={:?}, location={:?})", live_ty, location);
 

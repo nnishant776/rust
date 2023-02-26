@@ -1,3 +1,4 @@
+use crate::errors;
 use info;
 use libloading::Library;
 use rustc_ast as ast;
@@ -8,14 +9,16 @@ use rustc_parse::validate_attr;
 use rustc_session as session;
 use rustc_session::config::CheckCfg;
 use rustc_session::config::{self, CrateType};
-use rustc_session::config::{ErrorOutputType, Input, OutputFilenames};
+use rustc_session::config::{ErrorOutputType, OutputFilenames};
+use rustc_session::filesearch::sysroot_candidates;
 use rustc_session::lint::{self, BuiltinLintDiagnostics, LintBuffer};
 use rustc_session::parse::CrateConfig;
 use rustc_session::{early_error, filesearch, output, Session};
+use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::edition::Edition;
-use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::source_map::FileLoader;
 use rustc_span::symbol::{sym, Symbol};
+use session::CompilerIO;
 use std::env;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::mem;
@@ -56,8 +59,9 @@ pub fn create_session(
     sopts: config::Options,
     cfg: FxHashSet<(String, Option<String>)>,
     check_cfg: CheckCfg,
+    locale_resources: &'static [&'static str],
     file_loader: Option<Box<dyn FileLoader + Send + Sync + 'static>>,
-    input_path: Option<PathBuf>,
+    io: CompilerIO,
     lint_caps: FxHashMap<lint::LintId, lint::Level>,
     make_codegen_backend: Option<
         Box<dyn FnOnce(&config::Options) -> Box<dyn CodegenBackend> + Send>,
@@ -67,10 +71,7 @@ pub fn create_session(
     let codegen_backend = if let Some(make_codegen_backend) = make_codegen_backend {
         make_codegen_backend(&sopts)
     } else {
-        get_codegen_backend(
-            &sopts.maybe_sysroot,
-            sopts.unstable_opts.codegen_backend.as_ref().map(|name| &name[..]),
-        )
+        get_codegen_backend(&sopts.maybe_sysroot, sopts.unstable_opts.codegen_backend.as_deref())
     };
 
     // target_override is documented to be called before init(), so this is okay
@@ -78,7 +79,7 @@ pub fn create_session(
 
     let bundle = match rustc_errors::fluent_bundle(
         sopts.maybe_sysroot.clone(),
-        sysroot_candidates(),
+        sysroot_candidates().to_vec(),
         sopts.unstable_opts.translate_lang.clone(),
         sopts.unstable_opts.translate_additional_ftl.as_deref(),
         sopts.unstable_opts.translate_directionality_markers,
@@ -89,11 +90,15 @@ pub fn create_session(
         }
     };
 
+    let mut locale_resources = Vec::from(locale_resources);
+    locale_resources.push(codegen_backend.locale_resource());
+
     let mut sess = session::build_session(
         sopts,
-        input_path,
+        io,
         bundle,
         descriptions,
+        locale_resources,
         lint_caps,
         file_loader,
         target_override,
@@ -207,13 +212,13 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
 
 fn load_backend_from_dylib(path: &Path) -> MakeBackendFn {
     let lib = unsafe { Library::new(path) }.unwrap_or_else(|err| {
-        let err = format!("couldn't load codegen backend {:?}: {}", path, err);
+        let err = format!("couldn't load codegen backend {path:?}: {err}");
         early_error(ErrorOutputType::default(), &err);
     });
 
     let backend_sym = unsafe { lib.get::<MakeBackendFn>(b"__rustc_codegen_backend") }
         .unwrap_or_else(|e| {
-            let err = format!("couldn't load codegen backend: {}", e);
+            let err = format!("couldn't load codegen backend: {e}");
             early_error(ErrorOutputType::default(), &err);
         });
 
@@ -259,7 +264,7 @@ pub fn rustc_path<'a>() -> Option<&'a Path> {
 
     const BIN_PATH: &str = env!("RUSTC_INSTALL_BINDIR");
 
-    RUSTC_PATH.get_or_init(|| get_rustc_path_inner(BIN_PATH)).as_ref().map(|v| &**v)
+    RUSTC_PATH.get_or_init(|| get_rustc_path_inner(BIN_PATH)).as_deref()
 }
 
 fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
@@ -271,100 +276,6 @@ fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
         });
         candidate.exists().then_some(candidate)
     })
-}
-
-fn sysroot_candidates() -> Vec<PathBuf> {
-    let target = session::config::host_triple();
-    let mut sysroot_candidates = vec![filesearch::get_or_default_sysroot()];
-    let path = current_dll_path().and_then(|s| s.canonicalize().ok());
-    if let Some(dll) = path {
-        // use `parent` twice to chop off the file name and then also the
-        // directory containing the dll which should be either `lib` or `bin`.
-        if let Some(path) = dll.parent().and_then(|p| p.parent()) {
-            // The original `path` pointed at the `rustc_driver` crate's dll.
-            // Now that dll should only be in one of two locations. The first is
-            // in the compiler's libdir, for example `$sysroot/lib/*.dll`. The
-            // other is the target's libdir, for example
-            // `$sysroot/lib/rustlib/$target/lib/*.dll`.
-            //
-            // We don't know which, so let's assume that if our `path` above
-            // ends in `$target` we *could* be in the target libdir, and always
-            // assume that we may be in the main libdir.
-            sysroot_candidates.push(path.to_owned());
-
-            if path.ends_with(target) {
-                sysroot_candidates.extend(
-                    path.parent() // chop off `$target`
-                        .and_then(|p| p.parent()) // chop off `rustlib`
-                        .and_then(|p| p.parent()) // chop off `lib`
-                        .map(|s| s.to_owned()),
-                );
-            }
-        }
-    }
-
-    return sysroot_candidates;
-
-    #[cfg(unix)]
-    fn current_dll_path() -> Option<PathBuf> {
-        use std::ffi::{CStr, OsStr};
-        use std::os::unix::prelude::*;
-
-        unsafe {
-            let addr = current_dll_path as usize as *mut _;
-            let mut info = mem::zeroed();
-            if libc::dladdr(addr, &mut info) == 0 {
-                info!("dladdr failed");
-                return None;
-            }
-            if info.dli_fname.is_null() {
-                info!("dladdr returned null pointer");
-                return None;
-            }
-            let bytes = CStr::from_ptr(info.dli_fname).to_bytes();
-            let os = OsStr::from_bytes(bytes);
-            Some(PathBuf::from(os))
-        }
-    }
-
-    #[cfg(windows)]
-    fn current_dll_path() -> Option<PathBuf> {
-        use std::ffi::OsString;
-        use std::io;
-        use std::os::windows::prelude::*;
-        use std::ptr;
-
-        use winapi::um::libloaderapi::{
-            GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        };
-
-        unsafe {
-            let mut module = ptr::null_mut();
-            let r = GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                current_dll_path as usize as *mut _,
-                &mut module,
-            );
-            if r == 0 {
-                info!("GetModuleHandleExW failed: {}", io::Error::last_os_error());
-                return None;
-            }
-            let mut space = Vec::with_capacity(1024);
-            let r = GetModuleFileNameW(module, space.as_mut_ptr(), space.capacity() as u32);
-            if r == 0 {
-                info!("GetModuleFileNameW failed: {}", io::Error::last_os_error());
-                return None;
-            }
-            let r = r as usize;
-            if r >= space.capacity() {
-                info!("our buffer was too small? {}", io::Error::last_os_error());
-                return None;
-            }
-            space.set_len(r);
-            let os = OsString::from_wide(&space);
-            Some(PathBuf::from(os))
-        }
-    }
 }
 
 fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> MakeBackendFn {
@@ -400,8 +311,7 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
             .join("\n* ");
         let err = format!(
             "failed to find a `codegen-backends` folder \
-                           in the sysroot candidates:\n* {}",
-            candidates
+                           in the sysroot candidates:\n* {candidates}"
         );
         early_error(ErrorOutputType::default(), &err);
     });
@@ -420,8 +330,8 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
     let mut file: Option<PathBuf> = None;
 
     let expected_names = &[
-        format!("rustc_codegen_{}-{}", backend_name, release_str().expect("CFG_RELEASE")),
-        format!("rustc_codegen_{}", backend_name),
+        format!("rustc_codegen_{}-{}", backend_name, env!("CFG_RELEASE")),
+        format!("rustc_codegen_{backend_name}"),
     ];
     for entry in d.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -450,7 +360,7 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
     match file {
         Some(ref s) => load_backend_from_dylib(s),
         None => {
-            let err = format!("unsupported builtin codegen backend `{}`", backend_name);
+            let err = format!("unsupported builtin codegen backend `{backend_name}`");
             early_error(ErrorOutputType::default(), &err);
         }
     }
@@ -485,7 +395,7 @@ pub(crate) fn check_attr_crate_type(
                             BuiltinLintDiagnostics::UnknownCrateTypes(
                                 span,
                                 "did you mean".to_string(),
-                                format!("\"{}\"", candidate),
+                                format!("\"{candidate}\""),
                             ),
                         );
                     } else {
@@ -568,35 +478,27 @@ pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<C
     }
 
     base.retain(|crate_type| {
-        let res = !output::invalid_output_for_target(session, *crate_type);
-
-        if !res {
-            session.warn(&format!(
-                "dropping unsupported crate type `{}` for target `{}`",
-                *crate_type, session.opts.target_triple
-            ));
+        if output::invalid_output_for_target(session, *crate_type) {
+            session.emit_warning(errors::UnsupportedCrateTypeForTarget {
+                crate_type: *crate_type,
+                target_triple: &session.opts.target_triple,
+            });
+            false
+        } else {
+            true
         }
-
-        res
     });
 
     base
 }
 
-pub fn build_output_filenames(
-    input: &Input,
-    odir: &Option<PathBuf>,
-    ofile: &Option<PathBuf>,
-    temps_dir: &Option<PathBuf>,
-    attrs: &[ast::Attribute],
-    sess: &Session,
-) -> OutputFilenames {
-    match *ofile {
+pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> OutputFilenames {
+    match sess.io.output_file {
         None => {
             // "-" as input file will cause the parser to read from stdin so we
             // have to make up a name
             // We want to toss everything after the final '.'
-            let dirpath = (*odir).as_ref().cloned().unwrap_or_default();
+            let dirpath = sess.io.output_dir.clone().unwrap_or_default();
 
             // If a crate name is present, we use it as the link name
             let stem = sess
@@ -604,13 +506,13 @@ pub fn build_output_filenames(
                 .crate_name
                 .clone()
                 .or_else(|| rustc_attr::find_crate_name(sess, attrs).map(|n| n.to_string()))
-                .unwrap_or_else(|| input.filestem().to_owned());
+                .unwrap_or_else(|| sess.io.input.filestem().to_owned());
 
             OutputFilenames::new(
                 dirpath,
                 stem,
                 None,
-                temps_dir.clone(),
+                sess.io.temps_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )
@@ -620,26 +522,23 @@ pub fn build_output_filenames(
             let unnamed_output_types =
                 sess.opts.output_types.values().filter(|a| a.is_none()).count();
             let ofile = if unnamed_output_types > 1 {
-                sess.warn(
-                    "due to multiple output types requested, the explicitly specified \
-                     output file name will be adapted for each output type",
-                );
+                sess.emit_warning(errors::MultipleOutputTypesAdaption);
                 None
             } else {
                 if !sess.opts.cg.extra_filename.is_empty() {
-                    sess.warn("ignoring -C extra-filename flag due to -o flag");
+                    sess.emit_warning(errors::IgnoringExtraFilename);
                 }
                 Some(out_file.clone())
             };
-            if *odir != None {
-                sess.warn("ignoring --out-dir flag due to -o flag");
+            if sess.io.output_dir != None {
+                sess.emit_warning(errors::IgnoringOutDir);
             }
 
             OutputFilenames::new(
                 out_file.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
                 out_file.file_stem().unwrap_or_default().to_str().unwrap().to_string(),
                 ofile,
-                temps_dir.clone(),
+                sess.io.temps_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )
@@ -647,22 +546,12 @@ pub fn build_output_filenames(
     }
 }
 
-/// Returns a version string such as "1.46.0 (04488afe3 2020-08-24)"
-pub fn version_str() -> Option<&'static str> {
+/// Returns a version string such as "1.46.0 (04488afe3 2020-08-24)" when invoked by an in-tree tool.
+pub macro version_str() {
     option_env!("CFG_VERSION")
 }
 
-/// Returns a version string such as "0.12.0-dev".
-pub fn release_str() -> Option<&'static str> {
-    option_env!("CFG_RELEASE")
-}
-
-/// Returns the full SHA1 hash of HEAD of the Git repo from which rustc was built.
-pub fn commit_hash_str() -> Option<&'static str> {
-    option_env!("CFG_VER_HASH")
-}
-
-/// Returns the "commit date" of HEAD of the Git repo from which rustc was built as a static string.
-pub fn commit_date_str() -> Option<&'static str> {
-    option_env!("CFG_VER_DATE")
+/// Returns the version string for `rustc` itself (which may be different from a tool version).
+pub fn rustc_version_str() -> Option<&'static str> {
+    version_str!()
 }

@@ -149,7 +149,7 @@ enum DefUse {
 }
 
 impl DefUse {
-    fn apply<'tcx>(trans: &mut impl GenKill<Local>, place: Place<'tcx>, context: PlaceContext) {
+    fn apply(trans: &mut impl GenKill<Local>, place: Place<'_>, context: PlaceContext) {
         match DefUse::for_place(place, context) {
             Some(DefUse::Def) => trans.kill(place.local),
             Some(DefUse::Use) => trans.gen(place.local),
@@ -157,7 +157,7 @@ impl DefUse {
         }
     }
 
-    fn for_place<'tcx>(place: Place<'tcx>, context: PlaceContext) -> Option<DefUse> {
+    fn for_place(place: Place<'_>, context: PlaceContext) -> Option<DefUse> {
         match context {
             PlaceContext::NonUse(_) => None,
 
@@ -254,13 +254,7 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeTransitiveLiveLocals<'a> {
     ) {
         // Compute the place that we are storing to, if any
         let destination = match &statement.kind {
-            StatementKind::Assign(assign) => {
-                if assign.1.is_safe_to_remove() {
-                    Some(assign.0)
-                } else {
-                    None
-                }
-            }
+            StatementKind::Assign(assign) => assign.1.is_safe_to_remove().then_some(assign.0),
             StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) => {
                 Some(**place)
             }
@@ -271,6 +265,7 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeTransitiveLiveLocals<'a> {
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop => None,
         };
         if let Some(destination) = destination {

@@ -123,6 +123,7 @@ pub enum FailMode {
 pub enum CompareMode {
     Polonius,
     Chalk,
+    NextSolver,
     SplitDwarf,
     SplitDwarfSingle,
 }
@@ -132,6 +133,7 @@ impl CompareMode {
         match *self {
             CompareMode::Polonius => "polonius",
             CompareMode::Chalk => "chalk",
+            CompareMode::NextSolver => "next-solver",
             CompareMode::SplitDwarf => "split-dwarf",
             CompareMode::SplitDwarfSingle => "split-dwarf-single",
         }
@@ -141,6 +143,7 @@ impl CompareMode {
         match s.as_str() {
             "polonius" => CompareMode::Polonius,
             "chalk" => CompareMode::Chalk,
+            "next-solver" => CompareMode::NextSolver,
             "split-dwarf" => CompareMode::SplitDwarf,
             "split-dwarf-single" => CompareMode::SplitDwarfSingle,
             x => panic!("unknown --compare-mode option: {}", x),
@@ -230,6 +233,9 @@ pub struct Config {
     /// The directory where programs should be built
     pub build_base: PathBuf,
 
+    /// The directory containing the compiler sysroot
+    pub sysroot_base: PathBuf,
+
     /// The name of the stage being built (stage1, etc)
     pub stage_id: String,
 
@@ -237,7 +243,7 @@ pub struct Config {
     pub mode: Mode,
 
     /// The test suite (essentially which directory is running, but without the
-    /// directory prefix such as src/test)
+    /// directory prefix such as tests)
     pub suite: String,
 
     /// The debugger to use in debuginfo mode. Unset otherwise.
@@ -373,6 +379,9 @@ pub struct Config {
 
     /// Whether to rerun tests even if the inputs are unchanged.
     pub force_rerun: bool,
+
+    /// Only rerun the tests that result has been modified accoring to Git status
+    pub only_modified: bool,
 
     pub target_cfg: LazyCell<TargetCfg>,
 }
@@ -614,6 +623,6 @@ pub fn output_base_name(config: &Config, testpaths: &TestPaths, revision: Option
 
 /// Absolute path to the directory to use for incremental compilation. Example:
 ///   /path/to/build/host-triple/test/ui/relative/testname.mode/testname.inc
-pub fn incremental_dir(config: &Config, testpaths: &TestPaths) -> PathBuf {
-    output_base_name(config, testpaths, None).with_extension("inc")
+pub fn incremental_dir(config: &Config, testpaths: &TestPaths, revision: Option<&str>) -> PathBuf {
+    output_base_name(config, testpaths, revision).with_extension("inc")
 }

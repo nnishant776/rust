@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_middle::ty::TypeVisitable;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{
     self,
     error::TypeError,
@@ -136,6 +136,11 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
     fn tag(&self) -> &'static str {
         "Match"
     }
+
+    fn intercrate(&self) -> bool {
+        false
+    }
+
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -146,14 +151,21 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         true
     } // irrelevant
 
+    fn mark_ambiguous(&mut self) {
+        bug!()
+    }
+
+    #[instrument(level = "trace", skip(self))]
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
-        _: ty::Variance,
+        variance: ty::Variance,
         _: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
-        self.relate(a, b)
+        // Opaque types substs have lifetime parameters.
+        // We must not check them to be equal, as we never insert anything to make them so.
+        if variance != ty::Bivariant { self.relate(a, b) } else { Ok(a) }
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -174,7 +186,8 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     fn tys(&mut self, pattern: Ty<'tcx>, value: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
-        if let ty::Error(_) = pattern.kind() {
+        // FIXME(non_lifetime_binders): What to do here?
+        if matches!(pattern.kind(), ty::Error(_) | ty::Bound(..)) {
             // Unlike normal `TypeRelation` rules, `ty::Error` does not equal any type.
             self.no_match()
         } else if pattern == value {

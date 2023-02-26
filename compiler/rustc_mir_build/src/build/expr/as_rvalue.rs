@@ -55,7 +55,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 })
             }
             ExprKind::Repeat { value, count } => {
-                if Some(0) == count.try_eval_usize(this.tcx, this.param_env) {
+                if Some(0) == count.try_eval_target_usize(this.tcx, this.param_env) {
                     this.build_zero_repeat(block, value, scope, source_info)
                 } else {
                     let value_operand = unpack!(
@@ -142,7 +142,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let exchange_malloc = Operand::function_handle(
                     tcx,
                     tcx.require_lang_item(LangItem::ExchangeMalloc, Some(expr_span)),
-                    ty::List::empty(),
+                    [],
                     expr_span,
                 );
                 let storage = this.temp(tcx.mk_mut_ptr(tcx.types.u8), expr_span);
@@ -369,8 +369,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     let place_builder =
                         unpack!(block = this.as_place_builder(block, &this.thir[*thir_place]));
 
-                    if let Ok(place_builder_resolved) = place_builder.try_upvars_resolved(this) {
-                        let mir_place = place_builder_resolved.into_place(this);
+                    if let Some(mir_place) = place_builder.try_to_place(this) {
                         this.cfg.push_fake_read(
                             block,
                             this.source_info(this.tcx.hir().span(*hir_id)),
@@ -440,10 +439,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         // We implicitly set the discriminant to 0. See
                         // librustc_mir/transform/deaggregator.rs for details.
                         let movability = movability.unwrap();
-                        Box::new(AggregateKind::Generator(closure_id, substs, movability))
+                        Box::new(AggregateKind::Generator(
+                            closure_id.to_def_id(),
+                            substs,
+                            movability,
+                        ))
                     }
                     UpvarSubsts::Closure(substs) => {
-                        Box::new(AggregateKind::Closure(closure_id, substs))
+                        Box::new(AggregateKind::Closure(closure_id.to_def_id(), substs))
                     }
                 };
                 block.and(Rvalue::Aggregate(result, operands))
@@ -517,7 +520,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let source_info = self.source_info(span);
         let bool_ty = self.tcx.types.bool;
         if self.check_overflow && op.is_checkable() && ty.is_integral() {
-            let result_tup = self.tcx.intern_tup(&[ty, bool_ty]);
+            let result_tup = self.tcx.mk_tup(&[ty, bool_ty]);
             let result_value = self.temp(result_tup, span);
 
             self.cfg.push_assign(
@@ -661,7 +664,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // by the parent itself. The mutability of the current capture
             // is same as that of the capture in the parent closure.
             PlaceBase::Upvar { .. } => {
-                let enclosing_upvars_resolved = arg_place_builder.clone().into_place(this);
+                let enclosing_upvars_resolved = arg_place_builder.to_place(this);
 
                 match enclosing_upvars_resolved.as_ref() {
                     PlaceRef {
@@ -698,7 +701,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             Mutability::Mut => BorrowKind::Mut { allow_two_phase_borrow: false },
         };
 
-        let arg_place = arg_place_builder.into_place(this);
+        let arg_place = arg_place_builder.to_place(this);
 
         this.cfg.push_assign(
             block,

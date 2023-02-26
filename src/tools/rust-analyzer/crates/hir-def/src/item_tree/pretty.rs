@@ -3,7 +3,6 @@
 use std::fmt::{self, Write};
 
 use crate::{
-    attr::RawAttrs,
     generics::{TypeOrConstParamData, WherePredicate, WherePredicateTypeTarget},
     pretty::{print_path, print_type_bounds, print_type_ref},
     visibility::RawVisibility,
@@ -375,12 +374,21 @@ impl<'a> Printer<'a> {
                 }
                 w!(self, "trait {}", name);
                 self.print_generic_params(generic_params);
-                self.print_where_clause_and_opening_brace(generic_params);
-                self.indented(|this| {
-                    for item in &**items {
-                        this.print_mod_item((*item).into());
+                match items {
+                    Some(items) => {
+                        self.print_where_clause_and_opening_brace(generic_params);
+                        self.indented(|this| {
+                            for item in &**items {
+                                this.print_mod_item((*item).into());
+                            }
+                        });
                     }
-                });
+                    None => {
+                        w!(self, " = ");
+                        // FIXME: Print the aliased traits
+                        self.print_where_clause_and_opening_brace(generic_params);
+                    }
+                }
                 wln!(self, "}}");
             }
             ModItem::Impl(it) => {

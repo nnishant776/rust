@@ -1,6 +1,8 @@
 use crate::creader::{CStore, LoadedMacro};
 use crate::foreign_modules;
 use crate::native_libs;
+use crate::rmeta::table::IsDefault;
+use crate::rmeta::AttrFlags;
 
 use rustc_ast as ast;
 use rustc_attr::Deprecation;
@@ -21,7 +23,6 @@ use rustc_span::source_map::{Span, Spanned};
 use rustc_span::symbol::{kw, Symbol};
 
 use rustc_data_structures::sync::Lrc;
-use smallvec::SmallVec;
 use std::any::Any;
 
 use super::{Decodable, DecodeContext, DecodeIterator};
@@ -88,6 +89,14 @@ macro_rules! provide_one {
             }
         }
     };
+    ($tcx:ident, $def_id:ident, $other:ident, $cdata:ident, $name:ident => { table_defaulted_array }) => {
+        provide_one! {
+            $tcx, $def_id, $other, $cdata, $name => {
+                let lazy = $cdata.root.tables.$name.get($cdata, $def_id.index);
+                if lazy.is_default() { &[] } else { $tcx.arena.alloc_from_iter(lazy.decode(($cdata, $tcx))) }
+            }
+        }
+    };
     ($tcx:ident, $def_id:ident, $other:ident, $cdata:ident, $name:ident => { table_direct }) => {
         provide_one! {
             $tcx, $def_id, $other, $cdata, $name => {
@@ -105,7 +114,7 @@ macro_rules! provide_one {
         fn $name<'tcx>(
             $tcx: TyCtxt<'tcx>,
             def_id_arg: ty::query::query_keys::$name<'tcx>,
-        ) -> ty::query::query_values::$name<'tcx> {
+        ) -> ty::query::query_provided::$name<'tcx> {
             let _prof_timer =
                 $tcx.prof.generic_activity(concat!("metadata_decode_entry_", stringify!($name)));
 
@@ -121,7 +130,13 @@ macro_rules! provide_one {
                 $tcx.ensure().crate_hash($def_id.krate);
             }
 
-            let $cdata = CStore::from_tcx($tcx).get_crate_data($def_id.krate);
+            let cdata = rustc_data_structures::sync::MappedReadGuard::map(CStore::from_tcx($tcx), |c| {
+                c.get_crate_data($def_id.krate).cdata
+            });
+            let $cdata = crate::creader::CrateMetadataRef {
+                cdata: &cdata,
+                cstore: &CStore::from_tcx($tcx),
+            };
 
             $compute
         }
@@ -187,10 +202,10 @@ impl IntoArgs for (CrateNum, SimplifiedType) {
 }
 
 provide! { tcx, def_id, other, cdata,
-    explicit_item_bounds => { table }
+    explicit_item_bounds => { table_defaulted_array }
     explicit_predicates_of => { table }
     generics_of => { table }
-    inferred_outlives_of => { table }
+    inferred_outlives_of => { table_defaulted_array }
     super_predicates_of => { table }
     type_of => { table }
     variances_of => { table }
@@ -202,6 +217,7 @@ provide! { tcx, def_id, other, cdata,
     thir_abstract_const => { table }
     optimized_mir => { table }
     mir_for_ctfe => { table }
+    mir_generator_witnesses => { table }
     promoted_mir => { table }
     def_span => { table }
     def_ident_span => { table }
@@ -224,15 +240,21 @@ provide! { tcx, def_id, other, cdata,
     generator_kind => { table }
     trait_def => { table }
     deduced_param_attrs => { table }
-    collect_trait_impl_trait_tys => {
+    is_type_alias_impl_trait => {
+        debug_assert_eq!(tcx.def_kind(def_id), DefKind::OpaqueTy);
+        cdata.root.tables.is_type_alias_impl_trait.get(cdata, def_id.index)
+    }
+    collect_return_position_impl_trait_in_trait_tys => {
         Ok(cdata
             .root
             .tables
             .trait_impl_trait_tys
             .get(cdata, def_id.index)
             .map(|lazy| lazy.decode((cdata, tcx)))
-            .process_decoded(tcx, || panic!("{:?} does not have trait_impl_trait_tys", def_id)))
+            .process_decoded(tcx, || panic!("{def_id:?} does not have trait_impl_trait_tys")))
      }
+
+    associated_items_for_impl_trait_in_trait => { table_defaulted_array }
 
     visibility => { cdata.get_visibility(def_id.index) }
     adt_def => { cdata.get_adt_def(def_id.index, tcx) }
@@ -290,6 +312,7 @@ provide! { tcx, def_id, other, cdata,
     extra_filename => { cdata.root.extra_filename.clone() }
 
     traits_in_crate => { tcx.arena.alloc_from_iter(cdata.get_traits()) }
+    trait_impls_in_crate => { tcx.arena.alloc_from_iter(cdata.get_trait_impls()) }
     implementations_of_trait => { cdata.get_implementations_of_trait(tcx, other) }
     crate_incoherent_impls => { cdata.get_incoherent_impls(tcx, other) }
 
@@ -298,9 +321,7 @@ provide! { tcx, def_id, other, cdata,
         r
     }
     module_children => {
-        let mut result = SmallVec::<[_; 8]>::new();
-        cdata.for_each_module_child(def_id.index, |child| result.push(child), tcx.sess);
-        tcx.arena.alloc_slice(&result)
+        tcx.arena.alloc_from_iter(cdata.get_module_children(def_id.index, tcx.sess))
     }
     defined_lib_features => { cdata.get_lib_features(tcx) }
     stability_implications => {
@@ -332,6 +353,11 @@ provide! { tcx, def_id, other, cdata,
     crate_extern_paths => { cdata.source().paths().cloned().collect() }
     expn_that_defined => { cdata.get_expn_that_defined(def_id.index, tcx.sess) }
     generator_diagnostic_data => { cdata.get_generator_diagnostic_data(tcx, def_id.index) }
+    is_doc_hidden => { cdata.get_attr_flags(def_id.index).contains(AttrFlags::IS_DOC_HIDDEN) }
+    doc_link_resolutions => { tcx.arena.alloc(cdata.get_doc_link_resolutions(def_id.index)) }
+    doc_link_traits_in_scope => {
+        tcx.arena.alloc_from_iter(cdata.get_doc_link_traits_in_scope(def_id.index))
+    }
 }
 
 pub(in crate::rmeta) fn provide(providers: &mut Providers) {
@@ -385,7 +411,7 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             // keys from the former.
             // This is a rudimentary check that does not catch all cases,
             // just the easiest.
-            let mut fallback_map: DefIdMap<DefId> = Default::default();
+            let mut fallback_map: Vec<(DefId, DefId)> = Default::default();
 
             // Issue 46112: We want the map to prefer the shortest
             // paths when reporting the path to an item. Therefore we
@@ -415,12 +441,12 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
 
                 if let Some(def_id) = child.res.opt_def_id() {
                     if child.ident.name == kw::Underscore {
-                        fallback_map.insert(def_id, parent);
+                        fallback_map.push((def_id, parent));
                         return;
                     }
 
-                    if ty::util::is_doc_hidden(tcx, parent) {
-                        fallback_map.insert(def_id, parent);
+                    if tcx.is_doc_hidden(parent) {
+                        fallback_map.push((def_id, parent));
                         return;
                     }
 
@@ -454,6 +480,7 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             // Fill in any missing entries with the less preferable path.
             // If this path re-exports the child as `_`, we still use this
             // path in a diagnostic that suggests importing `::*`.
+
             for (child, parent) in fallback_map {
                 visible_parent_map.entry(child).or_insert(parent);
             }
@@ -495,22 +522,20 @@ impl CStore {
         self.get_crate_data(def.krate).get_struct_field_visibilities(def.index)
     }
 
-    pub fn ctor_def_id_and_kind_untracked(&self, def: DefId) -> Option<(DefId, CtorKind)> {
-        self.get_crate_data(def.krate).get_ctor_def_id_and_kind(def.index)
+    pub fn ctor_untracked(&self, def: DefId) -> Option<(CtorKind, DefId)> {
+        self.get_crate_data(def.krate).get_ctor(def.index)
     }
 
     pub fn visibility_untracked(&self, def: DefId) -> Visibility<DefId> {
         self.get_crate_data(def.krate).get_visibility(def.index)
     }
 
-    pub fn module_children_untracked(&self, def_id: DefId, sess: &Session) -> Vec<ModChild> {
-        let mut result = vec![];
-        self.get_crate_data(def_id.krate).for_each_module_child(
-            def_id.index,
-            |child| result.push(child),
-            sess,
-        );
-        result
+    pub fn module_children_untracked<'a>(
+        &'a self,
+        def_id: DefId,
+        sess: &'a Session,
+    ) -> impl Iterator<Item = ModChild> + 'a {
+        self.get_crate_data(def_id.krate).get_module_children(def_id.index, sess)
     }
 
     pub fn load_macro_untracked(&self, id: DefId, sess: &Session) -> LoadedMacro {
@@ -592,46 +617,13 @@ impl CStore {
     ) -> Span {
         self.get_crate_data(cnum).get_proc_macro_quoted_span(id, sess)
     }
-
-    /// Decodes all trait impls in the crate (for rustdoc).
-    pub fn trait_impls_in_crate_untracked(
-        &self,
-        cnum: CrateNum,
-    ) -> impl Iterator<Item = (DefId, DefId, Option<SimplifiedType>)> + '_ {
-        self.get_crate_data(cnum).get_trait_impls()
-    }
-
-    /// Decodes all inherent impls in the crate (for rustdoc).
-    pub fn inherent_impls_in_crate_untracked(
-        &self,
-        cnum: CrateNum,
-    ) -> impl Iterator<Item = (DefId, DefId)> + '_ {
-        self.get_crate_data(cnum).get_inherent_impls()
-    }
-
-    /// Decodes all incoherent inherent impls in the crate (for rustdoc).
-    pub fn incoherent_impls_in_crate_untracked(
-        &self,
-        cnum: CrateNum,
-    ) -> impl Iterator<Item = DefId> + '_ {
-        self.get_crate_data(cnum).get_all_incoherent_impls()
-    }
-
-    pub fn associated_item_def_ids_untracked<'a>(
-        &'a self,
-        def_id: DefId,
-        sess: &'a Session,
-    ) -> impl Iterator<Item = DefId> + 'a {
-        self.get_crate_data(def_id.krate).get_associated_item_def_ids(def_id.index, sess)
-    }
-
-    pub fn may_have_doc_links_untracked(&self, def_id: DefId) -> bool {
-        self.get_crate_data(def_id.krate).get_may_have_doc_links(def_id.index)
-    }
 }
 
 impl CrateStore for CStore {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn untracked_as_any(&mut self) -> &mut dyn Any {
         self
     }
 

@@ -7,9 +7,11 @@ use chalk_recursive::Cache;
 use chalk_solve::{logging_db::LoggingRustIrDatabase, Solver};
 
 use base_db::CrateId;
-use hir_def::{lang_item::LangItemTarget, TraitId};
+use hir_def::{
+    lang_item::{LangItem, LangItemTarget},
+    TraitId,
+};
 use stdx::panic_context;
-use syntax::SmolStr;
 
 use crate::{
     db::HirDatabase, infer::unify::InferenceTable, AliasEq, AliasTy, Canonical, DomainGoal, Goal,
@@ -18,7 +20,7 @@ use crate::{
 };
 
 /// This controls how much 'time' we give the Chalk solver before giving up.
-const CHALK_SOLVER_FUEL: i32 = 100;
+const CHALK_SOLVER_FUEL: i32 = 1000;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ChalkContext<'a> {
@@ -55,13 +57,10 @@ impl TraitEnvironment {
         }
     }
 
-    pub fn traits_in_scope_from_clauses<'a>(
-        &'a self,
-        ty: Ty,
-    ) -> impl Iterator<Item = TraitId> + 'a {
+    pub fn traits_in_scope_from_clauses(&self, ty: Ty) -> impl Iterator<Item = TraitId> + '_ {
         self.traits_from_clauses
             .iter()
-            .filter_map(move |(self_ty, trait_id)| (*self_ty == ty).then(|| *trait_id))
+            .filter_map(move |(self_ty, trait_id)| (*self_ty == ty).then_some(*trait_id))
     }
 }
 
@@ -130,7 +129,7 @@ fn solve(
 
     let mut solve = || {
         let _ctx = if is_chalk_debug() || is_chalk_print() {
-            Some(panic_context::enter(format!("solving {:?}", goal)))
+            Some(panic_context::enter(format!("solving {goal:?}")))
         } else {
             None
         };
@@ -180,18 +179,18 @@ pub enum FnTrait {
 }
 
 impl FnTrait {
-    const fn lang_item_name(self) -> &'static str {
+    const fn lang_item(self) -> LangItem {
         match self {
-            FnTrait::FnOnce => "fn_once",
-            FnTrait::FnMut => "fn_mut",
-            FnTrait::Fn => "fn",
+            FnTrait::FnOnce => LangItem::FnOnce,
+            FnTrait::FnMut => LangItem::FnMut,
+            FnTrait::Fn => LangItem::Fn,
         }
     }
 
     pub fn get_id(&self, db: &dyn HirDatabase, krate: CrateId) -> Option<TraitId> {
-        let target = db.lang_item(krate, SmolStr::new_inline(self.lang_item_name()))?;
+        let target = db.lang_item(krate, self.lang_item())?;
         match target {
-            LangItemTarget::TraitId(t) => Some(t),
+            LangItemTarget::Trait(t) => Some(t),
             _ => None,
         }
     }

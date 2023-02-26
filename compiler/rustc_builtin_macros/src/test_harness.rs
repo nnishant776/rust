@@ -14,7 +14,8 @@ use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::spec::PanicStrategy;
 use smallvec::{smallvec, SmallVec};
-use thin_vec::thin_vec;
+use thin_vec::{thin_vec, ThinVec};
+use tracing::debug;
 
 use std::{iter, mem};
 
@@ -34,8 +35,8 @@ struct TestCtxt<'a> {
     test_runner: Option<ast::Path>,
 }
 
-// Traverse the crate, collecting all the test functions, eliding any
-// existing main functions, and synthesizing a main test harness
+/// Traverse the crate, collecting all the test functions, eliding any
+/// existing main functions, and synthesizing a main test harness
 pub fn inject(sess: &Session, resolver: &mut dyn ResolverExpand, krate: &mut ast::Crate) {
     let span_diagnostic = sess.diagnostic();
     let panic_strategy = sess.panic_strategy();
@@ -131,8 +132,9 @@ impl<'a> MutVisitor for TestHarnessGenerator<'a> {
 
         // We don't want to recurse into anything other than mods, since
         // mods or tests inside of functions will break things
-        if let ast::ItemKind::Mod(_, ModKind::Loaded(.., ref spans)) = item.kind {
-            let ast::ModSpans { inner_span: span, inject_use_span: _ } = *spans;
+        if let ast::ItemKind::Mod(_, ModKind::Loaded(.., ast::ModSpans { inner_span: span, .. })) =
+            item.kind
+        {
             let prev_tests = mem::take(&mut self.tests);
             noop_visit_item_kind(&mut item.kind, self);
             self.add_test_cases(item.id, span, prev_tests);
@@ -185,13 +187,12 @@ impl<'a> MutVisitor for EntryPointCleaner<'a> {
         let item = match entry_point_type(self.sess, &item, self.depth) {
             EntryPointType::MainNamed | EntryPointType::RustcMainAttr | EntryPointType::Start => {
                 item.map(|ast::Item { id, ident, attrs, kind, vis, span, tokens }| {
-                    let allow_ident = Ident::new(sym::allow, self.def_site);
-                    let dc_nested =
-                        attr::mk_nested_word_item(Ident::new(sym::dead_code, self.def_site));
-                    let allow_dead_code_item = attr::mk_list_item(allow_ident, vec![dc_nested]);
-                    let allow_dead_code = attr::mk_attr_outer(
+                    let allow_dead_code = attr::mk_attr_nested_word(
                         &self.sess.parse_sess.attr_id_generator,
-                        allow_dead_code_item,
+                        ast::AttrStyle::Outer,
+                        sym::allow,
+                        sym::dead_code,
+                        self.def_site,
                     );
                     let attrs = attrs
                         .into_iter()
@@ -299,7 +300,7 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> P<ast::Item> {
     test_runner.span = sp;
 
     let test_main_path_expr = ecx.expr_path(test_runner);
-    let call_test_main = ecx.expr_call(sp, test_main_path_expr, vec![mk_tests_slice(cx, sp)]);
+    let call_test_main = ecx.expr_call(sp, test_main_path_expr, thin_vec![mk_tests_slice(cx, sp)]);
     let call_test_main = ecx.stmt_expr(call_test_main);
 
     // extern crate test
@@ -309,20 +310,19 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> P<ast::Item> {
     );
 
     // #[rustc_main]
-    let main_meta = ecx.meta_word(sp, sym::rustc_main);
-    let main_attr = ecx.attribute(main_meta);
+    let main_attr = ecx.attr_word(sym::rustc_main, sp);
 
     // pub fn main() { ... }
-    let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(vec![]));
+    let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(ThinVec::new()));
 
     // If no test runner is provided we need to import the test crate
     let main_body = if cx.test_runner.is_none() {
-        ecx.block(sp, vec![test_extern_stmt, call_test_main])
+        ecx.block(sp, thin_vec![test_extern_stmt, call_test_main])
     } else {
-        ecx.block(sp, vec![call_test_main])
+        ecx.block(sp, thin_vec![call_test_main])
     };
 
-    let decl = ecx.fn_decl(vec![], ast::FnRetTy::Ty(main_ret_ty));
+    let decl = ecx.fn_decl(ThinVec::new(), ast::FnRetTy::Ty(main_ret_ty));
     let sig = ast::FnSig { decl, header: ast::FnHeader::default(), span: sp };
     let defaultness = ast::Defaultness::Final;
     let main = ast::ItemKind::Fn(Box::new(ast::Fn {

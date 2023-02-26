@@ -80,7 +80,7 @@ fn report_error_if_not_applied_to_ty(
     path: &[&str],
     ty_name: &str,
 ) -> Result<(), DiagnosticDeriveError> {
-    if !type_matches_path(&info.ty, path) {
+    if !type_matches_path(info.ty.inner_type(), path) {
         report_type_error(attr, ty_name)?;
     }
 
@@ -105,8 +105,8 @@ pub(crate) fn report_error_if_not_applied_to_span(
     attr: &Attribute,
     info: &FieldInfo<'_>,
 ) -> Result<(), DiagnosticDeriveError> {
-    if !type_matches_path(&info.ty, &["rustc_span", "Span"])
-        && !type_matches_path(&info.ty, &["rustc_errors", "MultiSpan"])
+    if !type_matches_path(info.ty.inner_type(), &["rustc_span", "Span"])
+        && !type_matches_path(info.ty.inner_type(), &["rustc_errors", "MultiSpan"])
     {
         report_type_error(attr, "`Span` or `MultiSpan`")?;
     }
@@ -115,44 +115,50 @@ pub(crate) fn report_error_if_not_applied_to_span(
 }
 
 /// Inner type of a field and type of wrapper.
+#[derive(Copy, Clone)]
 pub(crate) enum FieldInnerTy<'ty> {
     /// Field is wrapped in a `Option<$inner>`.
     Option(&'ty Type),
     /// Field is wrapped in a `Vec<$inner>`.
     Vec(&'ty Type),
     /// Field isn't wrapped in an outer type.
-    None,
+    Plain(&'ty Type),
 }
 
 impl<'ty> FieldInnerTy<'ty> {
     /// Returns inner type for a field, if there is one.
     ///
-    /// - If `ty` is an `Option`, returns `FieldInnerTy::Option { inner: (inner type) }`.
-    /// - If `ty` is a `Vec`, returns `FieldInnerTy::Vec { inner: (inner type) }`.
-    /// - Otherwise returns `None`.
+    /// - If `ty` is an `Option<Inner>`, returns `FieldInnerTy::Option(Inner)`.
+    /// - If `ty` is a `Vec<Inner>`, returns `FieldInnerTy::Vec(Inner)`.
+    /// - Otherwise returns `FieldInnerTy::Plain(ty)`.
     pub(crate) fn from_type(ty: &'ty Type) -> Self {
-        let variant: &dyn Fn(&'ty Type) -> FieldInnerTy<'ty> =
-            if type_matches_path(ty, &["std", "option", "Option"]) {
-                &FieldInnerTy::Option
-            } else if type_matches_path(ty, &["std", "vec", "Vec"]) {
-                &FieldInnerTy::Vec
-            } else {
-                return FieldInnerTy::None;
+        fn single_generic_type(ty: &Type) -> &Type {
+            let Type::Path(ty_path) = ty else {
+                panic!("expected path type");
             };
 
-        if let Type::Path(ty_path) = ty {
             let path = &ty_path.path;
             let ty = path.segments.iter().last().unwrap();
-            if let syn::PathArguments::AngleBracketed(bracketed) = &ty.arguments {
-                if bracketed.args.len() == 1 {
-                    if let syn::GenericArgument::Type(ty) = &bracketed.args[0] {
-                        return variant(ty);
-                    }
-                }
-            }
+            let syn::PathArguments::AngleBracketed(bracketed) = &ty.arguments else {
+                panic!("expected bracketed generic arguments");
+            };
+
+            assert_eq!(bracketed.args.len(), 1);
+
+            let syn::GenericArgument::Type(ty) = &bracketed.args[0] else {
+                panic!("expected generic parameter to be a type generic");
+            };
+
+            ty
         }
 
-        unreachable!();
+        if type_matches_path(ty, &["std", "option", "Option"]) {
+            FieldInnerTy::Option(single_generic_type(ty))
+        } else if type_matches_path(ty, &["std", "vec", "Vec"]) {
+            FieldInnerTy::Vec(single_generic_type(ty))
+        } else {
+            FieldInnerTy::Plain(ty)
+        }
     }
 
     /// Returns `true` if `FieldInnerTy::with` will result in iteration for this inner type (i.e.
@@ -160,15 +166,16 @@ impl<'ty> FieldInnerTy<'ty> {
     pub(crate) fn will_iterate(&self) -> bool {
         match self {
             FieldInnerTy::Vec(..) => true,
-            FieldInnerTy::Option(..) | FieldInnerTy::None => false,
+            FieldInnerTy::Option(..) | FieldInnerTy::Plain(_) => false,
         }
     }
 
-    /// Returns `Option` containing inner type if there is one.
-    pub(crate) fn inner_type(&self) -> Option<&'ty Type> {
+    /// Returns the inner type.
+    pub(crate) fn inner_type(&self) -> &'ty Type {
         match self {
-            FieldInnerTy::Option(inner) | FieldInnerTy::Vec(inner) => Some(inner),
-            FieldInnerTy::None => None,
+            FieldInnerTy::Option(inner) | FieldInnerTy::Vec(inner) | FieldInnerTy::Plain(inner) => {
+                inner
+            }
         }
     }
 
@@ -185,7 +192,7 @@ impl<'ty> FieldInnerTy<'ty> {
                     #inner
                 }
             },
-            FieldInnerTy::None => quote! { #inner },
+            FieldInnerTy::Plain(..) => quote! { #inner },
         }
     }
 }
@@ -194,7 +201,7 @@ impl<'ty> FieldInnerTy<'ty> {
 /// `generate_*` methods from walking the attributes themselves.
 pub(crate) struct FieldInfo<'a> {
     pub(crate) binding: &'a BindingInfo<'a>,
-    pub(crate) ty: &'a Type,
+    pub(crate) ty: FieldInnerTy<'a>,
     pub(crate) span: &'a proc_macro2::Span,
 }
 
@@ -322,7 +329,7 @@ pub(crate) trait HasFieldMap {
                 None => {
                     span_err(
                         span.unwrap(),
-                        &format!("`{}` doesn't refer to a field on this type", field),
+                        &format!("`{field}` doesn't refer to a field on this type"),
                     )
                     .emit();
                     quote! {
@@ -385,7 +392,7 @@ impl quote::ToTokens for Applicability {
 
 /// Build the mapping of field names to fields. This allows attributes to peek values from
 /// other fields.
-pub(super) fn build_field_mapping<'v>(variant: &VariantInfo<'v>) -> HashMap<String, TokenStream> {
+pub(super) fn build_field_mapping(variant: &VariantInfo<'_>) -> HashMap<String, TokenStream> {
     let mut fields_map = FieldMap::new();
     for binding in variant.bindings() {
         if let Some(ident) = &binding.ast().ident {
@@ -603,8 +610,7 @@ impl SubdiagnosticKind {
                     if suggestion_kind != SuggestionKind::Normal {
                         invalid_attr(attr, &meta)
                             .help(format!(
-                                r#"Use `#[suggestion(..., style = "{}")]` instead"#,
-                                suggestion_kind
+                                r#"Use `#[suggestion(..., style = "{suggestion_kind}")]` instead"#
                             ))
                             .emit();
                     }
@@ -621,8 +627,7 @@ impl SubdiagnosticKind {
                     if suggestion_kind != SuggestionKind::Normal {
                         invalid_attr(attr, &meta)
                             .help(format!(
-                                r#"Use `#[multipart_suggestion(..., style = "{}")]` instead"#,
-                                suggestion_kind
+                                r#"Use `#[multipart_suggestion(..., style = "{suggestion_kind}")]` instead"#
                             ))
                             .emit();
                     }
@@ -686,7 +691,7 @@ impl SubdiagnosticKind {
             let meta = match nested_attr {
                 NestedMeta::Meta(ref meta) => meta,
                 NestedMeta::Lit(_) => {
-                    invalid_nested_attr(attr, &nested_attr).emit();
+                    invalid_nested_attr(attr, nested_attr).emit();
                     continue;
                 }
             };
@@ -698,7 +703,7 @@ impl SubdiagnosticKind {
             let string_value = match meta {
                 Meta::NameValue(MetaNameValue { lit: syn::Lit::Str(value), .. }) => Some(value),
 
-                Meta::Path(_) => throw_invalid_nested_attr!(attr, &nested_attr, |diag| {
+                Meta::Path(_) => throw_invalid_nested_attr!(attr, nested_attr, |diag| {
                     diag.help("a diagnostic slug must be the first argument to the attribute")
                 }),
                 _ => None,
@@ -720,7 +725,7 @@ impl SubdiagnosticKind {
                     | SubdiagnosticKind::MultipartSuggestion { ref mut applicability, .. },
                 ) => {
                     let Some(value) = string_value else {
-                        invalid_nested_attr(attr, &nested_attr).emit();
+                        invalid_nested_attr(attr, nested_attr).emit();
                         continue;
                     };
 
@@ -736,7 +741,7 @@ impl SubdiagnosticKind {
                     | SubdiagnosticKind::MultipartSuggestion { .. },
                 ) => {
                     let Some(value) = string_value else {
-                        invalid_nested_attr(attr, &nested_attr).emit();
+                        invalid_nested_attr(attr, nested_attr).emit();
                         continue;
                     };
 
@@ -752,19 +757,19 @@ impl SubdiagnosticKind {
 
                 // Invalid nested attribute
                 (_, SubdiagnosticKind::Suggestion { .. }) => {
-                    invalid_nested_attr(attr, &nested_attr)
+                    invalid_nested_attr(attr, nested_attr)
                         .help(
                             "only `style`, `code` and `applicability` are valid nested attributes",
                         )
                         .emit();
                 }
                 (_, SubdiagnosticKind::MultipartSuggestion { .. }) => {
-                    invalid_nested_attr(attr, &nested_attr)
+                    invalid_nested_attr(attr, nested_attr)
                         .help("only `style` and `applicability` are valid nested attributes")
                         .emit()
                 }
                 _ => {
-                    invalid_nested_attr(attr, &nested_attr).emit();
+                    invalid_nested_attr(attr, nested_attr).emit();
                 }
             }
         }
@@ -830,5 +835,5 @@ pub(super) fn should_generate_set_arg(field: &Field) -> bool {
 }
 
 pub(super) fn is_doc_comment(attr: &Attribute) -> bool {
-    attr.path.segments.last().unwrap().ident.to_string() == "doc"
+    attr.path.segments.last().unwrap().ident == "doc"
 }

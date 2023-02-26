@@ -7,6 +7,7 @@
 use std::{env, fs, iter, ops, path::PathBuf, process::Command};
 
 use anyhow::{format_err, Result};
+use base_db::CrateName;
 use la_arena::{Arena, Idx};
 use paths::{AbsPath, AbsPathBuf};
 use rustc_hash::FxHashMap;
@@ -50,14 +51,16 @@ impl Sysroot {
         &self.src_root
     }
 
-    pub fn public_deps(&self) -> impl Iterator<Item = (&'static str, SysrootCrate, bool)> + '_ {
+    pub fn public_deps(&self) -> impl Iterator<Item = (CrateName, SysrootCrate, bool)> + '_ {
         // core is added as a dependency before std in order to
         // mimic rustcs dependency order
         ["core", "alloc", "std"]
             .into_iter()
             .zip(iter::repeat(true))
             .chain(iter::once(("test", false)))
-            .filter_map(move |(name, prelude)| Some((name, self.by_name(name)?, prelude)))
+            .filter_map(move |(name, prelude)| {
+                Some((CrateName::new(name).unwrap(), self.by_name(name)?, prelude))
+            })
     }
 
     pub fn proc_macro(&self) -> Option<SysrootCrate> {
@@ -67,8 +70,13 @@ impl Sysroot {
     pub fn crates(&self) -> impl Iterator<Item = SysrootCrate> + ExactSizeIterator + '_ {
         self.crates.iter().map(|(id, _data)| id)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.crates.is_empty()
+    }
 }
 
+// FIXME: Expose a builder api as loading the sysroot got way too modular and complicated.
 impl Sysroot {
     /// Attempts to discover the toolchain's sysroot from the given `dir`.
     pub fn discover(dir: &AbsPath, extra_env: &FxHashMap<String, String>) -> Result<Sysroot> {
@@ -76,8 +84,17 @@ impl Sysroot {
         let sysroot_dir = discover_sysroot_dir(dir, extra_env)?;
         let sysroot_src_dir =
             discover_sysroot_src_dir_or_add_component(&sysroot_dir, dir, extra_env)?;
-        let res = Sysroot::load(sysroot_dir, sysroot_src_dir)?;
-        Ok(res)
+        Ok(Sysroot::load(sysroot_dir, sysroot_src_dir))
+    }
+
+    pub fn discover_with_src_override(
+        dir: &AbsPath,
+        extra_env: &FxHashMap<String, String>,
+        src: AbsPathBuf,
+    ) -> Result<Sysroot> {
+        tracing::debug!("discovering sysroot for {}", dir.display());
+        let sysroot_dir = discover_sysroot_dir(dir, extra_env)?;
+        Ok(Sysroot::load(sysroot_dir, src))
     }
 
     pub fn discover_rustc(
@@ -94,17 +111,16 @@ impl Sysroot {
         let sysroot_src_dir = discover_sysroot_src_dir(&sysroot_dir).ok_or_else(|| {
             format_err!("can't load standard library from sysroot {}", sysroot_dir.display())
         })?;
-        let res = Sysroot::load(sysroot_dir, sysroot_src_dir)?;
-        Ok(res)
+        Ok(Sysroot::load(sysroot_dir, sysroot_src_dir))
     }
 
-    pub fn load(sysroot_dir: AbsPathBuf, sysroot_src_dir: AbsPathBuf) -> Result<Sysroot> {
+    pub fn load(sysroot_dir: AbsPathBuf, sysroot_src_dir: AbsPathBuf) -> Sysroot {
         let mut sysroot =
             Sysroot { root: sysroot_dir, src_root: sysroot_src_dir, crates: Arena::default() };
 
         for path in SYSROOT_CRATES.trim().lines() {
             let name = path.split('/').last().unwrap();
-            let root = [format!("{}/src/lib.rs", path), format!("lib{}/lib.rs", path)]
+            let root = [format!("{path}/src/lib.rs"), format!("lib{path}/lib.rs")]
                 .into_iter()
                 .map(|it| sysroot.src_root.join(it))
                 .filter_map(|it| ManifestPath::try_from(it).ok())
@@ -128,14 +144,18 @@ impl Sysroot {
         }
 
         if let Some(alloc) = sysroot.by_name("alloc") {
-            if let Some(core) = sysroot.by_name("core") {
-                sysroot.crates[alloc].deps.push(core);
+            for dep in ALLOC_DEPS.trim().lines() {
+                if let Some(dep) = sysroot.by_name(dep) {
+                    sysroot.crates[alloc].deps.push(dep)
+                }
             }
         }
 
         if let Some(proc_macro) = sysroot.by_name("proc_macro") {
-            if let Some(std) = sysroot.by_name("std") {
-                sysroot.crates[proc_macro].deps.push(std);
+            for dep in PROC_MACRO_DEPS.trim().lines() {
+                if let Some(dep) = sysroot.by_name(dep) {
+                    sysroot.crates[proc_macro].deps.push(dep)
+                }
             }
         }
 
@@ -145,14 +165,14 @@ impl Sysroot {
             } else {
                 ""
             };
-            anyhow::bail!(
+            tracing::error!(
                 "could not find libcore in sysroot path `{}`{}",
                 sysroot.src_root.as_path().display(),
                 var_note,
             );
         }
 
-        Ok(sysroot)
+        sysroot
     }
 
     fn by_name(&self, name: &str) -> Option<SysrootCrate> {
@@ -167,7 +187,7 @@ fn discover_sysroot_dir(
 ) -> Result<AbsPathBuf> {
     let mut rustc = Command::new(toolchain::rustc());
     rustc.envs(extra_env);
-    rustc.current_dir(current_dir).args(&["--print", "sysroot"]);
+    rustc.current_dir(current_dir).args(["--print", "sysroot"]);
     tracing::debug!("Discovering sysroot by {:?}", rustc);
     let stdout = utf8_stdout(rustc)?;
     Ok(AbsPathBuf::assert(PathBuf::from(stdout)))
@@ -199,7 +219,7 @@ fn discover_sysroot_src_dir_or_add_component(
         .or_else(|| {
             let mut rustup = Command::new(toolchain::rustup());
             rustup.envs(extra_env);
-            rustup.current_dir(current_dir).args(&["component", "add", "rust-src"]);
+            rustup.current_dir(current_dir).args(["component", "add", "rust-src"]);
             tracing::info!("adding rust-src component by {:?}", rustup);
             utf8_stdout(rustup).ok()?;
             get_rust_src(sysroot_path)
@@ -239,6 +259,7 @@ fn get_rust_src(sysroot_path: &AbsPath) -> Option<AbsPathBuf> {
 
 const SYSROOT_CRATES: &str = "
 alloc
+backtrace
 core
 panic_abort
 panic_unwind
@@ -246,17 +267,19 @@ proc_macro
 profiler_builtins
 std
 stdarch/crates/std_detect
-term
 test
 unwind";
 
+const ALLOC_DEPS: &str = "core";
+
 const STD_DEPS: &str = "
 alloc
-core
-panic_abort
 panic_unwind
+panic_abort
+core
 profiler_builtins
+unwind
 std_detect
-term
-test
-unwind";
+test";
+
+const PROC_MACRO_DEPS: &str = "std";

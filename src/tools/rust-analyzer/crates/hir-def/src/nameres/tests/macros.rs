@@ -264,7 +264,7 @@ fn prelude_is_macro_use() {
     cov_mark::check!(prelude_is_macro_use);
     check(
         r#"
-//- /main.rs crate:main deps:std
+//- /main.rs edition:2018 crate:main deps:std
 structs!(Foo);
 structs_priv!(Bar);
 structs_outside!(Out);
@@ -634,7 +634,7 @@ fn macro_dollar_crate_is_correct_in_indirect_deps() {
     // From std
     check(
         r#"
-//- /main.rs crate:main deps:std
+//- /main.rs edition:2018 crate:main deps:std
 foo!();
 
 //- /std.rs crate:std deps:core
@@ -818,6 +818,28 @@ fn derive() {}
             crate
             S: t v
             derive: m
+        "#]],
+    );
+}
+
+#[test]
+fn resolves_derive_helper_rustc_builtin_macro() {
+    cov_mark::check!(resolved_derive_helper);
+    // This is NOT the correct usage of `default` helper attribute, but we don't resolve helper
+    // attributes on non mod items in hir nameres.
+    check(
+        r#"
+//- minicore: derive, default
+#[derive(Default)]
+#[default]
+enum E {
+    A,
+    B,
+}
+"#,
+        expect![[r#"
+            crate
+            E: t
         "#]],
     );
 }
@@ -1012,7 +1034,7 @@ structs!(Foo);
 fn macro_in_prelude() {
     check(
         r#"
-//- /lib.rs crate:lib deps:std
+//- /lib.rs edition:2018 crate:lib deps:std
 global_asm!();
 
 //- /std.rs crate:std

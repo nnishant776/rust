@@ -3,29 +3,32 @@ use crate::interface::parse_cfgspecs;
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{emitter::HumanReadableErrorType, registry, ColorConfig};
-use rustc_session::config::InstrumentCoverage;
-use rustc_session::config::Strip;
+use rustc_session::config::rustc_optgroups;
+use rustc_session::config::Input;
+use rustc_session::config::InstrumentXRay;
+use rustc_session::config::TraitSolver;
 use rustc_session::config::{build_configuration, build_session_options, to_crate_config};
-use rustc_session::config::{
-    rustc_optgroups, ErrorOutputType, ExternLocation, LocationDetail, Options, Passes,
-};
 use rustc_session::config::{
     BranchProtection, Externs, OomStrategy, OutputType, OutputTypes, PAuthKey, PacRet,
     ProcMacroExecutionStrategy, SymbolManglingVersion, WasiExecModel,
 };
 use rustc_session::config::{CFGuard, ExternEntry, LinkerPluginLto, LtoCli, SwitchWithOptPath};
+use rustc_session::config::{DumpMonoStatsFormat, MirSpanview};
+use rustc_session::config::{ErrorOutputType, ExternLocation, LocationDetail, Options, Strip};
+use rustc_session::config::{InstrumentCoverage, Passes};
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
+use rustc_session::CompilerIO;
 use rustc_session::{build_session, getopts, Session};
 use rustc_span::edition::{Edition, DEFAULT_EDITION};
 use rustc_span::symbol::sym;
+use rustc_span::FileName;
 use rustc_span::SourceFileHashAlgorithm;
 use rustc_target::spec::{CodeModel, LinkerFlavorCli, MergeFunctions, PanicStrategy, RelocModel};
 use rustc_target::spec::{RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::iter::FromIterator;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +43,14 @@ fn build_session_options_and_crate_config(matches: getopts::Matches) -> (Options
 fn mk_session(matches: getopts::Matches) -> (Session, CfgSpecs) {
     let registry = registry::Registry::new(&[]);
     let (sessopts, cfg) = build_session_options_and_crate_config(matches);
-    let sess = build_session(sessopts, None, None, registry, Default::default(), None, None);
+    let temps_dir = sessopts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
+    let io = CompilerIO {
+        input: Input::Str { name: FileName::Custom(String::new()), input: String::new() },
+        output_dir: None,
+        output_file: None,
+        temps_dir,
+    };
+    let sess = build_session(sessopts, io, None, registry, vec![], Default::default(), None, None);
     (sess, cfg)
 }
 
@@ -648,12 +658,14 @@ fn test_unstable_options_tracking_hash() {
     untracked!(dump_mir_dir, String::from("abc"));
     untracked!(dump_mir_exclude_pass_number, true);
     untracked!(dump_mir_graphviz, true);
+    untracked!(dump_mir_spanview, Some(MirSpanview::Statement));
+    untracked!(dump_mono_stats, SwitchWithOptPath::Enabled(Some("mono-items-dir/".into())));
+    untracked!(dump_mono_stats_format, DumpMonoStatsFormat::Json);
     untracked!(dylib_lto, true);
     untracked!(emit_stack_sizes, true);
     untracked!(future_incompat_test, true);
     untracked!(hir_stats, true);
     untracked!(identify_regions, true);
-    untracked!(incremental_ignore_spans, true);
     untracked!(incremental_info, true);
     untracked!(incremental_verify_ich, true);
     untracked!(input_stats, true);
@@ -666,7 +678,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(mir_pretty_relative_line_numbers, true);
     untracked!(nll_facts, true);
     untracked!(no_analysis, true);
-    untracked!(no_interleave_lints, true);
     untracked!(no_leak_check, true);
     untracked!(no_parallel_llvm, true);
     untracked!(parse_only, true);
@@ -680,7 +691,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(proc_macro_execution_strategy, ProcMacroExecutionStrategy::CrossThread);
     untracked!(profile_closures, true);
     untracked!(query_dep_graph, true);
-    untracked!(save_analysis, true);
     untracked!(self_profile, SwitchWithOptPath::Enabled(None));
     untracked!(self_profile_events, Some(vec![String::new()]));
     untracked!(span_debug, true);
@@ -715,7 +725,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(asm_comments, true);
     tracked!(assume_incomplete_release, true);
     tracked!(binary_dep_depinfo, true);
-    tracked!(box_noalias, Some(false));
+    tracked!(box_noalias, false);
     tracked!(
         branch_protection,
         Some(BranchProtection {
@@ -723,7 +733,6 @@ fn test_unstable_options_tracking_hash() {
             pac_ret: Some(PacRet { leaf: true, key: PAuthKey::B })
         })
     );
-    tracked!(chalk, true);
     tracked!(codegen_backend, Some("abc".to_string()));
     tracked!(crate_attr, vec!["abc".to_string()]);
     tracked!(debug_info_for_profiling, true);
@@ -739,22 +748,26 @@ fn test_unstable_options_tracking_hash() {
     tracked!(fuel, Some(("abc".to_string(), 99)));
     tracked!(function_sections, Some(false));
     tracked!(human_readable_cgu_names, true);
+    tracked!(incremental_ignore_spans, true);
     tracked!(inline_in_all_cgus, Some(true));
     tracked!(inline_mir, Some(true));
     tracked!(inline_mir_hint_threshold, Some(123));
     tracked!(inline_mir_threshold, Some(123));
     tracked!(instrument_coverage, Some(InstrumentCoverage::All));
     tracked!(instrument_mcount, true);
+    tracked!(instrument_xray, Some(InstrumentXRay::default()));
     tracked!(link_only, true);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
+    tracked!(maximal_hir_to_mir_coverage, true);
     tracked!(merge_functions, Some(MergeFunctions::Disabled));
     tracked!(mir_emit_retag, true);
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
     tracked!(mir_opt_level, Some(4));
     tracked!(move_size_limit, Some(4096));
-    tracked!(mutable_noalias, Some(true));
+    tracked!(mutable_noalias, false);
     tracked!(no_generate_arange_section, true);
+    tracked!(no_jump_tables, true);
     tracked!(no_link, true);
     tracked!(no_profiler_runtime, true);
     tracked!(no_unique_section_names, true);
@@ -763,7 +776,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(packed_bundled_libs, true);
     tracked!(panic_abort_tests, true);
     tracked!(panic_in_drop, PanicStrategy::Abort);
-    tracked!(pick_stable_methods_before_any_unstable, false);
     tracked!(plt, Some(true));
     tracked!(polonius, true);
     tracked!(precise_enum_drop_elaboration, false);
@@ -789,7 +801,9 @@ fn test_unstable_options_tracking_hash() {
     tracked!(teach, true);
     tracked!(thinlto, Some(true));
     tracked!(thir_unsafeck, true);
+    tracked!(tiny_const_eval_limit, true);
     tracked!(tls_model, Some(TlsModel::GeneralDynamic));
+    tracked!(trait_solver, TraitSolver::Chalk);
     tracked!(translate_remapped_path_to_local_path, false);
     tracked!(trap_unreachable, Some(false));
     tracked!(treat_err_as_bug, NonZeroUsize::new(1));

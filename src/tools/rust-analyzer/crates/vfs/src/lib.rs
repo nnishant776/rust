@@ -59,15 +59,10 @@ pub use paths::{AbsPath, AbsPathBuf};
 /// Handle to a file in [`Vfs`]
 ///
 /// Most functions in rust-analyzer use this when they need to refer to a file.
-#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct FileId(pub u32);
 
 impl stdx::hash::NoHashHashable for FileId {}
-impl std::hash::Hash for FileId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
 
 /// Storage for all files read by rust-analyzer.
 ///
@@ -80,6 +75,7 @@ pub struct Vfs {
 }
 
 /// Changed file in the [`Vfs`].
+#[derive(Debug)]
 pub struct ChangedFile {
     /// Id of the changed file
     pub file_id: FileId,
@@ -166,9 +162,9 @@ impl Vfs {
         let file_id = self.alloc_file_id(path);
         let change_kind = match (&self.get(file_id), &contents) {
             (None, None) => return false,
+            (Some(old), Some(new)) if old == new => return false,
             (None, Some(_)) => ChangeKind::Create,
             (Some(_), None) => ChangeKind::Delete,
-            (Some(old), Some(new)) if old == new => return false,
             (Some(_), Some(_)) => ChangeKind::Modify,
         };
 

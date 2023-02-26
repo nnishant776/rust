@@ -1,6 +1,5 @@
 //! Errors emitted by ast_passes.
 
-use rustc_errors::{fluent, AddToDiagnostic, Applicability, Diagnostic, SubdiagnosticMessage};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 
@@ -25,13 +24,6 @@ pub struct ForbiddenLetStable {
 }
 
 #[derive(Diagnostic)]
-#[diag(ast_passes_forbidden_assoc_constraint)]
-pub struct ForbiddenAssocConstraint {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(ast_passes_keyword_lifetime)]
 pub struct KeywordLifetime {
     #[primary_span]
@@ -51,7 +43,7 @@ pub struct InvalidLabel {
 pub struct InvalidVisibility {
     #[primary_span]
     pub span: Span,
-    #[label(implied)]
+    #[label(ast_passes_implied)]
     pub implied: Option<Span>,
     #[subdiagnostic]
     pub note: Option<InvalidVisibilityNote>,
@@ -59,9 +51,9 @@ pub struct InvalidVisibility {
 
 #[derive(Subdiagnostic)]
 pub enum InvalidVisibilityNote {
-    #[note(individual_impl_items)]
+    #[note(ast_passes_individual_impl_items)]
     IndividualImplItems,
-    #[note(individual_foreign_items)]
+    #[note(ast_passes_individual_foreign_items)]
     IndividualForeignItems,
 }
 
@@ -207,28 +199,21 @@ pub struct FnWithoutBody {
     pub extern_block_suggestion: Option<ExternBlockSuggestion>,
 }
 
-pub struct ExternBlockSuggestion {
-    pub start_span: Span,
-    pub end_span: Span,
-    pub abi: Option<Symbol>,
-}
-
-impl AddToDiagnostic for ExternBlockSuggestion {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
-        let start_suggestion = if let Some(abi) = self.abi {
-            format!("extern \"{}\" {{", abi)
-        } else {
-            "extern {".to_owned()
-        };
-        let end_suggestion = " }".to_owned();
-
-        diag.multipart_suggestion(
-            fluent::extern_block_suggestion,
-            vec![(self.start_span, start_suggestion), (self.end_span, end_suggestion)],
-            Applicability::MaybeIncorrect,
-        );
-    }
+#[derive(Subdiagnostic)]
+pub enum ExternBlockSuggestion {
+    #[multipart_suggestion(ast_passes_extern_block_suggestion, applicability = "maybe-incorrect")]
+    Implicit {
+        #[suggestion_part(code = "extern {{")]
+        start_span: Span,
+        #[suggestion_part(code = " }}")]
+        end_span: Span,
+    },
+    #[multipart_suggestion(ast_passes_extern_block_suggestion, applicability = "maybe-incorrect")]
+    Explicit {
+        #[suggestion_part(code = "extern \"{abi}\" {{")]
+        start_span: Span,
+        #[suggestion_part(code = " }}")]
+        end_span: Span,
+        abi: Symbol,
+    },
 }

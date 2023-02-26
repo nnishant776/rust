@@ -13,9 +13,10 @@ use syntax::{AstNode, SyntaxKind::*, SyntaxToken, TextRange, T};
 
 use crate::{
     hover::hover_for_definition,
-    moniker::{crate_for_file, def_to_moniker, MonikerResult},
-    Analysis, Fold, HoverConfig, HoverDocFormat, HoverResult, InlayHint, InlayHintsConfig,
-    TryToNav,
+    inlay_hints::AdjustmentHintsMode,
+    moniker::{def_to_moniker, MonikerResult},
+    parent_module::crates_for,
+    Analysis, Fold, HoverConfig, HoverResult, InlayHint, InlayHintsConfig, TryToNav,
 };
 
 /// A static representation of fully analyzed source code.
@@ -99,19 +100,22 @@ fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
 
 impl StaticIndex<'_> {
     fn add_file(&mut self, file_id: FileId) {
-        let current_crate = crate_for_file(self.db, file_id);
+        let current_crate = crates_for(self.db, file_id).pop().map(Into::into);
         let folds = self.analysis.folding_ranges(file_id).unwrap();
         let inlay_hints = self
             .analysis
             .inlay_hints(
                 &InlayHintsConfig {
                     render_colons: true,
+                    discriminant_hints: crate::DiscriminantHints::Fieldless,
                     type_hints: true,
                     parameter_hints: true,
                     chaining_hints: true,
                     closure_return_type_hints: crate::ClosureReturnTypeHints::WithBlock,
                     lifetime_elision_hints: crate::LifetimeElisionHints::Never,
-                    reborrow_hints: crate::ReborrowHints::Never,
+                    adjustment_hints: crate::AdjustmentHints::Never,
+                    adjustment_hints_mode: AdjustmentHintsMode::Prefix,
+                    adjustment_hints_hide_outside_unsafe: false,
                     hide_named_constructor_hints: false,
                     hide_closure_initialization_hints: false,
                     param_names_for_lifetime_elision_hints: false,
@@ -132,8 +136,9 @@ impl StaticIndex<'_> {
         });
         let hover_config = HoverConfig {
             links_in_hover: true,
-            documentation: Some(HoverDocFormat::Markdown),
+            documentation: true,
             keywords: true,
+            format: crate::HoverDocFormat::Markdown,
         };
         let tokens = tokens.filter(|token| {
             matches!(
@@ -230,13 +235,13 @@ mod tests {
             for (range, _) in f.tokens {
                 let x = FileRange { file_id: f.file_id, range };
                 if !range_set.contains(&x) {
-                    panic!("additional range {:?}", x);
+                    panic!("additional range {x:?}");
                 }
                 range_set.remove(&x);
             }
         }
         if !range_set.is_empty() {
-            panic!("unfound ranges {:?}", range_set);
+            panic!("unfound ranges {range_set:?}");
         }
     }
 
@@ -251,13 +256,13 @@ mod tests {
                     continue;
                 }
                 if !range_set.contains(&x) {
-                    panic!("additional definition {:?}", x);
+                    panic!("additional definition {x:?}");
                 }
                 range_set.remove(&x);
             }
         }
         if !range_set.is_empty() {
-            panic!("unfound definitions {:?}", range_set);
+            panic!("unfound definitions {range_set:?}");
         }
     }
 

@@ -2,9 +2,8 @@ use std::collections::hash_map::Entry::*;
 
 use rustc_ast::expand::allocator::ALLOCATOR_METHODS;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir as hir;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
-use rustc_hir::Node;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{
     metadata_symbol_name, ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
@@ -12,7 +11,7 @@ use rustc_middle::middle::exported_symbols::{
 use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::Instance;
-use rustc_middle::ty::{self, SymbolName, TyCtxt};
+use rustc_middle::ty::{self, DefIdTree, SymbolName, TyCtxt};
 use rustc_session::config::{CrateType, OomStrategy};
 use rustc_target::spec::SanitizerSet;
 
@@ -74,32 +73,34 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
             //
             // As a result, if this id is an FFI item (foreign item) then we only
             // let it through if it's included statically.
-            match tcx.hir().get_by_def_id(def_id) {
-                Node::ForeignItem(..) => {
-                    tcx.native_library(def_id).map_or(false, |library| library.kind.is_statically_included()).then_some(def_id)
-                }
+            if let Some(parent_id) = tcx.opt_local_parent(def_id)
+                && let DefKind::ForeignMod = tcx.def_kind(parent_id)
+            {
+                let library = tcx.native_library(def_id)?;
+                return library.kind.is_statically_included().then_some(def_id);
+            }
 
-                // Only consider nodes that actually have exported symbols.
-                Node::Item(&hir::Item {
-                    kind: hir::ItemKind::Static(..) | hir::ItemKind::Fn(..),
-                    ..
-                })
-                | Node::ImplItem(&hir::ImplItem { kind: hir::ImplItemKind::Fn(..), .. }) => {
-                    let generics = tcx.generics_of(def_id);
-                    if !generics.requires_monomorphization(tcx)
-                        // Functions marked with #[inline] are codegened with "internal"
-                        // linkage and are not exported unless marked with an extern
-                        // indicator
-                        && (!Instance::mono(tcx, def_id.to_def_id()).def.generates_cgu_internal_copy(tcx)
-                            || tcx.codegen_fn_attrs(def_id.to_def_id()).contains_extern_indicator())
-                    {
-                        Some(def_id)
-                    } else {
-                        None
-                    }
-                }
+            // Only consider nodes that actually have exported symbols.
+            match tcx.def_kind(def_id) {
+                DefKind::Fn | DefKind::Static(_) => {}
+                DefKind::AssocFn if tcx.impl_of_method(def_id.to_def_id()).is_some() => {}
+                _ => return None,
+            };
 
-                _ => None,
+            let generics = tcx.generics_of(def_id);
+            if generics.requires_monomorphization(tcx) {
+                return None;
+            }
+
+            // Functions marked with #[inline] are codegened with "internal"
+            // linkage and are not exported unless marked with an extern
+            // indicator
+            if !Instance::mono(tcx, def_id.to_def_id()).def.generates_cgu_internal_copy(tcx)
+                || tcx.codegen_fn_attrs(def_id.to_def_id()).contains_extern_indicator()
+            {
+                Some(def_id)
+            } else {
+                None
             }
         })
         .map(|def_id| {
@@ -118,7 +119,7 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
                 tcx.symbol_name(Instance::mono(tcx, def_id.to_def_id())),
                 export_level
             );
-            (def_id.to_def_id(), SymbolExportInfo {
+            let info = SymbolExportInfo {
                 level: export_level,
                 kind: if tcx.is_static(def_id.to_def_id()) {
                     if codegen_attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
@@ -130,8 +131,10 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
                     SymbolExportKind::Text
                 },
                 used: codegen_attrs.flags.contains(CodegenFnAttrFlags::USED)
-                    || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER) || used,
-            })
+                    || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
+                    || used,
+            };
+            (def_id.to_def_id(), info)
         })
         .collect();
 
@@ -163,24 +166,29 @@ fn is_reachable_non_generic_provider_extern(tcx: TyCtxt<'_>, def_id: DefId) -> b
     tcx.reachable_non_generics(def_id.krate).contains_key(&def_id)
 }
 
-fn exported_symbols_provider_local<'tcx>(
-    tcx: TyCtxt<'tcx>,
+fn exported_symbols_provider_local(
+    tcx: TyCtxt<'_>,
     cnum: CrateNum,
-) -> &'tcx [(ExportedSymbol<'tcx>, SymbolExportInfo)] {
+) -> &[(ExportedSymbol<'_>, SymbolExportInfo)] {
     assert_eq!(cnum, LOCAL_CRATE);
 
     if !tcx.sess.opts.output_types.should_codegen() {
         return &[];
     }
 
-    let mut symbols: Vec<_> = tcx
-        .reachable_non_generics(LOCAL_CRATE)
-        .iter()
-        .map(|(&def_id, &info)| (ExportedSymbol::NonGeneric(def_id), info))
-        .collect();
+    // FIXME: Sorting this is unnecessary since we are sorting later anyway.
+    //        Can we skip the later sorting?
+    let mut symbols: Vec<_> = tcx.with_stable_hashing_context(|hcx| {
+        tcx.reachable_non_generics(LOCAL_CRATE)
+            .to_sorted(&hcx, true)
+            .into_iter()
+            .map(|(&def_id, &info)| (ExportedSymbol::NonGeneric(def_id), info))
+            .collect()
+    });
 
     if tcx.entry_fn(()).is_some() {
-        let exported_symbol = ExportedSymbol::NoDefId(SymbolName::new(tcx, "main"));
+        let exported_symbol =
+            ExportedSymbol::NoDefId(SymbolName::new(tcx, tcx.sess.target.entry_name.as_ref()));
 
         symbols.push((
             exported_symbol,
@@ -365,7 +373,7 @@ fn upstream_monomorphizations_provider(
                 ExportedSymbol::Generic(def_id, substs) => (def_id, substs),
                 ExportedSymbol::DropGlue(ty) => {
                     if let Some(drop_in_place_fn_def_id) = drop_in_place_fn_def_id {
-                        (drop_in_place_fn_def_id, tcx.intern_substs(&[ty.into()]))
+                        (drop_in_place_fn_def_id, tcx.mk_substs(&[ty.into()]))
                     } else {
                         // `drop_in_place` in place does not exist, don't try
                         // to use it.
@@ -452,9 +460,7 @@ fn symbol_export_level(tcx: TyCtxt<'_>, sym_def_id: DefId) -> SymbolExportLevel 
         let target = &tcx.sess.target.llvm_target;
         // WebAssembly cannot export data symbols, so reduce their export level
         if target.contains("emscripten") {
-            if let Some(Node::Item(&hir::Item { kind: hir::ItemKind::Static(..), .. })) =
-                tcx.hir().get_if_local(sym_def_id)
-            {
+            if let DefKind::Static(_) = tcx.def_kind(sym_def_id) {
                 return SymbolExportLevel::Rust;
             }
         }

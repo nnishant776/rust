@@ -29,7 +29,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
         if item.span.is_dummy() {
             continue;
         }
-        let hir::ItemKind::Use(path, _) = item.kind else { unreachable!() };
+        let (path, _) = item.expect_use();
         let msg = if let Ok(snippet) = tcx.sess.source_map().span_to_snippet(path.span) {
             format!("unused import: `{}`", snippet)
         } else {
@@ -50,31 +50,12 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
 fn unused_crates_lint(tcx: TyCtxt<'_>) {
     let lint = lint::builtin::UNUSED_EXTERN_CRATES;
 
-    // Collect first the crates that are completely unused.  These we
+    // Collect first the crates that are completely unused. These we
     // can always suggest removing (no matter which edition we are
     // in).
     let unused_extern_crates: FxHashMap<LocalDefId, Span> = tcx
         .maybe_unused_extern_crates(())
         .iter()
-        .filter(|&&(def_id, _)| {
-            // The `def_id` here actually was calculated during resolution (at least
-            // at the time of this writing) and is being shipped to us via a side
-            // channel of the tcx. There may have been extra expansion phases,
-            // however, which ended up removing the `def_id` *after* expansion.
-            //
-            // As a result we need to verify that `def_id` is indeed still valid for
-            // our AST and actually present in the HIR map. If it's not there then
-            // there's safely nothing to warn about, and otherwise we carry on with
-            // our execution.
-            //
-            // Note that if we carry through to the `extern_mod_stmt_cnum` query
-            // below it'll cause a panic because `def_id` is actually bogus at this
-            // point in time otherwise.
-            if tcx.hir().find(tcx.hir().local_def_id_to_hir_id(def_id)).is_none() {
-                return false;
-            }
-            true
-        })
         .filter(|&&(def_id, _)| {
             tcx.extern_mod_stmt_cnum(def_id).map_or(true, |cnum| {
                 !tcx.is_compiler_builtins(cnum)

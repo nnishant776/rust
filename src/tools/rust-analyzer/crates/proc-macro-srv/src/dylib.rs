@@ -13,6 +13,8 @@ use object::Object;
 use paths::AbsPath;
 use proc_macro_api::{read_dylib_info, ProcMacroKind};
 
+use crate::tt;
+
 use super::abis::Abi;
 
 const NEW_REGISTRAR_SYMBOL: &str = "_rustc_proc_macro_decls_";
@@ -80,14 +82,14 @@ fn load_library(file: &Path) -> Result<Library, libloading::Error> {
 pub enum LoadProcMacroDylibError {
     Io(io::Error),
     LibLoading(libloading::Error),
-    UnsupportedABI,
+    UnsupportedABI(String),
 }
 
 impl fmt::Display for LoadProcMacroDylibError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => e.fmt(f),
-            Self::UnsupportedABI => write!(f, "unsupported ABI version"),
+            Self::UnsupportedABI(v) => write!(f, "unsupported ABI `{v}`"),
             Self::LibLoading(e) => e.fmt(f),
         }
     }

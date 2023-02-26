@@ -8,8 +8,9 @@ use std::convert::From;
 use std::fmt;
 
 use rustc_ast::ast;
-use rustc_hir::{def::CtorKind, def_id::DefId};
+use rustc_hir::{def::CtorKind, def::DefKind, def_id::DefId};
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::symbol::sym;
 use rustc_span::{Pos, Symbol};
 use rustc_target::spec::abi::Abi as RustcAbi;
 
@@ -37,7 +38,7 @@ impl JsonRenderer<'_> {
                     Some(UrlFragment::UserWritten(_)) | None => *page_id,
                 };
 
-                (link.clone(), from_item_id(id.into(), self.tcx))
+                (link.clone(), id_from_item_default(id.into(), self.tcx))
             })
             .collect();
         let docs = item.attrs.collapsed_doc_value();
@@ -49,7 +50,8 @@ impl JsonRenderer<'_> {
             .collect();
         let span = item.span(self.tcx);
         let visibility = item.visibility(self.tcx);
-        let clean::Item { name, attrs: _, kind: _, item_id, cfg: _, .. } = item;
+        let clean::Item { name, item_id, .. } = item;
+        let id = id_from_item(&item, self.tcx);
         let inner = match *item.kind {
             clean::KeywordItem => return None,
             clean::StrippedItem(ref inner) => {
@@ -68,7 +70,7 @@ impl JsonRenderer<'_> {
             _ => from_clean_item(item, self.tcx),
         };
         Some(Item {
-            id: from_item_id_with_name(item_id, self.tcx, name),
+            id,
             crate_id: item_id.krate().as_u32(),
             name: name.map(|sym| sym.to_string()),
             span: span.and_then(|span| self.convert_span(span)),
@@ -100,14 +102,13 @@ impl JsonRenderer<'_> {
         }
     }
 
-    fn convert_visibility(&self, v: clean::Visibility) -> Visibility {
-        use clean::Visibility::*;
+    fn convert_visibility(&self, v: Option<ty::Visibility<DefId>>) -> Visibility {
         match v {
-            Public => Visibility::Public,
-            Inherited => Visibility::Default,
-            Restricted(did) if did.is_crate_root() => Visibility::Crate,
-            Restricted(did) => Visibility::Restricted {
-                parent: from_item_id(did.into(), self.tcx),
+            None => Visibility::Default,
+            Some(ty::Visibility::Public) => Visibility::Public,
+            Some(ty::Visibility::Restricted(did)) if did.is_crate_root() => Visibility::Crate,
+            Some(ty::Visibility::Restricted(did)) => Visibility::Restricted {
+                parent: id_from_item_default(did.into(), self.tcx),
                 path: self.tcx.def_path(did).to_string_no_crate_verbose(),
             },
         }
@@ -204,41 +205,90 @@ impl FromWithTcx<clean::TypeBindingKind> for TypeBindingKind {
     }
 }
 
-/// It generates an ID as follows:
-///
-/// `CRATE_ID:ITEM_ID[:NAME_ID]` (if there is no name, NAME_ID is not generated).
-pub(crate) fn from_item_id(item_id: ItemId, tcx: TyCtxt<'_>) -> Id {
-    from_item_id_with_name(item_id, tcx, None)
+#[inline]
+pub(crate) fn id_from_item_default(item_id: ItemId, tcx: TyCtxt<'_>) -> Id {
+    id_from_item_inner(item_id, tcx, None, None)
 }
 
-// FIXME: this function (and appending the name at the end of the ID) should be removed when
-// reexports are not inlined anymore for json format. It should be done in #93518.
-pub(crate) fn from_item_id_with_name(item_id: ItemId, tcx: TyCtxt<'_>, name: Option<Symbol>) -> Id {
-    struct DisplayDefId<'a>(DefId, TyCtxt<'a>, Option<Symbol>);
+/// It generates an ID as follows:
+///
+/// `CRATE_ID:ITEM_ID[:NAME_ID][-EXTRA]`:
+///   * If there is no `name`, `NAME_ID` is not generated.
+///   * If there is no `extra`, `EXTRA` is not generated.
+///
+/// * `name` is the item's name if available (it's not for impl blocks for example).
+/// * `extra` is used for reexports: it contains the ID of the reexported item. It is used to allow
+///   to have items with the same name but different types to both appear in the generated JSON.
+pub(crate) fn id_from_item_inner(
+    item_id: ItemId,
+    tcx: TyCtxt<'_>,
+    name: Option<Symbol>,
+    extra: Option<&Id>,
+) -> Id {
+    struct DisplayDefId<'a, 'b>(DefId, TyCtxt<'a>, Option<&'b Id>, Option<Symbol>);
 
-    impl<'a> fmt::Display for DisplayDefId<'a> {
+    impl<'a, 'b> fmt::Display for DisplayDefId<'a, 'b> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let name = match self.2 {
-                Some(name) => format!(":{}", name.as_u32()),
-                None => self
-                    .1
-                    .opt_item_name(self.0)
-                    .map(|n| format!(":{}", n.as_u32()))
-                    .unwrap_or_default(),
+            let DisplayDefId(def_id, tcx, extra, name) = self;
+            // We need this workaround because primitive types' DefId actually refers to
+            // their parent module, which isn't present in the output JSON items. So
+            // instead, we directly get the primitive symbol and convert it to u32 to
+            // generate the ID.
+            let s;
+            let extra = if let Some(e) = extra {
+                s = format!("-{}", e.0);
+                &s
+            } else {
+                ""
             };
-            write!(f, "{}:{}{}", self.0.krate.as_u32(), u32::from(self.0.index), name)
+            let name = match name {
+                Some(name) => format!(":{}", name.as_u32()),
+                None => {
+                    // We need this workaround because primitive types' DefId actually refers to
+                    // their parent module, which isn't present in the output JSON items. So
+                    // instead, we directly get the primitive symbol and convert it to u32 to
+                    // generate the ID.
+                    if matches!(tcx.def_kind(def_id), DefKind::Mod) &&
+                        let Some(prim) = tcx.get_attrs(*def_id, sym::doc)
+                            .flat_map(|attr| attr.meta_item_list().unwrap_or_default())
+                            .filter(|attr| attr.has_name(sym::primitive))
+                            .find_map(|attr| attr.value_str()) {
+                        format!(":{}", prim.as_u32())
+                    } else {
+                        tcx
+                        .opt_item_name(*def_id)
+                        .map(|n| format!(":{}", n.as_u32()))
+                        .unwrap_or_default()
+                    }
+                }
+            };
+            write!(f, "{}:{}{name}{extra}", def_id.krate.as_u32(), u32::from(def_id.index))
         }
     }
 
     match item_id {
-        ItemId::DefId(did) => Id(format!("{}", DisplayDefId(did, tcx, name))),
-        ItemId::Blanket { for_, impl_id } => {
-            Id(format!("b:{}-{}", DisplayDefId(impl_id, tcx, None), DisplayDefId(for_, tcx, name)))
+        ItemId::DefId(did) => Id(format!("{}", DisplayDefId(did, tcx, extra, name))),
+        ItemId::Blanket { for_, impl_id } => Id(format!(
+            "b:{}-{}",
+            DisplayDefId(impl_id, tcx, None, None),
+            DisplayDefId(for_, tcx, extra, name)
+        )),
+        ItemId::Auto { for_, trait_ } => Id(format!(
+            "a:{}-{}",
+            DisplayDefId(trait_, tcx, None, None),
+            DisplayDefId(for_, tcx, extra, name)
+        )),
+    }
+}
+
+pub(crate) fn id_from_item(item: &clean::Item, tcx: TyCtxt<'_>) -> Id {
+    match *item.kind {
+        clean::ItemKind::ImportItem(ref import) => {
+            let extra =
+                import.source.did.map(ItemId::from).map(|i| id_from_item_inner(i, tcx, None, None));
+            id_from_item_inner(item.item_id, tcx, item.name, extra.as_ref())
         }
-        ItemId::Auto { for_, trait_ } => {
-            Id(format!("a:{}-{}", DisplayDefId(trait_, tcx, None), DisplayDefId(for_, tcx, name)))
-        }
-        ItemId::Primitive(ty, krate) => Id(format!("p:{}:{}", krate.as_u32(), ty.as_sym())),
+        _ => id_from_item_inner(item.item_id, tcx, item.name, None),
     }
 }
 
@@ -258,12 +308,12 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
         StructFieldItem(f) => ItemEnum::StructField(f.into_tcx(tcx)),
         EnumItem(e) => ItemEnum::Enum(e.into_tcx(tcx)),
         VariantItem(v) => ItemEnum::Variant(v.into_tcx(tcx)),
-        FunctionItem(f) => ItemEnum::Function(from_function(f, header.unwrap(), tcx)),
-        ForeignFunctionItem(f) => ItemEnum::Function(from_function(f, header.unwrap(), tcx)),
+        FunctionItem(f) => ItemEnum::Function(from_function(f, true, header.unwrap(), tcx)),
+        ForeignFunctionItem(f) => ItemEnum::Function(from_function(f, false, header.unwrap(), tcx)),
         TraitItem(t) => ItemEnum::Trait((*t).into_tcx(tcx)),
         TraitAliasItem(t) => ItemEnum::TraitAlias(t.into_tcx(tcx)),
-        MethodItem(m, _) => ItemEnum::Method(from_function_method(m, true, header.unwrap(), tcx)),
-        TyMethodItem(m) => ItemEnum::Method(from_function_method(m, false, header.unwrap(), tcx)),
+        MethodItem(m, _) => ItemEnum::Function(from_function(m, true, header.unwrap(), tcx)),
+        TyMethodItem(m) => ItemEnum::Function(from_function(m, false, header.unwrap(), tcx)),
         ImplItem(i) => ItemEnum::Impl((*i).into_tcx(tcx)),
         StaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignStaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
@@ -284,7 +334,7 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
             ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: Some(default.expr(tcx)) }
         }
         TyAssocTypeItem(g, b) => ItemEnum::AssocType {
-            generics: (*g).into_tcx(tcx),
+            generics: g.into_tcx(tcx),
             bounds: b.into_tcx(tcx),
             default: None,
         },
@@ -316,15 +366,15 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
 impl FromWithTcx<clean::Struct> for Struct {
     fn from_tcx(struct_: clean::Struct, tcx: TyCtxt<'_>) -> Self {
         let fields_stripped = struct_.has_stripped_entries();
-        let clean::Struct { struct_type, generics, fields } = struct_;
+        let clean::Struct { ctor_kind, generics, fields } = struct_;
 
-        let kind = match struct_type {
-            CtorKind::Fn => StructKind::Tuple(ids_keeping_stripped(fields, tcx)),
-            CtorKind::Const => {
+        let kind = match ctor_kind {
+            Some(CtorKind::Fn) => StructKind::Tuple(ids_keeping_stripped(fields, tcx)),
+            Some(CtorKind::Const) => {
                 assert!(fields.is_empty());
                 StructKind::Unit
             }
-            CtorKind::Fictive => StructKind::Plain { fields: ids(fields, tcx), fields_stripped },
+            None => StructKind::Plain { fields: ids(fields, tcx), fields_stripped },
         };
 
         Struct {
@@ -486,7 +536,7 @@ impl FromWithTcx<clean::Type> for Type {
             BareFunction(f) => Type::FunctionPointer(Box::new((*f).into_tcx(tcx))),
             Tuple(t) => Type::Tuple(t.into_tcx(tcx)),
             Slice(t) => Type::Slice(Box::new((*t).into_tcx(tcx))),
-            Array(t, s) => Type::Array { type_: Box::new((*t).into_tcx(tcx)), len: s },
+            Array(t, s) => Type::Array { type_: Box::new((*t).into_tcx(tcx)), len: s.to_string() },
             ImplTrait(g) => Type::ImplTrait(g.into_tcx(tcx)),
             Infer => Type::Infer,
             RawPointer(mutability, type_) => Type::RawPointer {
@@ -512,7 +562,7 @@ impl FromWithTcx<clean::Path> for Path {
     fn from_tcx(path: clean::Path, tcx: TyCtxt<'_>) -> Path {
         Path {
             name: path.whole_name(),
-            id: from_item_id(path.def_id().into(), tcx),
+            id: id_from_item_default(path.def_id().into(), tcx),
             args: path.segments.last().map(|args| Box::new(args.clone().args.into_tcx(tcx))),
         }
     }
@@ -619,25 +669,12 @@ impl FromWithTcx<clean::Impl> for Impl {
 
 pub(crate) fn from_function(
     function: Box<clean::Function>,
+    has_body: bool,
     header: rustc_hir::FnHeader,
     tcx: TyCtxt<'_>,
 ) -> Function {
     let clean::Function { decl, generics } = *function;
     Function {
-        decl: decl.into_tcx(tcx),
-        generics: generics.into_tcx(tcx),
-        header: from_fn_header(&header),
-    }
-}
-
-pub(crate) fn from_function_method(
-    function: Box<clean::Function>,
-    has_body: bool,
-    header: rustc_hir::FnHeader,
-    tcx: TyCtxt<'_>,
-) -> Method {
-    let clean::Function { decl, generics } = *function;
-    Method {
         decl: decl.into_tcx(tcx),
         generics: generics.into_tcx(tcx),
         header: from_fn_header(&header),
@@ -660,22 +697,27 @@ impl FromWithTcx<clean::Enum> for Enum {
 
 impl FromWithTcx<clean::Variant> for Variant {
     fn from_tcx(variant: clean::Variant, tcx: TyCtxt<'_>) -> Self {
-        use clean::Variant::*;
-        match variant {
-            CLike(disr) => Variant::Plain(disr.map(|disr| disr.into_tcx(tcx))),
-            Tuple(fields) => Variant::Tuple(ids_keeping_stripped(fields, tcx)),
-            Struct(s) => Variant::Struct {
+        use clean::VariantKind::*;
+
+        let discriminant = variant.discriminant.map(|d| d.into_tcx(tcx));
+
+        let kind = match variant.kind {
+            CLike => VariantKind::Plain,
+            Tuple(fields) => VariantKind::Tuple(ids_keeping_stripped(fields, tcx)),
+            Struct(s) => VariantKind::Struct {
                 fields_stripped: s.has_stripped_entries(),
                 fields: ids(s.fields, tcx),
             },
-        }
+        };
+
+        Variant { kind, discriminant }
     }
 }
 
 impl FromWithTcx<clean::Discriminant> for Discriminant {
     fn from_tcx(disr: clean::Discriminant, tcx: TyCtxt<'_>) -> Self {
         Discriminant {
-            // expr is only none if going throught the inlineing path, which gets
+            // expr is only none if going through the inlineing path, which gets
             // `rustc_middle` types, not `rustc_hir`, but because JSON never inlines
             // the expr is always some.
             expr: disr.expr(tcx).unwrap(),
@@ -697,7 +739,7 @@ impl FromWithTcx<clean::Import> for Import {
         Import {
             source: import.source.path.whole_name(),
             name,
-            id: import.source.did.map(ItemId::from).map(|i| from_item_id(i, tcx)),
+            id: import.source.did.map(ItemId::from).map(|i| id_from_item_default(i, tcx)),
             glob,
         }
     }
@@ -760,14 +802,13 @@ impl FromWithTcx<ItemType> for ItemKind {
             Struct => ItemKind::Struct,
             Union => ItemKind::Union,
             Enum => ItemKind::Enum,
-            Function => ItemKind::Function,
+            Function | TyMethod | Method => ItemKind::Function,
             Typedef => ItemKind::Typedef,
             OpaqueTy => ItemKind::OpaqueTy,
             Static => ItemKind::Static,
             Constant => ItemKind::Constant,
             Trait => ItemKind::Trait,
             Impl => ItemKind::Impl,
-            TyMethod | Method => ItemKind::Method,
             StructField => ItemKind::StructField,
             Variant => ItemKind::Variant,
             Macro => ItemKind::Macro,
@@ -787,7 +828,7 @@ fn ids(items: impl IntoIterator<Item = clean::Item>, tcx: TyCtxt<'_>) -> Vec<Id>
     items
         .into_iter()
         .filter(|x| !x.is_stripped() && !x.is_keyword())
-        .map(|i| from_item_id_with_name(i.item_id, tcx, i.name))
+        .map(|i| id_from_item(&i, tcx))
         .collect()
 }
 
@@ -797,12 +838,10 @@ fn ids_keeping_stripped(
 ) -> Vec<Option<Id>> {
     items
         .into_iter()
-        .map(|i| {
-            if !i.is_stripped() && !i.is_keyword() {
-                Some(from_item_id_with_name(i.item_id, tcx, i.name))
-            } else {
-                None
-            }
-        })
+        .map(
+            |i| {
+                if !i.is_stripped() && !i.is_keyword() { Some(id_from_item(&i, tcx)) } else { None }
+            },
+        )
         .collect()
 }

@@ -19,6 +19,7 @@
 #![feature(negative_impls)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
+#![feature(let_chains)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 
@@ -46,7 +47,7 @@ pub use hygiene::{ExpnData, ExpnHash, ExpnId, LocalExpnId, SyntaxContext};
 use rustc_data_structures::stable_hasher::HashingControls;
 pub mod def_id;
 use def_id::{CrateNum, DefId, DefPathHash, LocalDefId, LOCAL_CRATE};
-pub mod lev_distance;
+pub mod edit_distance;
 mod span_encoding;
 pub use span_encoding::{Span, DUMMY_SP};
 
@@ -78,10 +79,10 @@ use sha2::Sha256;
 #[cfg(test)]
 mod tests;
 
-// Per-session global variables: this struct is stored in thread-local storage
-// in such a way that it is accessible without any kind of handle to all
-// threads within the compilation session, but is not accessible outside the
-// session.
+/// Per-session global variables: this struct is stored in thread-local storage
+/// in such a way that it is accessible without any kind of handle to all
+/// threads within the compilation session, but is not accessible outside the
+/// session.
 pub struct SessionGlobals {
     symbol_interner: symbol::Interner,
     span_interner: Lock<span_encoding::SpanInterner>,
@@ -217,9 +218,7 @@ impl RealFileName {
     pub fn local_path(&self) -> Option<&Path> {
         match self {
             RealFileName::LocalPath(p) => Some(p),
-            RealFileName::Remapped { local_path: p, virtual_name: _ } => {
-                p.as_ref().map(PathBuf::as_path)
-            }
+            RealFileName::Remapped { local_path, virtual_name: _ } => local_path.as_deref(),
         }
     }
 
@@ -240,7 +239,7 @@ impl RealFileName {
     pub fn remapped_path_if_available(&self) -> &Path {
         match self {
             RealFileName::LocalPath(p)
-            | RealFileName::Remapped { local_path: _, virtual_name: p } => &p,
+            | RealFileName::Remapped { local_path: _, virtual_name: p } => p,
         }
     }
 
@@ -261,6 +260,10 @@ impl RealFileName {
             FileNameDisplayPreference::Remapped => {
                 self.remapped_path_if_available().to_string_lossy()
             }
+            FileNameDisplayPreference::Short => self
+                .local_path_if_available()
+                .file_name()
+                .map_or_else(|| "".into(), |f| f.to_string_lossy()),
         }
     }
 }
@@ -304,6 +307,9 @@ pub enum FileNameDisplayPreference {
     /// Display the path before the application of rewrite rules provided via `--remap-path-prefix`.
     /// This is appropriate for use in user-facing output (such as diagnostics).
     Local,
+    /// Display only the filename, as a way to reduce the verbosity of the output.
+    /// This is appropriate for use in user-facing output (such as diagnostics).
+    Short,
 }
 
 pub struct FileNameDisplay<'a> {
@@ -324,7 +330,7 @@ impl fmt::Display for FileNameDisplay<'_> {
             ProcMacroSourceCode(_) => write!(fmt, "<proc-macro source code>"),
             CfgSpec(_) => write!(fmt, "<cfgspec>"),
             CliCrateAttr(_) => write!(fmt, "<crate attribute>"),
-            Custom(ref s) => write!(fmt, "<{}>", s),
+            Custom(ref s) => write!(fmt, "<{s}>"),
             DocTest(ref path, _) => write!(fmt, "{}", path.display()),
             InlineAsm(_) => write!(fmt, "<inline asm>"),
         }
@@ -361,8 +367,8 @@ impl FileName {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Remapped }
     }
 
-    // This may include transient local filesystem information.
-    // Must not be embedded in build outputs.
+    /// This may include transient local filesystem information.
+    /// Must not be embedded in build outputs.
     pub fn prefer_local(&self) -> FileNameDisplay<'_> {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Local }
     }
@@ -493,6 +499,10 @@ impl SpanData {
     pub fn is_dummy(self) -> bool {
         self.lo.0 == 0 && self.hi.0 == 0
     }
+    #[inline]
+    pub fn is_visible(self, sm: &SourceMap) -> bool {
+        !self.is_dummy() && sm.is_span_accessible(self.span())
+    }
     /// Returns `true` if `self` fully encloses `other`.
     pub fn contains(self, other: Self) -> bool {
         self.lo <= other.lo && other.hi <= self.hi
@@ -556,6 +566,11 @@ impl Span {
     #[inline]
     pub fn is_dummy(self) -> bool {
         self.data_untracked().is_dummy()
+    }
+
+    #[inline]
+    pub fn is_visible(self, sm: &SourceMap) -> bool {
+        self.data_untracked().is_visible(sm)
     }
 
     /// Returns `true` if this span comes from any kind of macro, desugaring or inlining.
@@ -691,23 +706,23 @@ impl Span {
     }
 
     #[inline]
-    pub fn rust_2015(self) -> bool {
-        self.edition() == edition::Edition::Edition2015
+    pub fn is_rust_2015(self) -> bool {
+        self.edition().is_rust_2015()
     }
 
     #[inline]
     pub fn rust_2018(self) -> bool {
-        self.edition() >= edition::Edition::Edition2018
+        self.edition().rust_2018()
     }
 
     #[inline]
     pub fn rust_2021(self) -> bool {
-        self.edition() >= edition::Edition::Edition2021
+        self.edition().rust_2021()
     }
 
     #[inline]
     pub fn rust_2024(self) -> bool {
-        self.edition() >= edition::Edition::Edition2024
+        self.edition().rust_2024()
     }
 
     /// Returns the source callee.
@@ -753,7 +768,7 @@ impl Span {
 
     /// Checks if a span is "internal" to a macro in which `unsafe`
     /// can be used without triggering the `unsafe_code` lint.
-    //  (that is, a macro marked with `#[allow_internal_unsafe]`).
+    /// (that is, a macro marked with `#[allow_internal_unsafe]`).
     pub fn allows_unsafe(self) -> bool {
         self.ctxt().outer_expn_data().allow_internal_unsafe
     }
@@ -781,6 +796,9 @@ impl Span {
     }
 
     /// Returns a `Span` that would enclose both `self` and `end`.
+    ///
+    /// Note that this can also be used to extend the span "backwards":
+    /// `start.to(end)` and `end.to(start)` return the same `Span`.
     ///
     /// ```text
     ///     ____             ___
@@ -1057,7 +1075,7 @@ impl NonNarrowChar {
             0 => NonNarrowChar::ZeroWidth(pos),
             2 => NonNarrowChar::Wide(pos),
             4 => NonNarrowChar::Tab(pos),
-            _ => panic!("width {} given for non-narrow character", width),
+            _ => panic!("width {width} given for non-narrow character"),
         }
     }
 
@@ -1374,7 +1392,7 @@ impl<S: Encoder> Encodable<S> for SourceFile {
                     4 => {
                         raw_diffs = Vec::with_capacity(bytes_per_diff * num_diffs);
                         for diff in diff_iter {
-                            raw_diffs.extend_from_slice(&(diff.0 as u32).to_le_bytes());
+                            raw_diffs.extend_from_slice(&(diff.0).to_le_bytes());
                         }
                     }
                     _ => unreachable!(),

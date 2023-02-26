@@ -18,10 +18,10 @@ use rustc_middle::thir::*;
 use rustc_middle::ty::{self, RvalueScopes, TyCtxt};
 use rustc_span::Span;
 
-pub(crate) fn thir_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
+pub(crate) fn thir_body(
+    tcx: TyCtxt<'_>,
     owner_def: ty::WithOptConstParam<LocalDefId>,
-) -> Result<(&'tcx Steal<Thir<'tcx>>, ExprId), ErrorGuaranteed> {
+) -> Result<(&Steal<Thir<'_>>, ExprId), ErrorGuaranteed> {
     let hir = tcx.hir();
     let body = hir.body(hir.body_owned_by(owner_def.did));
     let mut cx = Cx::new(tcx, owner_def);
@@ -52,10 +52,17 @@ pub(crate) fn thir_body<'tcx>(
     Ok((tcx.alloc_steal_thir(cx.thir), expr))
 }
 
-pub(crate) fn thir_tree<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    owner_def: ty::WithOptConstParam<LocalDefId>,
-) -> String {
+pub(crate) fn thir_tree(tcx: TyCtxt<'_>, owner_def: ty::WithOptConstParam<LocalDefId>) -> String {
+    match thir_body(tcx, owner_def) {
+        Ok((thir, _)) => {
+            let thir = thir.steal();
+            tcx.thir_tree_representation(&thir)
+        }
+        Err(_) => "error".into(),
+    }
+}
+
+pub(crate) fn thir_flat(tcx: TyCtxt<'_>, owner_def: ty::WithOptConstParam<LocalDefId>) -> String {
     match thir_body(tcx, owner_def) {
         Ok((thir, _)) => format!("{:#?}", thir.steal()),
         Err(_) => "error".into(),
@@ -80,6 +87,9 @@ struct Cx<'tcx> {
     /// for the receiver.
     adjustment_span: Option<(HirId, Span)>,
 
+    /// False to indicate that adjustments should not be applied. Only used for `custom_mir`
+    apply_adjustments: bool,
+
     /// The `DefId` of the owner of this body.
     body_owner: DefId,
 }
@@ -87,6 +97,8 @@ struct Cx<'tcx> {
 impl<'tcx> Cx<'tcx> {
     fn new(tcx: TyCtxt<'tcx>, def: ty::WithOptConstParam<LocalDefId>) -> Cx<'tcx> {
         let typeck_results = tcx.typeck_opt_const_arg(def);
+        let did = def.did;
+        let hir = tcx.hir();
         Cx {
             tcx,
             thir: Thir::new(),
@@ -94,8 +106,12 @@ impl<'tcx> Cx<'tcx> {
             region_scope_tree: tcx.region_scope_tree(def.did),
             typeck_results,
             rvalue_scopes: &typeck_results.rvalue_scopes,
-            body_owner: def.did.to_def_id(),
+            body_owner: did.to_def_id(),
             adjustment_span: None,
+            apply_adjustments: hir
+                .attrs(hir.local_def_id_to_hir_id(did))
+                .iter()
+                .all(|attr| attr.name_or_empty() != rustc_span::sym::custom_mir),
         }
     }
 
@@ -117,14 +133,13 @@ impl<'tcx> Cx<'tcx> {
                     bug!("closure expr does not have closure type: {:?}", closure_ty);
                 };
 
-                let bound_vars = self.tcx.mk_bound_variable_kinds(std::iter::once(
-                    ty::BoundVariableKind::Region(ty::BrEnv),
-                ));
+                let bound_vars =
+                    self.tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(ty::BrEnv)]);
                 let br = ty::BoundRegion {
                     var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                     kind: ty::BrEnv,
                 };
-                let env_region = ty::ReLateBound(ty::INNERMOST, br);
+                let env_region = self.tcx.mk_re_late_bound(ty::INNERMOST, br);
                 let closure_env_ty =
                     self.tcx.closure_env_ty(closure_def_id, closure_substs, env_region).unwrap();
                 let liberated_closure_env_ty = self.tcx.erase_late_bound_regions(
@@ -177,7 +192,7 @@ impl<'tcx> Cx<'tcx> {
                 let va_list_did = self.tcx.require_lang_item(LangItem::VaList, Some(param.span));
 
                 self.tcx
-                    .bound_type_of(va_list_did)
+                    .type_of(va_list_did)
                     .subst(self.tcx, &[self.tcx.lifetimes.re_erased.into()])
             } else {
                 fn_sig.inputs()[index]

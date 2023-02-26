@@ -1,8 +1,9 @@
+use crate::base;
 use crate::traits::*;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::ErrorHandled;
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, TyAndLayout};
-use rustc_middle::ty::{self, Instance, Ty, TypeFoldable, TypeVisitable};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
 use rustc_target::abi::call::{FnAbi, PassMode};
 
 use std::iter;
@@ -15,6 +16,18 @@ use self::place::PlaceRef;
 use rustc_middle::mir::traversal;
 
 use self::operand::{OperandRef, OperandValue};
+
+// Used for tracking the state of generated basic blocks.
+enum CachedLlbb<T> {
+    /// Nothing created yet.
+    None,
+
+    /// Has been created.
+    Some(T),
+
+    /// Nothing created yet, and nothing should be.
+    Skip,
+}
 
 /// Master context for codegenning from MIR.
 pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
@@ -43,10 +56,10 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
     /// as-needed (e.g. RPO reaching it or another block branching to it).
     // FIXME(eddyb) rename `llbbs` and other `ll`-prefixed things to use a
     // more backend-agnostic prefix such as `cg` (i.e. this would be `cgbbs`).
-    cached_llbbs: IndexVec<mir::BasicBlock, Option<Bx::BasicBlock>>,
+    cached_llbbs: IndexVec<mir::BasicBlock, CachedLlbb<Bx::BasicBlock>>,
 
     /// The funclet status of each basic block
-    cleanup_kinds: IndexVec<mir::BasicBlock, analyze::CleanupKind>,
+    cleanup_kinds: Option<IndexVec<mir::BasicBlock, analyze::CleanupKind>>,
 
     /// When targeting MSVC, this stores the cleanup info for each funclet BB.
     /// This is initialized at the same time as the `landing_pads` entry for the
@@ -92,7 +105,7 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     pub fn monomorphize<T>(&self, value: T) -> T
     where
-        T: Copy + TypeFoldable<'tcx>,
+        T: Copy + TypeFoldable<TyCtxt<'tcx>>,
     {
         debug!("monomorphize: self.instance={:?}", self.instance);
         self.instance.subst_mir_and_normalize_erasing_regions(
@@ -154,12 +167,15 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         start_bx.set_personality_fn(cx.eh_personality());
     }
 
-    let cleanup_kinds = analyze::cleanup_kinds(&mir);
-    let cached_llbbs: IndexVec<mir::BasicBlock, Option<Bx::BasicBlock>> = mir
-        .basic_blocks
-        .indices()
-        .map(|bb| if bb == mir::START_BLOCK { Some(start_llbb) } else { None })
-        .collect();
+    let cleanup_kinds = base::wants_msvc_seh(cx.tcx().sess).then(|| analyze::cleanup_kinds(&mir));
+
+    let cached_llbbs: IndexVec<mir::BasicBlock, CachedLlbb<Bx::BasicBlock>> =
+        mir.basic_blocks
+            .indices()
+            .map(|bb| {
+                if bb == mir::START_BLOCK { CachedLlbb::Some(start_llbb) } else { CachedLlbb::None }
+            })
+            .collect();
 
     let mut fx = FunctionCx {
         instance,
@@ -189,7 +205,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             all_consts_ok = false;
             match err {
                 // errored or at least linted
-                ErrorHandled::Reported(_) | ErrorHandled::Linted => {}
+                ErrorHandled::Reported(_) => {}
                 ErrorHandled::TooGeneric => {
                     span_bug!(const_.span, "codegen encountered polymorphic constant: {:?}", err)
                 }

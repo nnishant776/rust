@@ -1,6 +1,6 @@
+use crate::fluent_generated as fluent;
 use rustc_errors::{
-    fluent, AddToDiagnostic, Diagnostic, ErrorGuaranteed, Handler, IntoDiagnostic,
-    SubdiagnosticMessage,
+    AddToDiagnostic, Diagnostic, ErrorGuaranteed, Handler, IntoDiagnostic, SubdiagnosticMessage,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_session::lint::Level;
@@ -8,12 +8,12 @@ use rustc_span::{Span, Symbol};
 
 #[derive(Diagnostic)]
 #[diag(lint_overruled_attribute, code = "E0453")]
-pub struct OverruledAttribute {
+pub struct OverruledAttribute<'a> {
     #[primary_span]
     pub span: Span,
     #[label]
     pub overruled: Span,
-    pub lint_level: String,
+    pub lint_level: &'a str,
     pub lint_source: Symbol,
     #[subdiagnostic]
     pub sub: OverruledAttributeSub,
@@ -38,6 +38,7 @@ impl AddToDiagnostic for OverruledAttributeSub {
             OverruledAttributeSub::NodeSource { span, reason } => {
                 diag.span_label(span, fluent::lint_node_source);
                 if let Some(rationale) = reason {
+                    #[allow(rustc::untranslatable_diagnostic)]
                     diag.note(rationale.as_str());
                 }
             }
@@ -115,7 +116,7 @@ impl IntoDiagnostic<'_> for CheckNameUnknown {
         let mut diag = handler.struct_err(fluent::lint_check_name_unknown);
         diag.code(rustc_errors::error_code!(E0602));
         if let Some(suggestion) = self.suggestion {
-            diag.help(fluent::help);
+            diag.help(fluent::lint_help);
             diag.set_arg("suggestion", suggestion);
         }
         diag.set_arg("lint_name", self.lint_name);

@@ -1,9 +1,10 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 //! The entry point of the NLL borrow checker.
 
 use rustc_data_structures::vec_map::VecMap;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::vec::IndexVec;
-use rustc_infer::infer::InferCtxt;
 use rustc_middle::mir::{create_dump_file, dump_enabled, dump_mir, PassWhere};
 use rustc_middle::mir::{
     BasicBlock, Body, ClosureOutlivesSubject, ClosureRegionRequirements, LocalKind, Location,
@@ -35,7 +36,7 @@ use crate::{
     renumber,
     type_check::{self, MirTypeckRegionConstraints, MirTypeckResults},
     universal_regions::UniversalRegions,
-    Upvar,
+    BorrowckInferCtxt, Upvar,
 };
 
 pub type PoloniusOutput = Output<RustcFacts>;
@@ -56,7 +57,7 @@ pub(crate) struct NllOutput<'tcx> {
 /// `compute_regions`.
 #[instrument(skip(infcx, param_env, body, promoted), level = "debug")]
 pub(crate) fn replace_regions_in_mir<'tcx>(
-    infcx: &InferCtxt<'tcx>,
+    infcx: &BorrowckInferCtxt<'_, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     body: &mut Body<'tcx>,
     promoted: &mut IndexVec<Promoted, Body<'tcx>>,
@@ -71,7 +72,7 @@ pub(crate) fn replace_regions_in_mir<'tcx>(
     // Replace all remaining regions with fresh inference variables.
     renumber::renumber_mir(infcx, body, promoted);
 
-    dump_mir(infcx.tcx, None, "renumber", &0, body, |_, _| Ok(()));
+    dump_mir(infcx.tcx, false, "renumber", &0, body, |_, _| Ok(()));
 
     universal_regions
 }
@@ -155,7 +156,7 @@ fn populate_polonius_move_facts(
 ///
 /// This may result in errors being reported.
 pub(crate) fn compute_regions<'cx, 'tcx>(
-    infcx: &InferCtxt<'tcx>,
+    infcx: &BorrowckInferCtxt<'_, 'tcx>,
     universal_regions: UniversalRegions<'tcx>,
     body: &Body<'tcx>,
     promoted: &IndexVec<Promoted, Body<'tcx>>,
@@ -242,7 +243,6 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
         mut liveness_constraints,
         outlives_constraints,
         member_constraints,
-        closure_bounds_mapping,
         universe_causes,
         type_tests,
     } = constraints;
@@ -258,13 +258,13 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
     );
 
     let mut regioncx = RegionInferenceContext::new(
+        infcx,
         var_origins,
         universal_regions,
         placeholder_indices,
         universal_region_relations,
         outlives_constraints,
         member_constraints,
-        closure_bounds_mapping,
         universe_causes,
         type_tests,
         liveness_constraints,
@@ -303,7 +303,10 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
 
     if !nll_errors.is_empty() {
         // Suppress unhelpful extra errors in `infer_opaque_types`.
-        infcx.set_tainted_by_errors();
+        infcx.set_tainted_by_errors(infcx.tcx.sess.delay_span_bug(
+            body.span,
+            "`compute_regions` tainted `infcx` with errors but did not emit any errors",
+        ));
     }
 
     let remapped_opaque_tys = regioncx.infer_opaque_types(&infcx, opaque_type_values);
@@ -319,7 +322,7 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
 }
 
 pub(super) fn dump_mir_results<'tcx>(
-    infcx: &InferCtxt<'tcx>,
+    infcx: &BorrowckInferCtxt<'_, 'tcx>,
     body: &Body<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
     closure_region_requirements: &Option<ClosureRegionRequirements<'_>>,
@@ -328,7 +331,7 @@ pub(super) fn dump_mir_results<'tcx>(
         return;
     }
 
-    dump_mir(infcx.tcx, None, "nll", &0, body, |pass_where, out| {
+    dump_mir(infcx.tcx, false, "nll", &0, body, |pass_where, out| {
         match pass_where {
             // Before the CFG, dump out the values for each region variable.
             PassWhere::BeforeCFG => {
@@ -355,21 +358,21 @@ pub(super) fn dump_mir_results<'tcx>(
 
     // Also dump the inference graph constraints as a graphviz file.
     let _: io::Result<()> = try {
-        let mut file =
-            create_dump_file(infcx.tcx, "regioncx.all.dot", None, "nll", &0, body.source)?;
+        let mut file = create_dump_file(infcx.tcx, "regioncx.all.dot", false, "nll", &0, body)?;
         regioncx.dump_graphviz_raw_constraints(&mut file)?;
     };
 
     // Also dump the inference graph constraints as a graphviz file.
     let _: io::Result<()> = try {
-        let mut file =
-            create_dump_file(infcx.tcx, "regioncx.scc.dot", None, "nll", &0, body.source)?;
+        let mut file = create_dump_file(infcx.tcx, "regioncx.scc.dot", false, "nll", &0, body)?;
         regioncx.dump_graphviz_scc_constraints(&mut file)?;
     };
 }
 
+#[allow(rustc::diagnostic_outside_of_impl)]
+#[allow(rustc::untranslatable_diagnostic)]
 pub(super) fn dump_annotation<'tcx>(
-    infcx: &InferCtxt<'tcx>,
+    infcx: &BorrowckInferCtxt<'_, 'tcx>,
     body: &Body<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
     closure_region_requirements: &Option<ClosureRegionRequirements<'_>>,
@@ -384,7 +387,7 @@ pub(super) fn dump_annotation<'tcx>(
 
     // When the enclosing function is tagged with `#[rustc_regions]`,
     // we dump out various bits of state as warnings. This is useful
-    // for verifying that the compiler is behaving as expected.  These
+    // for verifying that the compiler is behaving as expected. These
     // warnings focus on the closure region requirements -- for
     // viewing the intraprocedural state, the -Zdump-mir output is
     // better.

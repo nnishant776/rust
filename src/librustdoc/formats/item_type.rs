@@ -21,6 +21,7 @@ use crate::clean;
 /// a heading, edit the listing in `html/render.rs`, function `sidebar_module`. This uses an
 /// ordering based on a helper function inside `item_module`, in the same file.
 #[derive(Copy, PartialEq, Eq, Hash, Clone, Debug, PartialOrd, Ord)]
+#[repr(u8)]
 pub(crate) enum ItemType {
     Module = 0,
     ExternCrate = 1,
@@ -139,7 +140,7 @@ impl From<DefKind> for ItemType {
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
-            | DefKind::Impl
+            | DefKind::Impl { .. }
             | DefKind::Closure
             | DefKind::Generator => Self::ForeignType,
         }
@@ -176,6 +177,9 @@ impl ItemType {
             ItemType::ProcDerive => "derive",
             ItemType::TraitAlias => "traitalias",
         }
+    }
+    pub(crate) fn is_method(&self) -> bool {
+        matches!(*self, ItemType::Method | ItemType::TyMethod)
     }
 }
 

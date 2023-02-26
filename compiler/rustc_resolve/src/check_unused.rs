@@ -28,9 +28,9 @@ use crate::module_to_string;
 use crate::Resolver;
 
 use rustc_ast as ast;
-use rustc_ast::node_id::NodeMap;
 use rustc_ast::visit::{self, Visitor};
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::{pluralize, MultiSpan};
 use rustc_session::lint::builtin::{MACRO_USE_EXTERN_CRATE, UNUSED_IMPORTS};
 use rustc_session::lint::BuiltinLintDiagnostics;
@@ -40,7 +40,7 @@ struct UnusedImport<'a> {
     use_tree: &'a ast::UseTree,
     use_tree_id: ast::NodeId,
     item_span: Span,
-    unused: FxHashSet<ast::NodeId>,
+    unused: UnordSet<ast::NodeId>,
 }
 
 impl<'a> UnusedImport<'a> {
@@ -49,16 +49,16 @@ impl<'a> UnusedImport<'a> {
     }
 }
 
-struct UnusedImportCheckVisitor<'a, 'b> {
-    r: &'a mut Resolver<'b>,
+struct UnusedImportCheckVisitor<'a, 'b, 'tcx> {
+    r: &'a mut Resolver<'b, 'tcx>,
     /// All the (so far) unused imports, grouped path list
-    unused_imports: NodeMap<UnusedImport<'a>>,
+    unused_imports: FxIndexMap<ast::NodeId, UnusedImport<'a>>,
     base_use_tree: Option<&'a ast::UseTree>,
     base_id: ast::NodeId,
     item_span: Span,
 }
 
-impl<'a, 'b> UnusedImportCheckVisitor<'a, 'b> {
+impl<'a, 'b, 'tcx> UnusedImportCheckVisitor<'a, 'b, 'tcx> {
     // We have information about whether `use` (import) items are actually
     // used now. If an import is not used at all, we signal a lint error.
     fn check_import(&mut self, id: ast::NodeId) {
@@ -89,12 +89,12 @@ impl<'a, 'b> UnusedImportCheckVisitor<'a, 'b> {
             use_tree,
             use_tree_id,
             item_span,
-            unused: FxHashSet::default(),
+            unused: Default::default(),
         })
     }
 }
 
-impl<'a, 'b> Visitor<'a> for UnusedImportCheckVisitor<'a, 'b> {
+impl<'a, 'b, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'b, 'tcx> {
     fn visit_item(&mut self, item: &'a ast::Item) {
         self.item_span = item.span_with_attributes();
 
@@ -222,7 +222,7 @@ fn calc_unused_spans(
     }
 }
 
-impl Resolver<'_> {
+impl Resolver<'_, '_> {
     pub(crate) fn check_unused(&mut self, krate: &ast::Crate) {
         for import in self.potentially_unused_imports.iter() {
             match import.kind {
@@ -290,7 +290,7 @@ impl Resolver<'_> {
             let ms = MultiSpan::from_spans(spans.clone());
             let mut span_snippets = spans
                 .iter()
-                .filter_map(|s| match visitor.r.session.source_map().span_to_snippet(*s) {
+                .filter_map(|s| match visitor.r.tcx.sess.source_map().span_to_snippet(*s) {
                     Ok(s) => Some(format!("`{}`", s)),
                     _ => None,
                 })
@@ -317,7 +317,7 @@ impl Resolver<'_> {
             // If we are in the `--test` mode, suppress a help that adds the `#[cfg(test)]`
             // attribute; however, if not, suggest adding the attribute. There is no way to
             // retrieve attributes here because we do not have a `TyCtxt` yet.
-            let test_module_span = if visitor.r.session.opts.test {
+            let test_module_span = if visitor.r.tcx.sess.opts.test {
                 None
             } else {
                 let parent_module = visitor.r.get_nearest_non_block_module(

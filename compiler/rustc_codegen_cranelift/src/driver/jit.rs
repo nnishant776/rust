@@ -121,22 +121,20 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
         .into_iter()
         .collect::<Vec<(_, (_, _))>>();
 
-    super::time(tcx, backend_config.display_cg_time, "codegen mono items", || {
+    tcx.sess.time("codegen mono items", || {
         super::predefine_mono_items(tcx, &mut jit_module, &mono_items);
         for (mono_item, _) in mono_items {
             match mono_item {
                 MonoItem::Fn(inst) => match backend_config.codegen_mode {
                     CodegenMode::Aot => unreachable!(),
                     CodegenMode::Jit => {
-                        tcx.sess.time("codegen fn", || {
-                            crate::base::codegen_and_compile_fn(
-                                tcx,
-                                &mut cx,
-                                &mut cached_context,
-                                &mut jit_module,
-                                inst,
-                            )
-                        });
+                        codegen_and_compile_fn(
+                            tcx,
+                            &mut cx,
+                            &mut cached_context,
+                            &mut jit_module,
+                            inst,
+                        );
                     }
                     CodegenMode::JitLazy => {
                         codegen_shim(tcx, &mut cx, &mut cached_context, &mut jit_module, inst)
@@ -159,7 +157,7 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
 
     tcx.sess.abort_if_errors();
 
-    jit_module.finalize_definitions();
+    jit_module.finalize_definitions().unwrap();
     unsafe { cx.unwind_context.register_jit(&jit_module) };
 
     println!(
@@ -219,6 +217,24 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
     }
 }
 
+pub(crate) fn codegen_and_compile_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cx: &mut crate::CodegenCx,
+    cached_context: &mut Context,
+    module: &mut dyn Module,
+    instance: Instance<'tcx>,
+) {
+    tcx.prof.generic_activity("codegen and compile fn").run(|| {
+        let _inst_guard =
+            crate::PrintOnPanic(|| format!("{:?} {}", instance, tcx.symbol_name(instance).name));
+
+        let cached_func = std::mem::replace(&mut cached_context.func, Function::new());
+        let codegened_func = crate::base::codegen_fn(tcx, cx, cached_func, module, instance);
+
+        crate::base::compile_fn(cx, cached_context, module, codegened_func);
+    });
+}
+
 extern "C" fn clif_jit_fn(
     instance_ptr: *const Instance<'static>,
     trampoline_ptr: *const u8,
@@ -245,7 +261,11 @@ fn jit_fn(instance_ptr: *const Instance<'static>, trampoline_ptr: *const u8) -> 
             let backend_config = lazy_jit_state.backend_config.clone();
 
             let name = tcx.symbol_name(instance).name;
-            let sig = crate::abi::get_function_sig(tcx, jit_module.isa().triple(), instance);
+            let sig = crate::abi::get_function_sig(
+                tcx,
+                jit_module.target_config().default_call_conv,
+                instance,
+            );
             let func_id = jit_module.declare_function(name, Linkage::Export, &sig).unwrap();
 
             let current_ptr = jit_module.read_got_entry(func_id);
@@ -267,18 +287,10 @@ fn jit_fn(instance_ptr: *const Instance<'static>, trampoline_ptr: *const u8) -> 
                 false,
                 Symbol::intern("dummy_cgu_name"),
             );
-            tcx.sess.time("codegen fn", || {
-                crate::base::codegen_and_compile_fn(
-                    tcx,
-                    &mut cx,
-                    &mut Context::new(),
-                    jit_module,
-                    instance,
-                )
-            });
+            codegen_and_compile_fn(tcx, &mut cx, &mut Context::new(), jit_module, instance);
 
             assert!(cx.global_asm.is_empty());
-            jit_module.finalize_definitions();
+            jit_module.finalize_definitions().unwrap();
             unsafe { cx.unwind_context.register_jit(&jit_module) };
             jit_module.get_finalized_function(func_id)
         })
@@ -344,7 +356,7 @@ fn codegen_shim<'tcx>(
     let pointer_type = module.target_config().pointer_type();
 
     let name = tcx.symbol_name(inst).name;
-    let sig = crate::abi::get_function_sig(tcx, module.isa().triple(), inst);
+    let sig = crate::abi::get_function_sig(tcx, module.target_config().default_call_conv, inst);
     let func_id = module.declare_function(name, Linkage::Export, &sig).unwrap();
 
     let instance_ptr = Box::into_raw(Box::new(inst));

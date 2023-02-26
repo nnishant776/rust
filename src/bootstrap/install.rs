@@ -200,10 +200,20 @@ install!((self, builder, _config),
         install_sh(builder, "clippy", self.compiler.stage, Some(self.target), &tarball);
     };
     Miri, alias = "miri", Self::should_build(_config), only_hosts: true, {
+        if let Some(tarball) = builder.ensure(dist::Miri { compiler: self.compiler, target: self.target }) {
+            install_sh(builder, "miri", self.compiler.stage, Some(self.target), &tarball);
+        } else {
+            // Miri is only available on nightly
+            builder.info(
+                &format!("skipping Install miri stage{} ({})", self.compiler.stage, self.target),
+            );
+        }
+    };
+    LlvmTools, alias = "llvm-tools", Self::should_build(_config), only_hosts: true, {
         let tarball = builder
-            .ensure(dist::Miri { compiler: self.compiler, target: self.target })
-            .expect("missing miri");
-        install_sh(builder, "miri", self.compiler.stage, Some(self.target), &tarball);
+            .ensure(dist::LlvmTools { target: self.target })
+            .expect("missing llvm-tools");
+        install_sh(builder, "llvm-tools", self.compiler.stage, Some(self.target), &tarball);
     };
     Rustfmt, alias = "rustfmt", Self::should_build(_config), only_hosts: true, {
         if let Some(tarball) = builder.ensure(dist::Rustfmt {
@@ -232,18 +242,6 @@ install!((self, builder, _config),
                          self.compiler.stage, self.target),
             );
         }
-    };
-    Analysis, alias = "analysis", Self::should_build(_config), only_hosts: false, {
-        // `expect` should be safe, only None with host != build, but this
-        // only uses the `build` compiler
-        let tarball = builder.ensure(dist::Analysis {
-            // Find the actual compiler (handling the full bootstrap option) which
-            // produced the save-analysis data because that data isn't copied
-            // through the sysroot uplifting.
-            compiler: builder.compiler_for(builder.top_stage, builder.config.build, self.target),
-            target: self.target
-        }).expect("missing analysis");
-        install_sh(builder, "analysis", self.compiler.stage, Some(self.target), &tarball);
     };
     Rustc, path = "compiler/rustc", true, only_hosts: true, {
         let tarball = builder.ensure(dist::Rustc {

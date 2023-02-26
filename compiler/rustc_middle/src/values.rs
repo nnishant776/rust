@@ -1,7 +1,8 @@
+use crate::dep_graph::DepKind;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{pluralize, struct_span_err, Applicability, MultiSpan};
 use rustc_hir as hir;
-use rustc_hir::def::DefKind;
+use rustc_hir::def::{DefKind, Res};
 use rustc_middle::ty::Representability;
 use rustc_middle::ty::{self, DefIdTree, Ty, TyCtxt};
 use rustc_query_system::query::QueryInfo;
@@ -11,16 +12,16 @@ use rustc_span::Span;
 
 use std::fmt::Write;
 
-impl<'tcx> Value<TyCtxt<'tcx>> for Ty<'_> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo]) -> Self {
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Ty<'_> {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo<DepKind>]) -> Self {
         // SAFETY: This is never called when `Self` is not `Ty<'tcx>`.
         // FIXME: Represent the above fact in the trait system somehow.
-        unsafe { std::mem::transmute::<Ty<'tcx>, Ty<'_>>(tcx.ty_error()) }
+        unsafe { std::mem::transmute::<Ty<'tcx>, Ty<'_>>(tcx.ty_error_misc()) }
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for ty::SymbolName<'_> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo]) -> Self {
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::SymbolName<'_> {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo<DepKind>]) -> Self {
         // SAFETY: This is never called when `Self` is not `SymbolName<'tcx>`.
         // FIXME: Represent the above fact in the trait system somehow.
         unsafe {
@@ -31,14 +32,24 @@ impl<'tcx> Value<TyCtxt<'tcx>> for ty::SymbolName<'_> {
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for ty::Binder<'_, ty::FnSig<'_>> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo]) -> Self {
-        let err = tcx.ty_error();
-        // FIXME(compiler-errors): It would be nice if we could get the
-        // query key, so we could at least generate a fn signature that
-        // has the right arity.
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::Binder<'_, ty::FnSig<'_>> {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, stack: &[QueryInfo<DepKind>]) -> Self {
+        let err = tcx.ty_error_misc();
+
+        let arity = if let Some(frame) = stack.get(0)
+            && frame.query.dep_kind == DepKind::fn_sig
+            && let Some(def_id) = frame.query.def_id
+            && let Some(node) = tcx.hir().get_if_local(def_id)
+            && let Some(sig) = node.fn_sig()
+        {
+            sig.decl.inputs.len() + sig.decl.implicit_self.has_implicit_self() as usize
+        } else {
+            tcx.sess.abort_if_errors();
+            unreachable!()
+        };
+
         let fn_sig = ty::Binder::dummy(tcx.mk_fn_sig(
-            [].into_iter(),
+            std::iter::repeat(err).take(arity),
             err,
             false,
             rustc_hir::Unsafety::Normal,
@@ -51,12 +62,12 @@ impl<'tcx> Value<TyCtxt<'tcx>> for ty::Binder<'_, ty::FnSig<'_>> {
     }
 }
 
-impl<'tcx> Value<TyCtxt<'tcx>> for Representability {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo]) -> Self {
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Representability {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
         let mut item_and_field_ids = Vec::new();
         let mut representable_ids = FxHashSet::default();
         for info in cycle {
-            if info.query.name == "representability"
+            if info.query.dep_kind == DepKind::representability
                 && let Some(field_id) = info.query.def_id
                 && let Some(field_id) = field_id.as_local()
                 && let Some(DefKind::Field) = info.query.def_kind
@@ -70,7 +81,7 @@ impl<'tcx> Value<TyCtxt<'tcx>> for Representability {
             }
         }
         for info in cycle {
-            if info.query.name == "representability_adt_ty"
+            if info.query.dep_kind == DepKind::representability_adt_ty
                 && let Some(def_id) = info.query.ty_adt_id
                 && let Some(def_id) = def_id.as_local()
                 && !item_and_field_ids.iter().any(|&(id, _)| id == def_id)
@@ -80,6 +91,18 @@ impl<'tcx> Value<TyCtxt<'tcx>> for Representability {
         }
         recursive_type_error(tcx, item_and_field_ids, &representable_ids);
         Representability::Infinite
+    }
+}
+
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::EarlyBinder<Ty<'_>> {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
+        ty::EarlyBinder(Ty::from_cycle_error(tcx, cycle))
+    }
+}
+
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::EarlyBinder<ty::Binder<'_, ty::FnSig<'_>>> {
+    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
+        ty::EarlyBinder(ty::Binder::from_cycle_error(tcx, cycle))
     }
 }
 
@@ -176,7 +199,8 @@ fn find_item_ty_spans(
 ) {
     match ty.kind {
         hir::TyKind::Path(hir::QPath::Resolved(_, path)) => {
-            if let Some(def_id) = path.res.opt_def_id() {
+            if let Res::Def(kind, def_id) = path.res
+                && kind != DefKind::TyAlias {
                 let check_params = def_id.as_local().map_or(true, |def_id| {
                     if def_id == needle {
                         spans.push(ty.span);
@@ -185,7 +209,8 @@ fn find_item_ty_spans(
                 });
                 if check_params && let Some(args) = path.segments.last().unwrap().args {
                     let params_in_repr = tcx.params_in_repr(def_id);
-                    for (i, arg) in args.args.iter().enumerate() {
+                    // the domain size check is needed because the HIR may not be well-formed at this point
+                    for (i, arg) in args.args.iter().enumerate().take(params_in_repr.domain_size()) {
                         if let hir::GenericArg::Type(ty) = arg && params_in_repr.contains(i as u32) {
                             find_item_ty_spans(tcx, ty, needle, spans, seen_representable);
                         }

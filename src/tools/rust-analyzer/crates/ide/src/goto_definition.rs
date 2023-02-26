@@ -187,7 +187,7 @@ mod tests {
         let (analysis, position) = fixture::position(ra_fixture);
         let navs = analysis.goto_definition(position).unwrap().expect("no definition found").info;
 
-        assert!(navs.is_empty(), "didn't expect this to resolve anywhere: {:?}", navs)
+        assert!(navs.is_empty(), "didn't expect this to resolve anywhere: {navs:?}")
     }
 
     #[test]
@@ -289,10 +289,10 @@ mod b;
 enum E { X(Foo$0) }
 
 //- /a.rs
-struct Foo;
-     //^^^
+pub struct Foo;
+         //^^^
 //- /b.rs
-struct Foo;
+pub struct Foo;
 "#,
         );
     }
@@ -1915,5 +1915,69 @@ fn main() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn query_impls_in_nearest_block() {
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+}
+fn f1() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+         //^
+    }
+    fn f2() {
+        fn f3() {
+            S1::e$0();
+        }
+    }
+}
+"#,
+        );
+
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+}
+fn f1() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+         //^
+    }
+    fn f2() {
+        struct S2;
+        S1::e$0();
+    }
+}
+fn f12() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+    }
+}
+"#,
+        );
+
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+     //^
+}
+fn f2() {
+    struct S2;
+    S1::e$0();
+}
+"#,
+        );
     }
 }

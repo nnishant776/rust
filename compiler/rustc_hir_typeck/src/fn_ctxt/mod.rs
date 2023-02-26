@@ -1,27 +1,28 @@
 mod _impl;
+mod adjust_fulfillment_errors;
 mod arg_matrix;
 mod checks;
 mod suggestions;
 
 pub use _impl::*;
+use rustc_errors::ErrorGuaranteed;
 pub use suggestions::*;
 
 use crate::coercion::DynamicCoerceMany;
-use crate::{Diverges, EnclosingBreakables, Inherited, UnsafetyState};
+use crate::{Diverges, EnclosingBreakables, Inherited};
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir_analysis::astconv::AstConv;
 use rustc_infer::infer;
 use rustc_infer::infer::error_reporting::TypeErrCtxt;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind};
 use rustc_middle::ty::subst::GenericArgKind;
-use rustc_middle::ty::visit::TypeVisitable;
-use rustc_middle::ty::{self, Const, Ty, TyCtxt};
+use rustc_middle::ty::{self, Const, Ty, TyCtxt, TypeVisitableExt};
 use rustc_session::Session;
 use rustc_span::symbol::Ident;
-use rustc_span::{self, Span};
-use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode};
+use rustc_span::{self, Span, DUMMY_SP};
+use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode, ObligationCtxt};
 
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
@@ -38,7 +39,7 @@ use std::ops::Deref;
 /// [`ItemCtxt`]: rustc_hir_analysis::collect::ItemCtxt
 /// [`InferCtxt`]: infer::InferCtxt
 pub struct FnCtxt<'a, 'tcx> {
-    pub(super) body_id: hir::HirId,
+    pub(super) body_id: LocalDefId,
 
     /// The parameter environment used for proving trait obligations
     /// in this function. This can change when we descend into
@@ -68,16 +69,10 @@ pub struct FnCtxt<'a, 'tcx> {
     /// any).
     pub(super) ret_coercion: Option<RefCell<DynamicCoerceMany<'tcx>>>,
 
-    /// Used exclusively to reduce cost of advanced evaluation used for
-    /// more helpful diagnostics.
-    pub(super) in_tail_expr: bool,
-
     /// First span of a return site that we find. Used in error messages.
     pub(super) ret_coercion_span: Cell<Option<Span>>,
 
     pub(super) resume_yield_tys: Option<(Ty<'tcx>, Ty<'tcx>)>,
-
-    pub(super) ps: Cell<UnsafetyState>,
 
     /// Whether the last checked node generates a divergence (e.g.,
     /// `return` will set this to `Always`). In general, when entering
@@ -112,47 +107,33 @@ pub struct FnCtxt<'a, 'tcx> {
     /// the diverges flag is set to something other than `Maybe`.
     pub(super) diverges: Cell<Diverges>,
 
-    /// Whether any child nodes have any type errors.
-    pub(super) has_errors: Cell<bool>,
-
     pub(super) enclosing_breakables: RefCell<EnclosingBreakables<'tcx>>,
 
     pub(super) inh: &'a Inherited<'tcx>,
 
-    /// True if the function or closure's return type is known before
-    /// entering the function/closure, i.e. if the return type is
-    /// either given explicitly or inferred from, say, an `Fn*` trait
-    /// bound. Used for diagnostic purposes only.
-    pub(super) return_type_pre_known: bool,
-
-    /// True if the return type has an Opaque type
-    pub(super) return_type_has_opaque: bool,
+    pub(super) fallback_has_occurred: Cell<bool>,
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn new(
         inh: &'a Inherited<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        body_id: hir::HirId,
+        body_id: LocalDefId,
     ) -> FnCtxt<'a, 'tcx> {
         FnCtxt {
             body_id,
             param_env,
             err_count_on_creation: inh.tcx.sess.err_count(),
             ret_coercion: None,
-            in_tail_expr: false,
             ret_coercion_span: Cell::new(None),
             resume_yield_tys: None,
-            ps: Cell::new(UnsafetyState::function(hir::Unsafety::Normal, hir::CRATE_HIR_ID)),
             diverges: Cell::new(Diverges::Maybe),
-            has_errors: Cell::new(false),
             enclosing_breakables: RefCell::new(EnclosingBreakables {
                 stack: Vec::new(),
                 by_id: Default::default(),
             }),
             inh,
-            return_type_pre_known: true,
-            return_type_has_opaque: false,
+            fallback_has_occurred: Cell::new(false),
         }
     }
 
@@ -174,7 +155,36 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ///
     /// [`InferCtxt::err_ctxt`]: infer::InferCtxt::err_ctxt
     pub fn err_ctxt(&'a self) -> TypeErrCtxt<'a, 'tcx> {
-        TypeErrCtxt { infcx: &self.infcx, typeck_results: Some(self.typeck_results.borrow()) }
+        TypeErrCtxt {
+            infcx: &self.infcx,
+            typeck_results: Some(self.typeck_results.borrow()),
+            fallback_has_occurred: self.fallback_has_occurred.get(),
+            normalize_fn_sig: Box::new(|fn_sig| {
+                if fn_sig.has_escaping_bound_vars() {
+                    return fn_sig;
+                }
+                self.probe(|_| {
+                    let ocx = ObligationCtxt::new_in_snapshot(self);
+                    let normalized_fn_sig =
+                        ocx.normalize(&ObligationCause::dummy(), self.param_env, fn_sig);
+                    if ocx.select_all_or_error().is_empty() {
+                        let normalized_fn_sig = self.resolve_vars_if_possible(normalized_fn_sig);
+                        if !normalized_fn_sig.needs_infer() {
+                            return normalized_fn_sig;
+                        }
+                    }
+                    fn_sig
+                })
+            }),
+            autoderef_steps: Box::new(|ty| {
+                let mut autoderef = self.autoderef(DUMMY_SP, ty).silence_errors();
+                let mut steps = vec![];
+                while let Some((ty, _)) = autoderef.next() {
+                    steps.push((ty, autoderef.current_obligations()));
+                }
+                steps
+            }),
+        }
     }
 
     pub fn errors_reported_since_creation(&self) -> bool {
@@ -195,7 +205,7 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
     }
 
     fn item_def_id(&self) -> DefId {
-        self.body_id.owner.to_def_id()
+        self.body_id.to_def_id()
     }
 
     fn get_type_parameter_bounds(
@@ -213,7 +223,9 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
             predicates: tcx.arena.alloc_from_iter(
                 self.param_env.caller_bounds().iter().filter_map(|predicate| {
                     match predicate.kind().skip_binder() {
-                        ty::PredicateKind::Trait(data) if data.self_ty().is_param(index) => {
+                        ty::PredicateKind::Clause(ty::Clause::Trait(data))
+                            if data.self_ty().is_param(index) =>
+                        {
                             // HACK(eddyb) should get the original `Span`.
                             let span = tcx.def_span(def_id);
                             Some((predicate, span))
@@ -277,14 +289,13 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         item_segment: &hir::PathSegment<'_>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
     ) -> Ty<'tcx> {
-        let trait_ref = self.replace_bound_vars_with_fresh_vars(
+        let trait_ref = self.instantiate_binder_with_fresh_vars(
             span,
             infer::LateBoundRegionConversionTime::AssocTypeProjection(item_def_id),
             poly_trait_ref,
         );
 
-        let item_substs = <dyn AstConv<'tcx>>::create_substs_for_associated_item(
-            self,
+        let item_substs = self.astconv().create_substs_for_associated_item(
             span,
             item_def_id,
             item_segment,
@@ -294,19 +305,40 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         self.tcx().mk_projection(item_def_id, item_substs)
     }
 
-    fn normalize_ty(&self, span: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if ty.has_escaping_bound_vars() {
-            ty // FIXME: normalization and escaping regions
-        } else {
-            self.normalize_associated_types_in(span, ty)
+    fn probe_adt(&self, span: Span, ty: Ty<'tcx>) -> Option<ty::AdtDef<'tcx>> {
+        match ty.kind() {
+            ty::Adt(adt_def, _) => Some(*adt_def),
+            // FIXME(#104767): Should we handle bound regions here?
+            ty::Alias(ty::Projection, _) if !ty.has_escaping_bound_vars() => {
+                self.normalize(span, ty).ty_adt_def()
+            }
+            _ => None,
         }
     }
 
-    fn set_tainted_by_errors(&self) {
-        self.infcx.set_tainted_by_errors()
+    fn set_tainted_by_errors(&self, e: ErrorGuaranteed) {
+        self.infcx.set_tainted_by_errors(e)
     }
 
-    fn record_ty(&self, hir_id: hir::HirId, ty: Ty<'tcx>, _span: Span) {
+    fn record_ty(&self, hir_id: hir::HirId, ty: Ty<'tcx>, span: Span) {
+        // FIXME: normalization and escaping regions
+        let ty = if !ty.has_escaping_bound_vars() { self.normalize(span, ty) } else { ty };
         self.write_ty(hir_id, ty)
     }
+
+    fn infcx(&self) -> Option<&infer::InferCtxt<'tcx>> {
+        Some(&self.infcx)
+    }
+}
+
+/// Represents a user-provided type in the raw form (never normalized).
+///
+/// This is a bridge between the interface of `AstConv`, which outputs a raw `Ty`,
+/// and the API in this module, which expect `Ty` to be fully normalized.
+#[derive(Clone, Copy, Debug)]
+pub struct RawTy<'tcx> {
+    pub raw: Ty<'tcx>,
+
+    /// The normalized form of `raw`, stored here for efficiency.
+    pub normalized: Ty<'tcx>,
 }

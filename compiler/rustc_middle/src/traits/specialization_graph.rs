@@ -1,6 +1,6 @@
 use crate::error::StrictCoherenceNeedsNegativeCoherence;
 use crate::ty::fast_reject::SimplifiedType;
-use crate::ty::visit::TypeVisitable;
+use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{self, TyCtxt};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
@@ -60,7 +60,7 @@ pub enum OverlapMode {
 }
 
 impl OverlapMode {
-    pub fn get<'tcx>(tcx: TyCtxt<'tcx>, trait_id: DefId) -> OverlapMode {
+    pub fn get(tcx: TyCtxt<'_>, trait_id: DefId) -> OverlapMode {
         let with_negative_coherence = tcx.features().with_negative_coherence;
         let strict_coherence = tcx.has_attr(trait_id, sym::rustc_strict_coherence);
 
@@ -133,11 +133,7 @@ impl Node {
     ///
     /// If this returns `None`, the item can potentially still be found in
     /// parents of this node.
-    pub fn item<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        trait_item_def_id: DefId,
-    ) -> Option<&'tcx ty::AssocItem> {
+    pub fn item<'tcx>(&self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<ty::AssocItem> {
         match *self {
             Node::Trait(_) => Some(tcx.associated_item(trait_item_def_id)),
             Node::Impl(impl_def_id) => {
@@ -180,6 +176,7 @@ impl Iterator for Ancestors<'_> {
 }
 
 /// Information about the most specialized definition of an associated item.
+#[derive(Debug)]
 pub struct LeafDef {
     /// The associated item described by this `LeafDef`.
     pub item: ty::AssocItem,
@@ -238,7 +235,7 @@ impl<'tcx> Ancestors<'tcx> {
                     }
                 }
 
-                Some(LeafDef { item: *item, defining_node: node, finalizing_node })
+                Some(LeafDef { item, defining_node: node, finalizing_node })
             } else {
                 // Item not mentioned. This "finalizes" any defaulted item provided by an ancestor.
                 finalizing_node = Some(node);
@@ -253,16 +250,16 @@ impl<'tcx> Ancestors<'tcx> {
 ///
 /// Returns `Err` if an error was reported while building the specialization
 /// graph.
-pub fn ancestors<'tcx>(
-    tcx: TyCtxt<'tcx>,
+pub fn ancestors(
+    tcx: TyCtxt<'_>,
     trait_def_id: DefId,
     start_from_impl: DefId,
-) -> Result<Ancestors<'tcx>, ErrorGuaranteed> {
+) -> Result<Ancestors<'_>, ErrorGuaranteed> {
     let specialization_graph = tcx.specialization_graph_of(trait_def_id);
 
     if let Some(reported) = specialization_graph.has_errored {
         Err(reported)
-    } else if let Some(reported) = tcx.type_of(start_from_impl).error_reported() {
+    } else if let Err(reported) = tcx.type_of(start_from_impl).subst_identity().error_reported() {
         Err(reported)
     } else {
         Ok(Ancestors {

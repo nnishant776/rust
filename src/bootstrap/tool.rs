@@ -29,6 +29,46 @@ struct ToolBuild {
     is_optional_tool: bool,
     source_type: SourceType,
     extra_features: Vec<String>,
+    /// Nightly-only features that are allowed (comma-separated list).
+    allow_features: &'static str,
+}
+
+fn tooling_output(
+    mode: Mode,
+    tool: &str,
+    build_stage: u32,
+    host: &TargetSelection,
+    target: &TargetSelection,
+) -> String {
+    match mode {
+        // depends on compiler stage, different to host compiler
+        Mode::ToolRustc => {
+            if host == target {
+                format!("Building tool {} (stage{} -> stage{})", tool, build_stage, build_stage + 1)
+            } else {
+                format!(
+                    "Building tool {} (stage{}:{} -> stage{}:{})",
+                    tool,
+                    build_stage,
+                    host,
+                    build_stage + 1,
+                    target
+                )
+            }
+        }
+        // doesn't depend on compiler, same as host compiler
+        Mode::ToolStd => {
+            if host == target {
+                format!("Building tool {} (stage{})", tool, build_stage)
+            } else {
+                format!(
+                    "Building tool {} (stage{}:{} -> stage{}:{})",
+                    tool, build_stage, host, build_stage, target
+                )
+            }
+        }
+        _ => format!("Building tool {} (stage{})", tool, build_stage),
+    }
 }
 
 impl Step for ToolBuild {
@@ -59,7 +99,7 @@ impl Step for ToolBuild {
             _ => panic!("unexpected Mode for tool build"),
         }
 
-        let cargo = prepare_tool_cargo(
+        let mut cargo = prepare_tool_cargo(
             builder,
             compiler,
             self.mode,
@@ -69,8 +109,17 @@ impl Step for ToolBuild {
             self.source_type,
             &self.extra_features,
         );
-
-        builder.info(&format!("Building stage{} tool {} ({})", compiler.stage, tool, target));
+        if !self.allow_features.is_empty() {
+            cargo.allow_features(self.allow_features);
+        }
+        let msg = tooling_output(
+            self.mode,
+            self.tool,
+            self.compiler.stage,
+            &self.compiler.host,
+            &self.target,
+        );
+        builder.info(&msg);
         let mut duplicates = Vec::new();
         let is_expected = compile::stream_cargo(builder, cargo, vec![], &mut |msg| {
             // Only care about big things like the RLS/Cargo for now
@@ -292,6 +341,7 @@ macro_rules! bootstrap_tool {
         $name:ident, $path:expr, $tool_name:expr
         $(,is_external_tool = $external:expr)*
         $(,is_unstable_tool = $unstable:expr)*
+        $(,allow_features = $allow_features:expr)?
         ;
     )+) => {
         #[derive(Copy, PartialEq, Eq, Clone)]
@@ -355,6 +405,7 @@ macro_rules! bootstrap_tool {
                         SourceType::InTree
                     },
                     extra_features: vec![],
+                    allow_features: concat!($($allow_features)*),
                 }).expect("expected to build -- essential tool")
             }
         }
@@ -368,7 +419,7 @@ bootstrap_tool!(
     Tidy, "src/tools/tidy", "tidy";
     Linkchecker, "src/tools/linkchecker", "linkchecker";
     CargoTest, "src/tools/cargotest", "cargotest";
-    Compiletest, "src/tools/compiletest", "compiletest", is_unstable_tool = true;
+    Compiletest, "src/tools/compiletest", "compiletest", is_unstable_tool = true, allow_features = "test";
     BuildManifest, "src/tools/build-manifest", "build-manifest";
     RemoteTestClient, "src/tools/remote-test-client", "remote-test-client";
     RustInstaller, "src/tools/rust-installer", "rust-installer", is_external_tool = true;
@@ -380,6 +431,8 @@ bootstrap_tool!(
     HtmlChecker, "src/tools/html-checker", "html-checker";
     BumpStage0, "src/tools/bump-stage0", "bump-stage0";
     ReplaceVersionPlaceholder, "src/tools/replace-version-placeholder", "replace-version-placeholder";
+    CollectLicenseMetadata, "src/tools/collect-license-metadata", "collect-license-metadata";
+    GenerateCopyright, "src/tools/generate-copyright", "generate-copyright";
 );
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
@@ -433,6 +486,7 @@ impl Step for ErrorIndex {
                 is_optional_tool: false,
                 source_type: SourceType::InTree,
                 extra_features: Vec::new(),
+                allow_features: "",
             })
             .expect("expected to build -- essential tool")
     }
@@ -469,6 +523,7 @@ impl Step for RemoteTestServer {
                 is_optional_tool: false,
                 source_type: SourceType::InTree,
                 extra_features: Vec::new(),
+                allow_features: "",
             })
             .expect("expected to build -- essential tool")
     }
@@ -522,7 +577,7 @@ impl Step for Rustdoc {
         builder.ensure(compile::Rustc::new(build_compiler, target_compiler.host));
         // NOTE: this implies that `download-rustc` is pretty useless when compiling with the stage0
         // compiler, since you do just as much work.
-        if !builder.config.dry_run && builder.download_rustc() && build_compiler.stage == 0 {
+        if !builder.config.dry_run() && builder.download_rustc() && build_compiler.stage == 0 {
             println!(
                 "warning: `download-rustc` does nothing when building stage1 tools; consider using `--stage 2` instead"
             );
@@ -540,7 +595,7 @@ impl Step for Rustdoc {
             features.push("jemalloc".to_string());
         }
 
-        let cargo = prepare_tool_cargo(
+        let mut cargo = prepare_tool_cargo(
             builder,
             build_compiler,
             Mode::ToolRustc,
@@ -551,10 +606,18 @@ impl Step for Rustdoc {
             features.as_slice(),
         );
 
-        builder.info(&format!(
-            "Building rustdoc for stage{} ({})",
-            target_compiler.stage, target_compiler.host
-        ));
+        if builder.config.rustc_parallel {
+            cargo.rustflag("--cfg=parallel_compiler");
+        }
+
+        let msg = tooling_output(
+            Mode::ToolRustc,
+            "rustdoc",
+            build_compiler.stage,
+            &self.compiler.host,
+            &target,
+        );
+        builder.info(&msg);
         builder.run(&mut cargo.into());
 
         // Cargo adds a number of paths to the dylib search path on windows, which results in
@@ -620,6 +683,7 @@ impl Step for Cargo {
                 is_optional_tool: false,
                 source_type: SourceType::Submodule,
                 extra_features: Vec::new(),
+                allow_features: "",
             })
             .expect("expected to build -- essential tool");
 
@@ -635,6 +699,7 @@ impl Step for Cargo {
                 is_optional_tool: true,
                 source_type: SourceType::Submodule,
                 extra_features: Vec::new(),
+                allow_features: "",
             });
         };
 
@@ -682,6 +747,7 @@ impl Step for LldWrapper {
                 is_optional_tool: false,
                 source_type: SourceType::InTree,
                 extra_features: Vec::new(),
+                allow_features: "",
             })
             .expect("expected to build -- essential tool");
 
@@ -693,6 +759,11 @@ impl Step for LldWrapper {
 pub struct RustAnalyzer {
     pub compiler: Compiler,
     pub target: TargetSelection,
+}
+
+impl RustAnalyzer {
+    pub const ALLOW_FEATURES: &str =
+        "proc_macro_internals,proc_macro_diagnostic,proc_macro_span,proc_macro_span_shrink";
 }
 
 impl Step for RustAnalyzer {
@@ -729,6 +800,7 @@ impl Step for RustAnalyzer {
             extra_features: vec!["rust-analyzer/in-rust-tree".to_owned()],
             is_optional_tool: false,
             source_type: SourceType::InTree,
+            allow_features: RustAnalyzer::ALLOW_FEATURES,
         })
     }
 }
@@ -746,18 +818,14 @@ impl Step for RustAnalyzerProcMacroSrv {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let builder = run.builder;
-
         // Allow building `rust-analyzer-proc-macro-srv` both as part of the `rust-analyzer` and as a stand-alone tool.
         run.path("src/tools/rust-analyzer")
             .path("src/tools/rust-analyzer/crates/proc-macro-srv-cli")
-            .default_condition(
-                builder.config.extended
-                    && builder.config.tools.as_ref().map_or(true, |tools| {
-                        tools.iter().any(|tool| {
-                            tool == "rust-analyzer" || tool == "rust-analyzer-proc-macro-srv"
-                        })
-                    }),
-            )
+            .default_condition(builder.config.tools.as_ref().map_or(true, |tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool == "rust-analyzer" || tool == "rust-analyzer-proc-macro-srv")
+            }))
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -777,6 +845,7 @@ impl Step for RustAnalyzerProcMacroSrv {
             extra_features: vec!["proc-macro-srv/sysroot-abi".to_owned()],
             is_optional_tool: false,
             source_type: SourceType::InTree,
+            allow_features: RustAnalyzer::ALLOW_FEATURES,
         })?;
 
         // Copy `rust-analyzer-proc-macro-srv` to `<sysroot>/libexec/`
@@ -796,6 +865,7 @@ macro_rules! tool_extended {
        $tool_name:expr,
        stable = $stable:expr
        $(,tool_std = $tool_std:literal)?
+       $(,allow_features = $allow_features:expr)?
        ;)+) => {
         $(
             #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -847,6 +917,7 @@ macro_rules! tool_extended {
                     extra_features: $sel.extra_features,
                     is_optional_tool: true,
                     source_type: SourceType::InTree,
+                    allow_features: concat!($($allow_features)*),
                 })
             }
         }

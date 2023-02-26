@@ -57,7 +57,7 @@ impl<'a> LexedStr<'a> {
         let mut conv = Converter::new(text);
         conv.extend_token(&token.kind, text);
         match &*conv.res.kind {
-            [kind] => Some((*kind, conv.res.error.pop().map(|it| it.msg.clone()))),
+            [kind] => Some((*kind, conv.res.error.pop().map(|it| it.msg))),
             _ => None,
         }
     }
@@ -82,6 +82,7 @@ impl<'a> LexedStr<'a> {
     pub fn text(&self, i: usize) -> &str {
         self.range_text(i..i + 1)
     }
+
     pub fn range_text(&self, r: ops::Range<usize>) -> &str {
         assert!(r.start < r.end && r.end <= self.len());
         let lo = self.start[r.start] as usize;
@@ -216,6 +217,10 @@ impl<'a> Converter<'a> {
                 rustc_lexer::TokenKind::Caret => T![^],
                 rustc_lexer::TokenKind::Percent => T![%],
                 rustc_lexer::TokenKind::Unknown => ERROR,
+                rustc_lexer::TokenKind::UnknownPrefix => {
+                    err = "unknown literal prefix";
+                    IDENT
+                }
             }
         };
 

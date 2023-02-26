@@ -15,11 +15,11 @@
 use std::fmt;
 
 use hir_expand::name::Name;
+use intern::Interned;
 use la_arena::{Idx, RawIdx};
 
 use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    intern::Interned,
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
     BlockId,
@@ -35,6 +35,13 @@ pub(crate) fn dummy_expr_id() -> ExprId {
 }
 
 pub type PatId = Idx<Pat>;
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ExprOrPatId {
+    ExprId(ExprId),
+    PatId(PatId),
+}
+stdx::impl_from!(ExprId, PatId for ExprOrPatId);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Label {
@@ -135,6 +142,9 @@ pub enum Expr {
         expr: Option<ExprId>,
     },
     Yield {
+        expr: Option<ExprId>,
+    },
+    Yeet {
         expr: Option<ExprId>,
     },
     RecordLit {
@@ -313,7 +323,10 @@ impl Expr {
                 arms.iter().map(|arm| arm.expr).for_each(f);
             }
             Expr::Continue { .. } => {}
-            Expr::Break { expr, .. } | Expr::Return { expr } | Expr::Yield { expr } => {
+            Expr::Break { expr, .. }
+            | Expr::Return { expr }
+            | Expr::Yield { expr }
+            | Expr::Yeet { expr } => {
                 if let &Some(expr) = expr {
                     f(expr);
                 }

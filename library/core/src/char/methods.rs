@@ -53,15 +53,13 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char::decode_utf16;
-    ///
     /// // 𝄞mus<invalid>ic<invalid>
     /// let v = [
     ///     0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834,
     /// ];
     ///
     /// assert_eq!(
-    ///     decode_utf16(v)
+    ///     char::decode_utf16(v)
     ///         .map(|r| r.map_err(|e| e.unpaired_surrogate()))
     ///         .collect::<Vec<_>>(),
     ///     vec![
@@ -77,16 +75,14 @@ impl char {
     /// A lossy decoder can be obtained by replacing `Err` results with the replacement character:
     ///
     /// ```
-    /// use std::char::{decode_utf16, REPLACEMENT_CHARACTER};
-    ///
     /// // 𝄞mus<invalid>ic<invalid>
     /// let v = [
     ///     0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834,
     /// ];
     ///
     /// assert_eq!(
-    ///     decode_utf16(v)
-    ///        .map(|r| r.unwrap_or(REPLACEMENT_CHARACTER))
+    ///     char::decode_utf16(v)
+    ///        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
     ///        .collect::<String>(),
     ///     "𝄞mus�ic�"
     /// );
@@ -123,8 +119,6 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_u32(0x2764);
     ///
     /// assert_eq!(Some('❤'), c);
@@ -133,14 +127,12 @@ impl char {
     /// Returning `None` when the input is not a valid `char`:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_u32(0x110000);
     ///
     /// assert_eq!(None, c);
     /// ```
     #[stable(feature = "assoc_char_funcs", since = "1.52.0")]
-    #[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+    #[rustc_const_stable(feature = "const_char_convert", since = "1.67.0")]
     #[must_use]
     #[inline]
     pub const fn from_u32(i: u32) -> Option<char> {
@@ -176,14 +168,12 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = unsafe { char::from_u32_unchecked(0x2764) };
     ///
     /// assert_eq!('❤', c);
     /// ```
     #[stable(feature = "assoc_char_funcs", since = "1.52.0")]
-    #[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+    #[rustc_const_unstable(feature = "const_char_from_u32_unchecked", issue = "89259")]
     #[must_use]
     #[inline]
     pub const unsafe fn from_u32_unchecked(i: u32) -> char {
@@ -210,8 +200,6 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_digit(4, 10);
     ///
     /// assert_eq!(Some('4'), c);
@@ -225,8 +213,6 @@ impl char {
     /// Returning `None` when the input is not a digit:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_digit(20, 10);
     ///
     /// assert_eq!(None, c);
@@ -235,13 +221,11 @@ impl char {
     /// Passing a large radix, causing a panic:
     ///
     /// ```should_panic
-    /// use std::char;
-    ///
     /// // this panics
     /// let _c = char::from_digit(1, 37);
     /// ```
     #[stable(feature = "assoc_char_funcs", since = "1.52.0")]
-    #[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+    #[rustc_const_stable(feature = "const_char_convert", since = "1.67.0")]
     #[must_use]
     #[inline]
     pub const fn from_digit(num: u32, radix: u32) -> Option<char> {
@@ -338,7 +322,7 @@ impl char {
     /// let _ = '1'.to_digit(37);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+    #[rustc_const_stable(feature = "const_char_convert", since = "1.67.0")]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[inline]
@@ -1786,7 +1770,7 @@ pub fn encode_utf16_raw(mut code: u32, dst: &mut [u16]) -> &mut [u16] {
         } else {
             panic!(
                 "encode_utf16: need {} units to encode U+{:X}, but the buffer has {}",
-                from_u32_unchecked(code).len_utf16(),
+                char::from_u32_unchecked(code).len_utf16(),
                 code,
                 dst.len(),
             )

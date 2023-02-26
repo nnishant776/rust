@@ -1,10 +1,12 @@
+import * as anser from "anser";
 import * as lc from "vscode-languageclient/node";
 import * as vscode from "vscode";
 import * as ra from "../src/lsp_ext";
 import * as Is from "vscode-languageclient/lib/common/utils/is";
 import { assert } from "./util";
+import * as diagnostics from "./diagnostics";
 import { WorkspaceEdit } from "vscode";
-import { substituteVSCodeVariables } from "./config";
+import { Config, substituteVSCodeVariables } from "./config";
 import { randomUUID } from "crypto";
 
 export interface Env {
@@ -66,7 +68,8 @@ export async function createClient(
     traceOutputChannel: vscode.OutputChannel,
     outputChannel: vscode.OutputChannel,
     initializationOptions: vscode.WorkspaceConfiguration,
-    serverOptions: lc.ServerOptions
+    serverOptions: lc.ServerOptions,
+    config: Config
 ): Promise<lc.LanguageClient> {
     const clientOptions: lc.LanguageClientOptions = {
         documentSelector: [{ scheme: "file", language: "rust" }],
@@ -99,6 +102,54 @@ export async function createClient(
                     }
                 },
             },
+            async handleDiagnostics(
+                uri: vscode.Uri,
+                diagnosticList: vscode.Diagnostic[],
+                next: lc.HandleDiagnosticsSignature
+            ) {
+                const preview = config.previewRustcOutput;
+                const errorCode = config.useRustcErrorCode;
+                diagnosticList.forEach((diag, idx) => {
+                    // Abuse the fact that VSCode leaks the LSP diagnostics data field through the
+                    // Diagnostic class, if they ever break this we are out of luck and have to go
+                    // back to the worst diagnostics experience ever:)
+
+                    // We encode the rendered output of a rustc diagnostic in the rendered field of
+                    // the data payload of the lsp diagnostic. If that field exists, overwrite the
+                    // diagnostic code such that clicking it opens the diagnostic in a readonly
+                    // text editor for easy inspection
+                    const rendered = (diag as unknown as { data?: { rendered?: string } }).data
+                        ?.rendered;
+                    if (rendered) {
+                        if (preview) {
+                            const decolorized = anser.ansiToText(rendered);
+                            const index =
+                                decolorized.match(/^(note|help):/m)?.index || rendered.length;
+                            diag.message = decolorized
+                                .substring(0, index)
+                                .replace(/^ -->[^\n]+\n/m, "");
+                        }
+                        let value;
+                        if (errorCode) {
+                            if (typeof diag.code === "string" || typeof diag.code === "number") {
+                                value = diag.code;
+                            } else {
+                                value = diag.code?.value;
+                            }
+                        }
+                        diag.code = {
+                            target: vscode.Uri.from({
+                                scheme: diagnostics.URI_SCHEME,
+                                path: `/diagnostic message [${idx.toString()}]`,
+                                fragment: uri.toString(),
+                                query: idx.toString(),
+                            }),
+                            value: value ?? "Click for full compiler diagnostic",
+                        };
+                    }
+                });
+                return next(uri, diagnosticList);
+            },
             async provideHover(
                 document: vscode.TextDocument,
                 position: vscode.Position,
@@ -121,12 +172,10 @@ export async function createClient(
                     )
                     .then(
                         (result) => {
+                            if (!result) return null;
                             const hover = client.protocol2CodeConverter.asHover(result);
-                            if (hover) {
-                                const actions = (<any>result).actions;
-                                if (actions) {
-                                    hover.contents.push(renderHoverActions(actions));
-                                }
+                            if (!!result.actions) {
+                                hover.contents.push(renderHoverActions(result.actions));
                             }
                             return hover;
                         },
@@ -259,24 +308,27 @@ class ExperimentalFeatures implements lc.StaticFeature {
         return { kind: "static" };
     }
     fillClientCapabilities(capabilities: lc.ClientCapabilities): void {
-        const caps: any = capabilities.experimental ?? {};
-        caps.snippetTextEdit = true;
-        caps.codeActionGroup = true;
-        caps.hoverActions = true;
-        caps.serverStatusNotification = true;
-        caps.commands = {
-            commands: [
-                "rust-analyzer.runSingle",
-                "rust-analyzer.debugSingle",
-                "rust-analyzer.showReferences",
-                "rust-analyzer.gotoLocation",
-                "editor.action.triggerParameterHints",
-            ],
+        capabilities.experimental = {
+            snippetTextEdit: true,
+            codeActionGroup: true,
+            hoverActions: true,
+            serverStatusNotification: true,
+            colorDiagnosticOutput: true,
+            openServerLogs: true,
+            commands: {
+                commands: [
+                    "rust-analyzer.runSingle",
+                    "rust-analyzer.debugSingle",
+                    "rust-analyzer.showReferences",
+                    "rust-analyzer.gotoLocation",
+                    "editor.action.triggerParameterHints",
+                ],
+            },
+            ...capabilities.experimental,
         };
-        capabilities.experimental = caps;
     }
     initialize(
-        _capabilities: lc.ServerCapabilities<any>,
+        _capabilities: lc.ServerCapabilities,
         _documentSelector: lc.DocumentSelector | undefined
     ): void {}
     dispose(): void {}

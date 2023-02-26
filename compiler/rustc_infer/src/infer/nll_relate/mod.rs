@@ -21,26 +21,21 @@
 //!   thing we relate in chalk are basically domain goals and their
 //!   constituents)
 
-use crate::infer::combine::ConstEquateRelation;
 use crate::infer::InferCtxt;
 use crate::infer::{ConstVarValue, ConstVariableValue};
 use crate::infer::{TypeVariableOrigin, TypeVariableOriginKind};
-use crate::traits::PredicateObligation;
+use crate::traits::{Obligation, PredicateObligations};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::relate::{self, Relate, RelateResult, TypeRelation};
-use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
 use rustc_middle::ty::{self, InferConst, Ty, TyCtxt};
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 
-#[derive(PartialEq)]
-pub enum NormalizationStrategy {
-    Lazy,
-    Eager,
-}
+use super::combine::ObligationEmittingRelation;
 
 pub struct TypeRelating<'me, 'tcx, D>
 where
@@ -92,11 +87,7 @@ pub trait TypeRelatingDelegate<'tcx> {
         info: ty::VarianceDiagInfo<'tcx>,
     );
 
-    fn const_equate(&mut self, a: ty::Const<'tcx>, b: ty::Const<'tcx>);
-    fn register_opaque_type_obligations(
-        &mut self,
-        obligations: Vec<PredicateObligation<'tcx>>,
-    ) -> Result<(), TypeError<'tcx>>;
+    fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>);
 
     /// Creates a new universe index. Used when instantiating placeholders.
     fn create_next_universe(&mut self) -> ty::UniverseIndex;
@@ -109,7 +100,11 @@ pub trait TypeRelatingDelegate<'tcx> {
     /// we will invoke this method to instantiate `'a` with an
     /// inference variable (though `'b` would be instantiated first,
     /// as a placeholder).
-    fn next_existential_region_var(&mut self, was_placeholder: bool) -> ty::Region<'tcx>;
+    fn next_existential_region_var(
+        &mut self,
+        was_placeholder: bool,
+        name: Option<Symbol>,
+    ) -> ty::Region<'tcx>;
 
     /// Creates a new region variable representing a
     /// higher-ranked region that is instantiated universally.
@@ -128,9 +123,6 @@ pub trait TypeRelatingDelegate<'tcx> {
     /// relate `Foo<'?0>` with `Foo<'a>` (and probably add an outlives
     /// relation stating that `'?0: 'a`).
     fn generalize_existential(&mut self, universe: ty::UniverseIndex) -> ty::Region<'tcx>;
-
-    /// Define the normalization strategy to use, eager or lazy.
-    fn normalization() -> NormalizationStrategy;
 
     /// Enables some optimizations if we do not expect inference variables
     /// in the RHS of the relation.
@@ -200,7 +192,7 @@ where
                     let placeholder = ty::PlaceholderRegion { universe, name: br.kind };
                     delegate.next_placeholder_region(placeholder)
                 } else {
-                    delegate.next_existential_region_var(true)
+                    delegate.next_existential_region_var(true, br.kind.get_name())
                 }
             }
         };
@@ -269,38 +261,6 @@ where
         self.delegate.push_outlives(sup, sub, info);
     }
 
-    /// Relate a projection type and some value type lazily. This will always
-    /// succeed, but we push an additional `ProjectionEq` goal depending
-    /// on the value type:
-    /// - if the value type is any type `T` which is not a projection, we push
-    ///   `ProjectionEq(projection = T)`.
-    /// - if the value type is another projection `other_projection`, we create
-    ///   a new inference variable `?U` and push the two goals
-    ///   `ProjectionEq(projection = ?U)`, `ProjectionEq(other_projection = ?U)`.
-    fn relate_projection_ty(
-        &mut self,
-        projection_ty: ty::ProjectionTy<'tcx>,
-        value_ty: Ty<'tcx>,
-    ) -> Ty<'tcx> {
-        use rustc_span::DUMMY_SP;
-
-        match *value_ty.kind() {
-            ty::Projection(other_projection_ty) => {
-                let var = self.infcx.next_ty_var(TypeVariableOrigin {
-                    kind: TypeVariableOriginKind::MiscVariable,
-                    span: DUMMY_SP,
-                });
-                // FIXME(lazy-normalization): This will always ICE, because the recursive
-                // call will end up in the _ arm below.
-                self.relate_projection_ty(projection_ty, var);
-                self.relate_projection_ty(other_projection_ty, var);
-                var
-            }
-
-            _ => bug!("should never be invoked with eager normalization"),
-        }
-    }
-
     /// Relate a type inference variable with a value type. This works
     /// by creating a "generalization" G of the value where all the
     /// lifetimes are replaced with fresh inference values. This
@@ -337,10 +297,6 @@ where
                 // Two type variables: just equate them.
                 self.infcx.inner.borrow_mut().type_variables().equate(vid, value_vid);
                 return Ok(value_ty);
-            }
-
-            ty::Projection(projection_ty) if D::normalization() == NormalizationStrategy::Lazy => {
-                return Ok(self.relate_projection_ty(projection_ty, self.infcx.tcx.mk_ty_var(vid)));
             }
 
             _ => (),
@@ -410,8 +366,8 @@ where
             }
         };
         let (a, b) = match (a.kind(), b.kind()) {
-            (&ty::Opaque(..), _) => (a, generalize(b, false)?),
-            (_, &ty::Opaque(..)) => (generalize(a, true)?, b),
+            (&ty::Alias(ty::Opaque, ..), _) => (a, generalize(b, false)?),
+            (_, &ty::Alias(ty::Opaque, ..)) => (generalize(a, true)?, b),
             _ => unreachable!(),
         };
         let cause = ObligationCause::dummy_with_span(self.delegate.span());
@@ -419,7 +375,7 @@ where
             .infcx
             .handle_opaque_type(a, b, true, &cause, self.delegate.param_env())?
             .obligations;
-        self.delegate.register_opaque_type_obligations(obligations)?;
+        self.delegate.register_obligations(obligations);
         trace!(a = ?a.kind(), b = ?b.kind(), "opaque type instantiated");
         Ok(a)
     }
@@ -441,7 +397,7 @@ trait VidValuePair<'tcx>: Debug {
     fn value_ty(&self) -> Ty<'tcx>;
 
     /// Extract the scopes that apply to whichever side of the tuple
-    /// the vid was found on.  See the comment where this is called
+    /// the vid was found on. See the comment where this is called
     /// for more details on why we want them.
     fn vid_scopes<'r, D: TypeRelatingDelegate<'tcx>>(
         &self,
@@ -531,6 +487,10 @@ where
         self.infcx.tcx
     }
 
+    fn intercrate(&self) -> bool {
+        self.infcx.intercrate
+    }
+
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.delegate.param_env()
     }
@@ -541,6 +501,17 @@ where
 
     fn a_is_expected(&self) -> bool {
         true
+    }
+
+    fn mark_ambiguous(&mut self) {
+        let cause = ObligationCause::dummy_with_span(self.delegate.span());
+        let param_env = self.delegate.param_env();
+        self.delegate.register_obligations(vec![Obligation::new(
+            self.tcx(),
+            cause,
+            param_env,
+            ty::Binder::dummy(ty::PredicateKind::Ambiguous),
+        )]);
     }
 
     #[instrument(skip(self, info), level = "trace", ret)]
@@ -556,8 +527,9 @@ where
         self.ambient_variance_info = self.ambient_variance_info.xform(info);
 
         debug!(?self.ambient_variance);
-
-        let r = self.relate(a, b)?;
+        // In a bivariant context this always succeeds.
+        let r =
+            if self.ambient_variance == ty::Variance::Bivariant { a } else { self.relate(a, b)? };
 
         self.ambient_variance = old_ambient_variance;
 
@@ -596,29 +568,21 @@ where
 
             (&ty::Infer(ty::TyVar(vid)), _) => self.relate_ty_var((vid, b)),
 
-            (&ty::Opaque(a_def_id, _), &ty::Opaque(b_def_id, _)) if a_def_id == b_def_id => {
-                infcx.super_combine_tys(self, a, b).or_else(|err| {
-                    self.tcx().sess.delay_span_bug(
-                        self.delegate.span(),
-                        "failure to relate an opaque to itself should result in an error later on",
-                    );
-                    if a_def_id.is_local() { self.relate_opaques(a, b) } else { Err(err) }
-                })
-            }
-            (&ty::Opaque(did, ..), _) | (_, &ty::Opaque(did, ..)) if did.is_local() => {
+            (
+                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
+                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
+            ) if a_def_id == b_def_id => infcx.super_combine_tys(self, a, b).or_else(|err| {
+                self.tcx().sess.delay_span_bug(
+                    self.delegate.span(),
+                    "failure to relate an opaque to itself should result in an error later on",
+                );
+                if a_def_id.is_local() { self.relate_opaques(a, b) } else { Err(err) }
+            }),
+            (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
+            | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
+                if def_id.is_local() =>
+            {
                 self.relate_opaques(a, b)
-            }
-
-            (&ty::Projection(projection_ty), _)
-                if D::normalization() == NormalizationStrategy::Lazy =>
-            {
-                Ok(self.relate_projection_ty(projection_ty, b))
-            }
-
-            (_, &ty::Projection(projection_ty))
-                if D::normalization() == NormalizationStrategy::Lazy =>
-            {
-                Ok(self.relate_projection_ty(projection_ty, a))
             }
 
             _ => {
@@ -645,13 +609,13 @@ where
         debug!(?v_b);
 
         if self.ambient_covariance() {
-            // Covariance: a <= b. Hence, `b: a`.
-            self.push_outlives(v_b, v_a, self.ambient_variance_info);
+            // Covariant: &'a u8 <: &'b u8. Hence, `'a: 'b`.
+            self.push_outlives(v_a, v_b, self.ambient_variance_info);
         }
 
         if self.ambient_contravariance() {
-            // Contravariant: b <= a. Hence, `a: b`.
-            self.push_outlives(v_a, v_b, self.ambient_variance_info);
+            // Contravariant: &'b u8 <: &'a u8. Hence, `'b: 'a`.
+            self.push_outlives(v_b, v_a, self.ambient_variance_info);
         }
 
         Ok(a)
@@ -795,12 +759,23 @@ where
     }
 }
 
-impl<'tcx, D> ConstEquateRelation<'tcx> for TypeRelating<'_, 'tcx, D>
+impl<'tcx, D> ObligationEmittingRelation<'tcx> for TypeRelating<'_, 'tcx, D>
 where
     D: TypeRelatingDelegate<'tcx>,
 {
-    fn const_equate_obligation(&mut self, a: ty::Const<'tcx>, b: ty::Const<'tcx>) {
-        self.delegate.const_equate(a, b);
+    fn register_predicates(&mut self, obligations: impl IntoIterator<Item: ty::ToPredicate<'tcx>>) {
+        self.delegate.register_obligations(
+            obligations
+                .into_iter()
+                .map(|to_pred| {
+                    Obligation::new(self.tcx(), ObligationCause::dummy(), self.param_env(), to_pred)
+                })
+                .collect(),
+        );
+    }
+
+    fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>) {
+        self.delegate.register_obligations(obligations);
     }
 }
 
@@ -809,7 +784,7 @@ where
 /// (these are not explicitly present in the ty representation right
 /// now). This visitor handles that: it descends the type, tracking
 /// binder depth, and finds late-bound regions targeting the
-/// `for<..`>.  For each of those, it creates an entry in
+/// `for<..`>. For each of those, it creates an entry in
 /// `bound_region_scope`.
 struct ScopeInstantiator<'me, 'tcx> {
     next_region: &'me mut dyn FnMut(ty::BoundRegion) -> ty::Region<'tcx>,
@@ -818,8 +793,8 @@ struct ScopeInstantiator<'me, 'tcx> {
     bound_region_scope: &'me mut BoundRegionScope<'tcx>,
 }
 
-impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
-    fn visit_binder<T: TypeVisitable<'tcx>>(
+impl<'me, 'tcx> TypeVisitor<TyCtxt<'tcx>> for ScopeInstantiator<'me, 'tcx> {
+    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(
         &mut self,
         t: &ty::Binder<'tcx, T>,
     ) -> ControlFlow<Self::BreakTy> {
@@ -827,7 +802,7 @@ impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
         t.super_visit_with(self);
         self.target_index.shift_out(1);
 
-        ControlFlow::CONTINUE
+        ControlFlow::Continue(())
     }
 
     fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
@@ -841,7 +816,7 @@ impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
             _ => {}
         }
 
-        ControlFlow::CONTINUE
+        ControlFlow::Continue(())
     }
 }
 
@@ -897,6 +872,11 @@ where
         self.infcx.tcx
     }
 
+    fn intercrate(&self) -> bool {
+        assert!(!self.infcx.intercrate);
+        false
+    }
+
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.delegate.param_env()
     }
@@ -907,6 +887,10 @@ where
 
     fn a_is_expected(&self) -> bool {
         true
+    }
+
+    fn mark_ambiguous(&mut self) {
+        bug!()
     }
 
     fn relate_with_variance<T: Relate<'tcx>>(
@@ -1062,7 +1046,7 @@ where
                             origin: var_value.origin,
                             val: ConstVariableValue::Unknown { universe: self.universe },
                         });
-                        Ok(self.tcx().mk_const_var(new_var_id, a.ty()))
+                        Ok(self.tcx().mk_const(new_var_id, a.ty()))
                     }
                 }
             }

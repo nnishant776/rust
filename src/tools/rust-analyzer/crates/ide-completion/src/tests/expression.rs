@@ -4,7 +4,7 @@ use expect_test::{expect, Expect};
 use crate::tests::{check_edit, completion_list, BASE_ITEMS_FIXTURE};
 
 fn check(ra_fixture: &str, expect: Expect) {
-    let actual = completion_list(&format!("{}{}", BASE_ITEMS_FIXTURE, ra_fixture));
+    let actual = completion_list(&format!("{BASE_ITEMS_FIXTURE}{ra_fixture}"));
     expect.assert_eq(&actual)
 }
 
@@ -743,5 +743,257 @@ fn return_value_no_block() {
         "return",
         r#"fn f() -> i32 { match () { () => $0 } }"#,
         r#"fn f() -> i32 { match () { () => return $0 } }"#,
+    );
+}
+
+#[test]
+fn else_completion_after_if() {
+    check_empty(
+        r#"
+fn foo() { if foo {} $0 }
+"#,
+        expect![[r#"
+            fn foo()       fn()
+            bt u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { if foo {} el$0 }
+"#,
+        expect![[r#"
+            fn foo()       fn()
+            bt u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { bar(if foo {} $0) }
+"#,
+        expect![[r#"
+            fn foo()     fn()
+            bt u32
+            kw crate::
+            kw else
+            kw else if
+            kw false
+            kw for
+            kw if
+            kw if let
+            kw loop
+            kw match
+            kw return
+            kw self::
+            kw true
+            kw unsafe
+            kw while
+            kw while let
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { bar(if foo {} el$0) }
+"#,
+        expect![[r#"
+            fn foo()     fn()
+            bt u32
+            kw crate::
+            kw else
+            kw else if
+            kw false
+            kw for
+            kw if
+            kw if let
+            kw loop
+            kw match
+            kw return
+            kw self::
+            kw true
+            kw unsafe
+            kw while
+            kw while let
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { if foo {} $0 let x = 92; }
+"#,
+        expect![[r#"
+            fn foo()       fn()
+            bt u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { if foo {} el$0 let x = 92; }
+"#,
+        expect![[r#"
+            fn foo()       fn()
+            bt u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
+    check_empty(
+        r#"
+fn foo() { if foo {} el$0 { let x = 92; } }
+"#,
+        expect![[r#"
+            fn foo()       fn()
+            bt u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
     );
 }

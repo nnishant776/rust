@@ -1,10 +1,10 @@
 use crate::infer::canonical::{
-    Canonicalized, CanonicalizedQueryResponse, OriginalQueryValues, QueryRegionConstraints,
+    Canonical, CanonicalQueryResponse, OriginalQueryValues, QueryRegionConstraints,
 };
 use crate::infer::{InferCtxt, InferOk};
 use crate::traits::query::Fallible;
 use crate::traits::ObligationCause;
-use rustc_infer::infer::canonical::{Canonical, Certainty};
+use rustc_infer::infer::canonical::Certainty;
 use rustc_infer::traits::query::NoSolution;
 use rustc_infer::traits::PredicateObligations;
 use rustc_middle::ty::fold::TypeFoldable;
@@ -54,8 +54,8 @@ pub struct TypeOpOutput<'tcx, Op: TypeOp<'tcx>> {
 /// which produces the resulting query region constraints.
 ///
 /// [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
-pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<'tcx> + 'tcx {
-    type QueryResponse: TypeFoldable<'tcx>;
+pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 'tcx {
+    type QueryResponse: TypeFoldable<TyCtxt<'tcx>>;
 
     /// Give query the option for a simple fast path that never
     /// actually hits the tcx cache lookup etc. Return `Some(r)` with
@@ -73,8 +73,8 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<'tcx> + 'tcx {
     /// not captured in the return value.
     fn perform_query(
         tcx: TyCtxt<'tcx>,
-        canonicalized: Canonicalized<'tcx, ParamEnvAnd<'tcx, Self>>,
-    ) -> Fallible<CanonicalizedQueryResponse<'tcx, Self::QueryResponse>>;
+        canonicalized: Canonical<'tcx, ParamEnvAnd<'tcx, Self>>,
+    ) -> Fallible<CanonicalQueryResponse<'tcx, Self::QueryResponse>>;
 
     fn fully_perform_into(
         query_key: ParamEnvAnd<'tcx, Self>,

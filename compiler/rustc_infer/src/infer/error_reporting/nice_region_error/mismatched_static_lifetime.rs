@@ -9,7 +9,7 @@ use crate::infer::error_reporting::nice_region_error::NiceRegionError;
 use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::{SubregionOrigin, TypeTrace};
 use crate::traits::ObligationCauseCode;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::intravisit::Visitor;
@@ -72,8 +72,8 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             };
 
             // Next, let's figure out the set of trait objects with implicit static bounds
-            let ty = self.tcx().type_of(*impl_def_id);
-            let mut v = super::static_impl_trait::TraitObjectVisitor(FxHashSet::default());
+            let ty = self.tcx().type_of(*impl_def_id).subst_identity();
+            let mut v = super::static_impl_trait::TraitObjectVisitor(FxIndexSet::default());
             v.visit_ty(ty);
             let mut traits = vec![];
             for matching_def_id in v.0 {

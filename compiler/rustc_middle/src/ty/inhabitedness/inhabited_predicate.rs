@@ -41,6 +41,13 @@ impl<'tcx> InhabitedPredicate<'tcx> {
         self.apply_inner(tcx, param_env, &|_| Err(())).ok()
     }
 
+    /// Same as `apply`, but `NotInModule(_)` predicates yield `false`. That is,
+    /// privately uninhabited types are considered always uninhabited.
+    pub fn apply_ignore_module(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> bool {
+        let Ok(result) = self.apply_inner::<!>(tcx, param_env, &|_| Ok(true));
+        result
+    }
+
     fn apply_inner<E>(
         self,
         tcx: TyCtxt<'tcx>,
@@ -50,7 +57,7 @@ impl<'tcx> InhabitedPredicate<'tcx> {
         match self {
             Self::False => Ok(false),
             Self::True => Ok(true),
-            Self::ConstIsZero(const_) => match const_.try_eval_usize(tcx, param_env) {
+            Self::ConstIsZero(const_) => match const_.try_eval_target_usize(tcx, param_env) {
                 None | Some(0) => Ok(true),
                 Some(1..) => Ok(false),
             },
@@ -152,7 +159,7 @@ impl<'tcx> InhabitedPredicate<'tcx> {
         match self {
             Self::ConstIsZero(c) => {
                 let c = ty::EarlyBinder(c).subst(tcx, substs);
-                let pred = match c.kind().try_to_machine_usize(tcx) {
+                let pred = match c.kind().try_to_target_usize(tcx) {
                     Some(0) => Self::True,
                     Some(1..) => Self::False,
                     None => Self::ConstIsZero(c),

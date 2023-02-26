@@ -1,16 +1,18 @@
 use crate::coercion::CoerceMany;
+use crate::errors::{
+    LangStartIncorrectNumberArgs, LangStartIncorrectParam, LangStartIncorrectRetTy,
+};
 use crate::gather_locals::GatherLocalsVisitor;
-use crate::{FnCtxt, Inherited};
-use crate::{GeneratorTypes, UnsafetyState};
+use crate::FnCtxt;
+use crate::GeneratorTypes;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::lang_items::LangItem;
-use rustc_hir::{ImplicitSelfKind, ItemKind, Node};
 use rustc_hir_analysis::check::fn_maybe_err;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_infer::infer::RegionVariableOrigin;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Binder, Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits;
@@ -22,22 +24,16 @@ use std::cell::RefCell;
 ///
 /// * ...
 /// * inherited: other fields inherited from the enclosing fn (if any)
-#[instrument(skip(inherited, body), level = "debug")]
+#[instrument(skip(fcx, body), level = "debug")]
 pub(super) fn check_fn<'a, 'tcx>(
-    inherited: &'a Inherited<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
+    fcx: &mut FnCtxt<'a, 'tcx>,
     fn_sig: ty::FnSig<'tcx>,
     decl: &'tcx hir::FnDecl<'tcx>,
-    fn_id: hir::HirId,
+    fn_def_id: LocalDefId,
     body: &'tcx hir::Body<'tcx>,
     can_be_generator: Option<hir::Movability>,
-    return_type_pre_known: bool,
-) -> (FnCtxt<'a, 'tcx>, Option<GeneratorTypes<'tcx>>) {
-    // Create the function context. This is either derived from scratch or,
-    // in the case of closures, based on the outer context.
-    let mut fcx = FnCtxt::new(inherited, param_env, body.value.hir_id);
-    fcx.ps.set(UnsafetyState::function(fn_sig.unsafety, fn_id));
-    fcx.return_type_pre_known = return_type_pre_known;
+) -> Option<GeneratorTypes<'tcx>> {
+    let fn_id = fcx.tcx.hir().local_def_id_to_hir_id(fn_def_id);
 
     let tcx = fcx.tcx;
     let hir = tcx.hir();
@@ -47,13 +43,10 @@ pub(super) fn check_fn<'a, 'tcx>(
     let ret_ty =
         fcx.register_infer_ok_obligations(fcx.infcx.replace_opaque_types_with_inference_vars(
             declared_ret_ty,
-            body.value.hir_id,
+            fn_def_id,
             decl.output.span(),
-            param_env,
+            fcx.param_env,
         ));
-    // If we replaced declared_ret_ty with infer vars, then we must be inferring
-    // an opaque type, so set a flag so we can improve diagnostics.
-    fcx.return_type_has_opaque = ret_ty != declared_ret_ty;
 
     fcx.ret_coercion = Some(RefCell::new(CoerceMany::new(ret_ty)));
 
@@ -61,45 +54,15 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     fn_maybe_err(tcx, span, fn_sig.abi);
 
-    if fn_sig.abi == Abi::RustCall {
-        let expected_args = if let ImplicitSelfKind::None = decl.implicit_self { 1 } else { 2 };
-
-        let err = || {
-            let item = match tcx.hir().get(fn_id) {
-                Node::Item(hir::Item { kind: ItemKind::Fn(header, ..), .. }) => Some(header),
-                Node::ImplItem(hir::ImplItem {
-                    kind: hir::ImplItemKind::Fn(header, ..), ..
-                }) => Some(header),
-                Node::TraitItem(hir::TraitItem {
-                    kind: hir::TraitItemKind::Fn(header, ..),
-                    ..
-                }) => Some(header),
-                // Closures are RustCall, but they tuple their arguments, so shouldn't be checked
-                Node::Expr(hir::Expr { kind: hir::ExprKind::Closure { .. }, .. }) => None,
-                node => bug!("Item being checked wasn't a function/closure: {:?}", node),
-            };
-
-            if let Some(header) = item {
-                tcx.sess.span_err(header.span, "functions with the \"rust-call\" ABI must take a single non-self argument that is a tuple");
-            }
-        };
-
-        if fn_sig.inputs().len() != expected_args {
-            err()
+    if let Some(kind) = body.generator_kind && can_be_generator.is_some() {
+        let yield_ty = if kind == hir::GeneratorKind::Gen {
+            let yield_ty = fcx
+                .next_ty_var(TypeVariableOrigin { kind: TypeVariableOriginKind::TypeInference, span });
+            fcx.require_type_is_sized(yield_ty, span, traits::SizedYieldType);
+            yield_ty
         } else {
-            // FIXME(CraftSpider) Add a check on parameter expansion, so we don't just make the ICE happen later on
-            //   This will probably require wide-scale changes to support a TupleKind obligation
-            //   We can't resolve this without knowing the type of the param
-            if !matches!(fn_sig.inputs()[expected_args - 1].kind(), ty::Tuple(_) | ty::Param(_)) {
-                err()
-            }
-        }
-    }
-
-    if body.generator_kind.is_some() && can_be_generator.is_some() {
-        let yield_ty = fcx
-            .next_ty_var(TypeVariableOrigin { kind: TypeVariableOriginKind::TypeInference, span });
-        fcx.require_type_is_sized(yield_ty, span, traits::SizedYieldType);
+            tcx.mk_unit()
+        };
 
         // Resume type defaults to `()` if the generator has no argument.
         let resume_ty = fn_sig.inputs().get(0).copied().unwrap_or_else(|| tcx.mk_unit());
@@ -111,15 +74,13 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
     // (as it's created inside the body itself, not passed in from outside).
-    let maybe_va_list = if fn_sig.c_variadic {
+    let maybe_va_list = fn_sig.c_variadic.then(|| {
         let span = body.params.last().unwrap().span;
         let va_list_did = tcx.require_lang_item(LangItem::VaList, Some(span));
         let region = fcx.next_region_var(RegionVariableOrigin::MiscVariable(span));
 
-        Some(tcx.bound_type_of(va_list_did).subst(tcx, &[region.into()]))
-    } else {
-        None
-    };
+        tcx.type_of(va_list_did).subst(tcx, &[region.into()])
+    });
 
     // Add formal parameters.
     let inputs_hir = hir.fn_decl_by_hir_id(fn_id).map(|decl| &decl.inputs);
@@ -127,7 +88,7 @@ pub(super) fn check_fn<'a, 'tcx>(
     for (idx, (param_ty, param)) in inputs_fn.chain(maybe_va_list).zip(body.params).enumerate() {
         // Check the pattern.
         let ty_span = try { inputs_hir?.get(idx)?.span };
-        fcx.check_pat_top(&param.pat, param_ty, ty_span, false);
+        fcx.check_pat_top(&param.pat, param_ty, ty_span, None);
 
         // Check that argument is Sized.
         // The check for a non-trivial pattern is a hack to avoid duplicate warnings
@@ -140,10 +101,9 @@ pub(super) fn check_fn<'a, 'tcx>(
         fcx.write_ty(param.hir_id, param_ty);
     }
 
-    inherited.typeck_results.borrow_mut().liberated_fn_sigs_mut().insert(fn_id, fn_sig);
+    fcx.typeck_results.borrow_mut().liberated_fn_sigs_mut().insert(fn_id, fn_sig);
 
-    fcx.in_tail_expr = true;
-    if let ty::Dynamic(..) = declared_ret_ty.kind() {
+    if let ty::Dynamic(_, _, ty::Dyn) = declared_ret_ty.kind() {
         // FIXME: We need to verify that the return type is `Sized` after the return expression has
         // been evaluated so that we have types available for all the nodes being returned, but that
         // requires the coerced evaluated type to be stored. Moving `check_return_expr` before this
@@ -161,7 +121,6 @@ pub(super) fn check_fn<'a, 'tcx>(
         fcx.require_type_is_sized(declared_ret_ty, decl.output.span(), traits::SizedReturnType);
         fcx.check_return_expr(&body.value, false);
     }
-    fcx.in_tail_expr = false;
 
     // We insert the deferred_generator_interiors entry after visiting the body.
     // This ensures that all nested generators appear before the entry of this generator.
@@ -169,7 +128,12 @@ pub(super) fn check_fn<'a, 'tcx>(
     let gen_ty = if let (Some(_), Some(gen_kind)) = (can_be_generator, body.generator_kind) {
         let interior = fcx
             .next_ty_var(TypeVariableOrigin { kind: TypeVariableOriginKind::MiscVariable, span });
-        fcx.deferred_generator_interiors.borrow_mut().push((body.id(), interior, gen_kind));
+        fcx.deferred_generator_interiors.borrow_mut().push((
+            fn_def_id,
+            body.id(),
+            interior,
+            gen_kind,
+        ));
 
         let (resume_ty, yield_ty) = fcx.resume_yield_tys.unwrap();
         Some(GeneratorTypes {
@@ -206,12 +170,16 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     // Check that a function marked as `#[panic_handler]` has signature `fn(&PanicInfo) -> !`
     if let Some(panic_impl_did) = tcx.lang_items().panic_impl()
-        && panic_impl_did == hir.local_def_id(fn_id).to_def_id()
+        && panic_impl_did == fn_def_id.to_def_id()
     {
         check_panic_info_fn(tcx, panic_impl_did.expect_local(), fn_sig, decl, declared_ret_ty);
     }
 
-    (fcx, gen_ty)
+    if let Some(lang_start_defid) = tcx.lang_items().start_fn() && lang_start_defid == fn_def_id.to_def_id() {
+        check_lang_start_fn(tcx, fn_sig, decl, fn_def_id);
+    }
+
+    gen_ty
 }
 
 fn check_panic_info_fn(
@@ -239,7 +207,7 @@ fn check_panic_info_fn(
     let arg_is_panic_info = match *inputs[0].kind() {
         ty::Ref(region, ty, mutbl) => match *ty.kind() {
             ty::Adt(ref adt, _) => {
-                adt.did() == panic_info_did && mutbl == hir::Mutability::Not && !region.is_static()
+                adt.did() == panic_info_did && mutbl.is_not() && !region.is_static()
             }
             _ => false,
         },
@@ -264,5 +232,126 @@ fn check_panic_info_fn(
     if generic_counts.consts != 0 {
         let span = tcx.def_span(fn_id);
         tcx.sess.span_err(span, "should have no const parameters");
+    }
+}
+
+fn check_lang_start_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_sig: ty::FnSig<'tcx>,
+    decl: &'tcx hir::FnDecl<'tcx>,
+    def_id: LocalDefId,
+) {
+    let inputs = fn_sig.inputs();
+
+    let arg_count = inputs.len();
+    if arg_count != 4 {
+        tcx.sess.emit_err(LangStartIncorrectNumberArgs {
+            params_span: tcx.def_span(def_id),
+            found_param_count: arg_count,
+        });
+    }
+
+    // only check args if they should exist by checking the count
+    // note: this does not handle args being shifted or their order swapped very nicely
+    // but it's a lang item, users shouldn't frequently encounter this
+
+    // first arg is `main: fn() -> T`
+    if let Some(&main_arg) = inputs.get(0) {
+        // make a Ty for the generic on the fn for diagnostics
+        // FIXME: make the lang item generic checks check for the right generic *kind*
+        // for example `start`'s generic should be a type parameter
+        let generics = tcx.generics_of(def_id);
+        let fn_generic = generics.param_at(0, tcx);
+        let generic_ty = tcx.mk_ty_param(fn_generic.index, fn_generic.name);
+        let expected_fn_sig =
+            tcx.mk_fn_sig([], generic_ty, false, hir::Unsafety::Normal, Abi::Rust);
+        let expected_ty = tcx.mk_fn_ptr(Binder::dummy(expected_fn_sig));
+
+        // we emit the same error to suggest changing the arg no matter what's wrong with the arg
+        let emit_main_fn_arg_err = || {
+            tcx.sess.emit_err(LangStartIncorrectParam {
+                param_span: decl.inputs[0].span,
+                param_num: 1,
+                expected_ty: expected_ty,
+                found_ty: main_arg,
+            });
+        };
+
+        if let ty::FnPtr(main_fn_sig) = main_arg.kind() {
+            let main_fn_inputs = main_fn_sig.inputs();
+            if main_fn_inputs.iter().count() != 0 {
+                emit_main_fn_arg_err();
+            }
+
+            let output = main_fn_sig.output();
+            output.map_bound(|ret_ty| {
+                // if the output ty is a generic, it's probably the right one
+                if !matches!(ret_ty.kind(), ty::Param(_)) {
+                    emit_main_fn_arg_err();
+                }
+            });
+        } else {
+            emit_main_fn_arg_err();
+        }
+    }
+
+    // second arg is isize
+    if let Some(&argc_arg) = inputs.get(1) {
+        if argc_arg != tcx.types.isize {
+            tcx.sess.emit_err(LangStartIncorrectParam {
+                param_span: decl.inputs[1].span,
+                param_num: 2,
+                expected_ty: tcx.types.isize,
+                found_ty: argc_arg,
+            });
+        }
+    }
+
+    // third arg is `*const *const u8`
+    if let Some(&argv_arg) = inputs.get(2) {
+        let mut argv_is_okay = false;
+        if let ty::RawPtr(outer_ptr) = argv_arg.kind() {
+            if outer_ptr.mutbl.is_not() {
+                if let ty::RawPtr(inner_ptr) = outer_ptr.ty.kind() {
+                    if inner_ptr.mutbl.is_not() && inner_ptr.ty == tcx.types.u8 {
+                        argv_is_okay = true;
+                    }
+                }
+            }
+        }
+
+        if !argv_is_okay {
+            let inner_ptr_ty =
+                tcx.mk_ptr(ty::TypeAndMut { mutbl: hir::Mutability::Not, ty: tcx.types.u8 });
+            let expected_ty =
+                tcx.mk_ptr(ty::TypeAndMut { mutbl: hir::Mutability::Not, ty: inner_ptr_ty });
+            tcx.sess.emit_err(LangStartIncorrectParam {
+                param_span: decl.inputs[2].span,
+                param_num: 3,
+                expected_ty,
+                found_ty: argv_arg,
+            });
+        }
+    }
+
+    // fourth arg is `sigpipe: u8`
+    if let Some(&sigpipe_arg) = inputs.get(3) {
+        if sigpipe_arg != tcx.types.u8 {
+            tcx.sess.emit_err(LangStartIncorrectParam {
+                param_span: decl.inputs[3].span,
+                param_num: 4,
+                expected_ty: tcx.types.u8,
+                found_ty: sigpipe_arg,
+            });
+        }
+    }
+
+    // output type is isize
+    if fn_sig.output() != tcx.types.isize {
+        tcx.sess.emit_err(LangStartIncorrectRetTy {
+            ret_span: decl.output.span(),
+            expected_ty: tcx.types.isize,
+            found_ty: fn_sig.output(),
+        });
     }
 }

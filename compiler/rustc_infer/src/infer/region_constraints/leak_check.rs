@@ -1,6 +1,7 @@
 use super::*;
 use crate::infer::CombinedSnapshot;
 use rustc_data_structures::{
+    fx::FxIndexMap,
     graph::{scc::Sccs, vec_graph::VecGraph},
     undo_log::UndoLogs,
 };
@@ -279,7 +280,7 @@ impl<'me, 'tcx> LeakCheck<'me, 'tcx> {
         placeholder1: ty::PlaceholderRegion,
         placeholder2: ty::PlaceholderRegion,
     ) -> TypeError<'tcx> {
-        self.error(placeholder1, self.tcx.mk_region(ty::RePlaceholder(placeholder2)))
+        self.error(placeholder1, self.tcx.mk_re_placeholder(placeholder2))
     }
 
     fn error(
@@ -356,22 +357,20 @@ impl<'tcx> SccUniverse<'tcx> {
 }
 
 rustc_index::newtype_index! {
-    struct LeakCheckNode {
-        DEBUG_FORMAT = "LeakCheckNode({})"
-    }
+    #[debug_format = "LeakCheckNode({})"]
+    struct LeakCheckNode {}
 }
 
 rustc_index::newtype_index! {
-    struct LeakCheckScc {
-        DEBUG_FORMAT = "LeakCheckScc({})"
-    }
+    #[debug_format = "LeakCheckScc({})"]
+    struct LeakCheckScc {}
 }
 
 /// Represents the graph of constraints. For each `R1: R2` constraint we create
 /// an edge `R1 -> R2` in the graph.
 struct MiniGraph<'tcx> {
     /// Map from a region to the index of the node in the graph.
-    nodes: FxHashMap<ty::Region<'tcx>, LeakCheckNode>,
+    nodes: FxIndexMap<ty::Region<'tcx>, LeakCheckNode>,
 
     /// Map from node index to SCC, and stores the successors of each SCC. All
     /// the regions in the same SCC are equal to one another, and if `S1 -> S2`,
@@ -388,7 +387,7 @@ impl<'tcx> MiniGraph<'tcx> {
     where
         'tcx: 'a,
     {
-        let mut nodes = FxHashMap::default();
+        let mut nodes = FxIndexMap::default();
         let mut edges = Vec::new();
 
         // Note that if `R2: R1`, we get a callback `r1, r2`, so `target` is first parameter.
@@ -414,19 +413,19 @@ impl<'tcx> MiniGraph<'tcx> {
         for undo_entry in undo_log {
             match undo_entry {
                 &AddConstraint(Constraint::VarSubVar(a, b)) => {
-                    each_edge(tcx.mk_region(ReVar(a)), tcx.mk_region(ReVar(b)));
+                    each_edge(tcx.mk_re_var(a), tcx.mk_re_var(b));
                 }
                 &AddConstraint(Constraint::RegSubVar(a, b)) => {
-                    each_edge(a, tcx.mk_region(ReVar(b)));
+                    each_edge(a, tcx.mk_re_var(b));
                 }
                 &AddConstraint(Constraint::VarSubReg(a, b)) => {
-                    each_edge(tcx.mk_region(ReVar(a)), b);
+                    each_edge(tcx.mk_re_var(a), b);
                 }
                 &AddConstraint(Constraint::RegSubReg(a, b)) => {
                     each_edge(a, b);
                 }
                 &AddGiven(a, b) => {
-                    each_edge(a, tcx.mk_region(ReVar(b)));
+                    each_edge(a, tcx.mk_re_var(b));
                 }
                 &AddVerify(i) => span_bug!(
                     verifys[i].origin.span(),
@@ -438,7 +437,7 @@ impl<'tcx> MiniGraph<'tcx> {
     }
 
     fn add_node(
-        nodes: &mut FxHashMap<ty::Region<'tcx>, LeakCheckNode>,
+        nodes: &mut FxIndexMap<ty::Region<'tcx>, LeakCheckNode>,
         r: ty::Region<'tcx>,
     ) -> LeakCheckNode {
         let l = nodes.len();

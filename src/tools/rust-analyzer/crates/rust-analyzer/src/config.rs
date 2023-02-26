@@ -33,7 +33,7 @@ use crate::{
     caps::completion_item_edit_resolve,
     diagnostics::DiagnosticsMapConfig,
     line_index::PositionEncoding,
-    lsp_ext::{self, supports_utf8, WorkspaceSymbolSearchKind, WorkspaceSymbolSearchScope},
+    lsp_ext::{self, negotiated_encoding, WorkspaceSymbolSearchKind, WorkspaceSymbolSearchScope},
 };
 
 mod patch_old_style;
@@ -56,6 +56,9 @@ mod patch_old_style;
 // parsing the old name.
 config_data! {
     struct ConfigData {
+        /// Whether to insert #[must_use] when generating `as_` methods
+        /// for enum variants.
+        assist_emitMustUse: bool               = "false",
         /// Placeholder expression to use for missing expressions in assists.
         assist_expressionFillDefault: ExprFillDefaultDef              = "\"todo\"",
 
@@ -114,27 +117,35 @@ config_data! {
         ///
         /// This option does not take effect until rust-analyzer is restarted.
         cargo_sysroot: Option<String>    = "\"discover\"",
+        /// Relative path to the sysroot library sources. If left unset, this will default to
+        /// `{cargo.sysroot}/lib/rustlib/src/rust/library`.
+        ///
+        /// This option does not take effect until rust-analyzer is restarted.
+        cargo_sysrootSrc: Option<String>    = "null",
         /// Compilation target override (target triple).
+        // FIXME(@poliorcetics): move to multiple targets here too, but this will need more work
+        // than `checkOnSave_target`
         cargo_target: Option<String>     = "null",
         /// Unsets `#[cfg(test)]` for the specified crates.
-        cargo_unsetTest: Vec<String>   = "[\"core\"]",
+        cargo_unsetTest: Vec<String>     = "[\"core\"]",
+
+        /// Run the check command for diagnostics on save.
+        checkOnSave | checkOnSave_enable: bool                         = "true",
 
         /// Check all targets and tests (`--all-targets`).
-        checkOnSave_allTargets: bool                     = "true",
+        check_allTargets | checkOnSave_allTargets: bool                  = "true",
         /// Cargo command to use for `cargo check`.
-        checkOnSave_command: String                      = "\"check\"",
-        /// Run specified `cargo check` command for diagnostics on save.
-        checkOnSave_enable: bool                         = "true",
+        check_command | checkOnSave_command: String                      = "\"check\"",
         /// Extra arguments for `cargo check`.
-        checkOnSave_extraArgs: Vec<String>               = "[]",
+        check_extraArgs | checkOnSave_extraArgs: Vec<String>             = "[]",
         /// Extra environment variables that will be set when running `cargo check`.
         /// Extends `#rust-analyzer.cargo.extraEnv#`.
-        checkOnSave_extraEnv: FxHashMap<String, String> = "{}",
+        check_extraEnv | checkOnSave_extraEnv: FxHashMap<String, String> = "{}",
         /// List of features to activate. Defaults to
         /// `#rust-analyzer.cargo.features#`.
         ///
         /// Set to `"all"` to pass `--all-features` to Cargo.
-        checkOnSave_features: Option<CargoFeaturesDef>      = "null",
+        check_features | checkOnSave_features: Option<CargoFeaturesDef>  = "null",
         /// Specifies the working directory for running checks.
         /// - "workspace": run checks for workspaces in the corresponding workspaces' root directories.
         // FIXME: Ideally we would support this in some way
@@ -142,19 +153,21 @@ config_data! {
         /// - "root": run checks in the project's root directory.
         /// This config only has an effect when `#rust-analyzer.cargo.buildScripts.overrideCommand#`
         /// is set.
-        checkOnSave_invocationLocation: InvocationLocation = "\"workspace\"",
+        check_invocationLocation | checkOnSave_invocationLocation: InvocationLocation = "\"workspace\"",
         /// Specifies the invocation strategy to use when running the checkOnSave command.
         /// If `per_workspace` is set, the command will be executed for each workspace.
         /// If `once` is set, the command will be executed once.
         /// This config only has an effect when `#rust-analyzer.cargo.buildScripts.overrideCommand#`
         /// is set.
-        checkOnSave_invocationStrategy: InvocationStrategy = "\"per_workspace\"",
+        check_invocationStrategy | checkOnSave_invocationStrategy: InvocationStrategy = "\"per_workspace\"",
         /// Whether to pass `--no-default-features` to Cargo. Defaults to
         /// `#rust-analyzer.cargo.noDefaultFeatures#`.
-        checkOnSave_noDefaultFeatures: Option<bool>      = "null",
+        check_noDefaultFeatures | checkOnSave_noDefaultFeatures: Option<bool>         = "null",
         /// Override the command rust-analyzer uses instead of `cargo check` for
         /// diagnostics on save. The command is required to output json and
-        /// should therefor include `--message-format=json` or a similar option.
+        /// should therefore include `--message-format=json` or a similar option
+        /// (if your client supports the `colorDiagnosticOutput` experimental
+        /// capability, you can use `--message-format=json-diagnostic-rendered-ansi`).
         ///
         /// If you're changing this because you're using some tool wrapping
         /// Cargo, you might also want to change
@@ -170,10 +183,14 @@ config_data! {
         /// cargo check --workspace --message-format=json --all-targets
         /// ```
         /// .
-        checkOnSave_overrideCommand: Option<Vec<String>> = "null",
-        /// Check for a specific target. Defaults to
-        /// `#rust-analyzer.cargo.target#`.
-        checkOnSave_target: Option<String>               = "null",
+        check_overrideCommand | checkOnSave_overrideCommand: Option<Vec<String>>             = "null",
+        /// Check for specific targets. Defaults to `#rust-analyzer.cargo.target#` if empty.
+        ///
+        /// Can be a single target, e.g. `"x86_64-unknown-linux-gnu"` or a list of targets, e.g.
+        /// `["aarch64-apple-darwin", "x86_64-apple-darwin"]`.
+        ///
+        /// Aliased as `"checkOnSave.targets"`.
+        check_targets | checkOnSave_targets | checkOnSave_target: Option<CheckOnSaveTargets> = "null",
 
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
@@ -183,6 +200,8 @@ config_data! {
         completion_autoself_enable: bool        = "true",
         /// Whether to add parenthesis and argument snippets when completing function.
         completion_callable_snippets: CallableCompletionDef  = "\"fill_arguments\"",
+        /// Maximum number of completions to return. If `None`, the limit is infinite.
+        completion_limit: Option<usize> = "null",
         /// Whether to show postfix snippets like `dbg`, `if`, `not`, etc.
         completion_postfix_enable: bool         = "true",
         /// Enables completions of private items and fields that are defined in the current workspace even if they are not visible at the current position.
@@ -258,6 +277,7 @@ config_data! {
         files_excludeDirs: Vec<PathBuf> = "[]",
         /// Controls file watching implementation.
         files_watcher: FilesWatcherDef = "\"client\"",
+
         /// Enables highlighting of related references while the cursor is on `break`, `loop`, `while`, or `for` keywords.
         highlightRelated_breakPoints_enable: bool = "true",
         /// Enables highlighting of all exit points while the cursor is on any `return`, `?`, `fn`, or return type arrow (`->`).
@@ -317,6 +337,14 @@ config_data! {
         inlayHints_closingBraceHints_minLines: usize               = "25",
         /// Whether to show inlay type hints for return types of closures.
         inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef  = "\"never\"",
+        /// Whether to show enum variant discriminant hints.
+        inlayHints_discriminantHints_enable: DiscriminantHintsDef            = "\"never\"",
+        /// Whether to show inlay hints for type adjustments.
+        inlayHints_expressionAdjustmentHints_enable: AdjustmentHintsDef = "\"never\"",
+        /// Whether to hide inlay hints for type adjustments outside of `unsafe` blocks.
+        inlayHints_expressionAdjustmentHints_hideOutsideUnsafe: bool = "false",
+        /// Whether to show inlay hints as postfix ops (`.*` instead of `*`, etc).
+        inlayHints_expressionAdjustmentHints_mode: AdjustmentHintsModeDef = "\"prefix\"",
         /// Whether to show inlay type hints for elided lifetimes in function signatures.
         inlayHints_lifetimeElisionHints_enable: LifetimeElisionDef = "\"never\"",
         /// Whether to prefer using parameter names as the name for elided lifetime hints if possible.
@@ -326,7 +354,8 @@ config_data! {
         /// Whether to show function parameter name inlay hints at the call
         /// site.
         inlayHints_parameterHints_enable: bool                     = "true",
-        /// Whether to show inlay type hints for compiler inserted reborrows.
+        /// Whether to show inlay hints for compiler inserted reborrows.
+        /// This setting is deprecated in favor of #rust-analyzer.inlayHints.expressionAdjustmentHints.enable#.
         inlayHints_reborrowHints_enable: ReborrowHintsDef          = "\"never\"",
         /// Whether to render leading colons for type hints, and trailing colons for parameter hints.
         inlayHints_renderColons: bool                              = "true",
@@ -389,6 +418,9 @@ config_data! {
 
         /// Whether to show `can't find Cargo.toml` error message.
         notifications_cargoTomlNotFound: bool      = "true",
+
+        /// How many worker threads in the main loop. The default `null` means to pick automatically.
+        numThreads: Option<usize> = "null",
 
         /// Expand attribute macros. Requires `#rust-analyzer.procMacro.enable#` to be set.
         procMacro_attributes_enable: bool = "true",
@@ -494,6 +526,7 @@ impl Default for ConfigData {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub discovered_projects: Option<Vec<ProjectManifest>>,
+    pub workspace_roots: Vec<AbsPathBuf>,
     caps: lsp_types::ClientCapabilities,
     root_path: AbsPathBuf,
     data: ConfigData,
@@ -690,7 +723,11 @@ impl fmt::Display for ConfigUpdateError {
 }
 
 impl Config {
-    pub fn new(root_path: AbsPathBuf, caps: ClientCapabilities) -> Self {
+    pub fn new(
+        root_path: AbsPathBuf,
+        caps: ClientCapabilities,
+        workspace_roots: Vec<AbsPathBuf>,
+    ) -> Self {
         Config {
             caps,
             data: ConfigData::default(),
@@ -698,7 +735,17 @@ impl Config {
             discovered_projects: None,
             root_path,
             snippets: Default::default(),
+            workspace_roots,
         }
+    }
+
+    pub fn rediscover_workspaces(&mut self) {
+        let discovered = ProjectManifest::discover_all(&self.workspace_roots);
+        tracing::info!("discovered projects: {:?}", discovered);
+        if discovered.is_empty() {
+            tracing::error!("failed to find any projects in {:?}", &self.workspace_roots);
+        }
+        self.discovered_projects = Some(discovered);
     }
 
     pub fn update(&mut self, mut json: serde_json::Value) -> Result<(), ConfigUpdateError> {
@@ -754,9 +801,9 @@ impl Config {
 
     fn validate(&self, error_sink: &mut Vec<(String, serde_json::Error)>) {
         use serde::de::Error;
-        if self.data.checkOnSave_command.is_empty() {
+        if self.data.check_command.is_empty() {
             error_sink.push((
-                "/checkOnSave/command".to_string(),
+                "/check/command".to_string(),
                 serde_json::Error::custom("expected a non-empty string"),
             ));
         }
@@ -797,6 +844,9 @@ macro_rules! try_or_def {
 }
 
 impl Config {
+    pub fn has_linked_projects(&self) -> bool {
+        !self.data.linkedProjects.is_empty()
+    }
     pub fn linked_projects(&self) -> Vec<LinkedProject> {
         match self.data.linkedProjects.as_slice() {
             [] => match self.discovered_projects.as_ref() {
@@ -949,11 +999,7 @@ impl Config {
     }
 
     pub fn position_encoding(&self) -> PositionEncoding {
-        if supports_utf8(&self.caps) {
-            PositionEncoding::Utf8
-        } else {
-            PositionEncoding::Utf16
-        }
+        negotiated_encoding(&self.caps)
     }
 
     fn experimental(&self, index: &'static str) -> bool {
@@ -964,8 +1010,17 @@ impl Config {
         self.experimental("codeActionGroup")
     }
 
+    pub fn open_server_logs(&self) -> bool {
+        self.experimental("openServerLogs")
+    }
+
     pub fn server_status_notification(&self) -> bool {
         self.experimental("serverStatusNotification")
+    }
+
+    /// Whether the client supports colored output for full diagnostics from `checkOnSave`.
+    pub fn color_diagnostic_output(&self) -> bool {
+        self.experimental("colorDiagnosticOutput")
     }
 
     pub fn publish_diagnostics(&self) -> bool {
@@ -999,9 +1054,9 @@ impl Config {
         &self.data.cargo_extraEnv
     }
 
-    pub fn check_on_save_extra_env(&self) -> FxHashMap<String, String> {
+    pub fn check_extra_env(&self) -> FxHashMap<String, String> {
         let mut extra_env = self.data.cargo_extraEnv.clone();
-        extra_env.extend(self.data.checkOnSave_extraEnv.clone());
+        extra_env.extend(self.data.check_extraEnv.clone());
         extra_env
     }
 
@@ -1069,6 +1124,8 @@ impl Config {
                 RustcSource::Path(self.root_path.join(sysroot))
             }
         });
+        let sysroot_src =
+            self.data.cargo_sysrootSrc.as_ref().map(|sysroot| self.root_path.join(sysroot));
 
         CargoConfig {
             features: match &self.data.cargo_features {
@@ -1080,6 +1137,7 @@ impl Config {
             },
             target: self.data.cargo_target.clone(),
             sysroot,
+            sysroot_src,
             rustc_source,
             unset_test_crates: UnsetTestCrates::Only(self.data.cargo_unsetTest.clone()),
             wrap_rustc_in_build_scripts: self.data.cargo_buildScripts_useRustcWrapper,
@@ -1112,25 +1170,22 @@ impl Config {
         }
     }
 
-    pub fn flycheck(&self) -> Option<FlycheckConfig> {
-        if !self.data.checkOnSave_enable {
-            return None;
-        }
-        let flycheck_config = match &self.data.checkOnSave_overrideCommand {
+    pub fn flycheck(&self) -> FlycheckConfig {
+        match &self.data.check_overrideCommand {
             Some(args) if !args.is_empty() => {
                 let mut args = args.clone();
                 let command = args.remove(0);
                 FlycheckConfig::CustomCommand {
                     command,
                     args,
-                    extra_env: self.check_on_save_extra_env(),
-                    invocation_strategy: match self.data.checkOnSave_invocationStrategy {
+                    extra_env: self.check_extra_env(),
+                    invocation_strategy: match self.data.check_invocationStrategy {
                         InvocationStrategy::Once => flycheck::InvocationStrategy::Once,
                         InvocationStrategy::PerWorkspace => {
                             flycheck::InvocationStrategy::PerWorkspace
                         }
                     },
-                    invocation_location: match self.data.checkOnSave_invocationLocation {
+                    invocation_location: match self.data.check_invocationLocation {
                         InvocationLocation::Root => {
                             flycheck::InvocationLocation::Root(self.root_path.clone())
                         }
@@ -1139,35 +1194,43 @@ impl Config {
                 }
             }
             Some(_) | None => FlycheckConfig::CargoCommand {
-                command: self.data.checkOnSave_command.clone(),
-                target_triple: self
+                command: self.data.check_command.clone(),
+                target_triples: self
                     .data
-                    .checkOnSave_target
+                    .check_targets
                     .clone()
-                    .or_else(|| self.data.cargo_target.clone()),
-                all_targets: self.data.checkOnSave_allTargets,
+                    .and_then(|targets| match &targets.0[..] {
+                        [] => None,
+                        targets => Some(targets.into()),
+                    })
+                    .unwrap_or_else(|| self.data.cargo_target.clone().into_iter().collect()),
+                all_targets: self.data.check_allTargets,
                 no_default_features: self
                     .data
-                    .checkOnSave_noDefaultFeatures
+                    .check_noDefaultFeatures
                     .unwrap_or(self.data.cargo_noDefaultFeatures),
                 all_features: matches!(
-                    self.data.checkOnSave_features.as_ref().unwrap_or(&self.data.cargo_features),
+                    self.data.check_features.as_ref().unwrap_or(&self.data.cargo_features),
                     CargoFeaturesDef::All
                 ),
                 features: match self
                     .data
-                    .checkOnSave_features
+                    .check_features
                     .clone()
                     .unwrap_or_else(|| self.data.cargo_features.clone())
                 {
                     CargoFeaturesDef::All => vec![],
                     CargoFeaturesDef::Selected(it) => it,
                 },
-                extra_args: self.data.checkOnSave_extraArgs.clone(),
-                extra_env: self.check_on_save_extra_env(),
+                extra_args: self.data.check_extraArgs.clone(),
+                extra_env: self.check_extra_env(),
+                ansi_color_output: self.color_diagnostic_output(),
             },
-        };
-        Some(flycheck_config)
+        }
+    }
+
+    pub fn check_on_save(&self) -> bool {
+        self.data.checkOnSave
     }
 
     pub fn runnables(&self) -> RunnablesConfig {
@@ -1183,6 +1246,11 @@ impl Config {
             type_hints: self.data.inlayHints_typeHints_enable,
             parameter_hints: self.data.inlayHints_parameterHints_enable,
             chaining_hints: self.data.inlayHints_chainingHints_enable,
+            discriminant_hints: match self.data.inlayHints_discriminantHints_enable {
+                DiscriminantHintsDef::Always => ide::DiscriminantHints::Always,
+                DiscriminantHintsDef::Never => ide::DiscriminantHints::Never,
+                DiscriminantHintsDef::Fieldless => ide::DiscriminantHints::Fieldless,
+            },
             closure_return_type_hints: match self.data.inlayHints_closureReturnTypeHints_enable {
                 ClosureReturnTypeHintsDef::Always => ide::ClosureReturnTypeHints::Always,
                 ClosureReturnTypeHintsDef::Never => ide::ClosureReturnTypeHints::Never,
@@ -1197,11 +1265,25 @@ impl Config {
             hide_closure_initialization_hints: self
                 .data
                 .inlayHints_typeHints_hideClosureInitialization,
-            reborrow_hints: match self.data.inlayHints_reborrowHints_enable {
-                ReborrowHintsDef::Always => ide::ReborrowHints::Always,
-                ReborrowHintsDef::Never => ide::ReborrowHints::Never,
-                ReborrowHintsDef::Mutable => ide::ReborrowHints::MutableOnly,
+            adjustment_hints: match self.data.inlayHints_expressionAdjustmentHints_enable {
+                AdjustmentHintsDef::Always => ide::AdjustmentHints::Always,
+                AdjustmentHintsDef::Never => match self.data.inlayHints_reborrowHints_enable {
+                    ReborrowHintsDef::Always | ReborrowHintsDef::Mutable => {
+                        ide::AdjustmentHints::ReborrowOnly
+                    }
+                    ReborrowHintsDef::Never => ide::AdjustmentHints::Never,
+                },
+                AdjustmentHintsDef::Reborrow => ide::AdjustmentHints::ReborrowOnly,
             },
+            adjustment_hints_mode: match self.data.inlayHints_expressionAdjustmentHints_mode {
+                AdjustmentHintsModeDef::Prefix => ide::AdjustmentHintsMode::Prefix,
+                AdjustmentHintsModeDef::Postfix => ide::AdjustmentHintsMode::Postfix,
+                AdjustmentHintsModeDef::PreferPrefix => ide::AdjustmentHintsMode::PreferPrefix,
+                AdjustmentHintsModeDef::PreferPostfix => ide::AdjustmentHintsMode::PreferPostfix,
+            },
+            adjustment_hints_hide_outside_unsafe: self
+                .data
+                .inlayHints_expressionAdjustmentHints_hideOutsideUnsafe,
             binding_mode_hints: self.data.inlayHints_bindingModeHints_enable,
             param_names_for_lifetime_elision_hints: self
                 .data
@@ -1259,6 +1341,7 @@ impl Config {
                     .snippet_support?
             )),
             snippets: self.snippets.clone(),
+            limit: self.data.completion_limit,
         }
     }
 
@@ -1276,6 +1359,7 @@ impl Config {
             allowed: None,
             insert_use: self.insert_use_config(),
             prefer_no_std: self.data.imports_prefer_no_std,
+            assist_emit_must_use: self.data.assist_emitMustUse,
         }
     }
 
@@ -1338,7 +1422,8 @@ impl Config {
     pub fn hover(&self) -> HoverConfig {
         HoverConfig {
             links_in_hover: self.data.hover_links_enable,
-            documentation: self.data.hover_documentation_enable.then(|| {
+            documentation: self.data.hover_documentation_enable,
+            format: {
                 let is_markdown = try_or_def!(self
                     .caps
                     .text_document
@@ -1354,7 +1439,7 @@ impl Config {
                 } else {
                     HoverDocFormat::PlainText
                 }
-            }),
+            },
             keywords: self.data.hover_documentation_keywords_enable,
         }
     }
@@ -1381,6 +1466,10 @@ impl Config {
 
     pub fn code_lens_refresh(&self) -> bool {
         try_or_def!(self.caps.workspace.as_ref()?.code_lens.as_ref()?.refresh_support?)
+    }
+
+    pub fn inlay_hints_refresh(&self) -> bool {
+        try_or_def!(self.caps.workspace.as_ref()?.inlay_hint.as_ref()?.refresh_support?)
     }
 
     pub fn insert_replace_support(&self) -> bool {
@@ -1429,6 +1518,10 @@ impl Config {
             0 => num_cpus::get_physical().try_into().unwrap_or(u8::MAX),
             n => n,
         }
+    }
+
+    pub fn main_loop_num_threads(&self) -> usize {
+        self.data.numThreads.unwrap_or(num_cpus::get_physical().try_into().unwrap_or(1))
     }
 
     pub fn typing_autoclose_angle(&self) -> bool {
@@ -1534,6 +1627,8 @@ mod de_unit_v {
     named_unit_variant!(all);
     named_unit_variant!(skip_trivial);
     named_unit_variant!(mutable);
+    named_unit_variant!(reborrow);
+    named_unit_variant!(fieldless);
     named_unit_variant!(with_block);
 }
 
@@ -1644,6 +1739,9 @@ enum InvocationStrategy {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+struct CheckOnSaveTargets(#[serde(deserialize_with = "single_or_array")] Vec<String>);
+
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 enum InvocationLocation {
     Root,
@@ -1681,6 +1779,37 @@ enum ReborrowHintsDef {
     Never,
     #[serde(deserialize_with = "de_unit_v::mutable")]
     Mutable,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum AdjustmentHintsDef {
+    #[serde(deserialize_with = "true_or_always")]
+    Always,
+    #[serde(deserialize_with = "false_or_never")]
+    Never,
+    #[serde(deserialize_with = "de_unit_v::reborrow")]
+    Reborrow,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum DiscriminantHintsDef {
+    #[serde(deserialize_with = "true_or_always")]
+    Always,
+    #[serde(deserialize_with = "false_or_never")]
+    Never,
+    #[serde(deserialize_with = "de_unit_v::fieldless")]
+    Fieldless,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+enum AdjustmentHintsModeDef {
+    Prefix,
+    Postfix,
+    PreferPrefix,
+    PreferPostfix,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1784,40 +1913,35 @@ fn get_field<T: DeserializeOwned>(
     alias: Option<&'static str>,
     default: &str,
 ) -> T {
-    let default = serde_json::from_str(default).unwrap();
     // XXX: check alias first, to work-around the VS Code where it pre-fills the
     // defaults instead of sending an empty object.
     alias
         .into_iter()
         .chain(iter::once(field))
-        .find_map(move |field| {
+        .filter_map(move |field| {
             let mut pointer = field.replace('_', "/");
             pointer.insert(0, '/');
-            json.pointer_mut(&pointer).and_then(|it| match serde_json::from_value(it.take()) {
-                Ok(it) => Some(it),
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize config field at {}: {:?}", pointer, e);
-                    error_sink.push((pointer, e));
-                    None
-                }
-            })
+            json.pointer_mut(&pointer)
+                .map(|it| serde_json::from_value(it.take()).map_err(|e| (e, pointer)))
         })
-        .unwrap_or(default)
+        .find(Result::is_ok)
+        .and_then(|res| match res {
+            Ok(it) => Some(it),
+            Err((e, pointer)) => {
+                tracing::warn!("Failed to deserialize config field at {}: {:?}", pointer, e);
+                error_sink.push((pointer, e));
+                None
+            }
+        })
+        .unwrap_or_else(|| serde_json::from_str(default).unwrap())
 }
 
 fn schema(fields: &[(&'static str, &'static str, &[&str], &str)]) -> serde_json::Value {
-    for ((f1, ..), (f2, ..)) in fields.iter().zip(&fields[1..]) {
-        fn key(f: &str) -> &str {
-            f.splitn(2, '_').next().unwrap()
-        }
-        assert!(key(f1) <= key(f2), "wrong field order: {:?} {:?}", f1, f2);
-    }
-
     let map = fields
         .iter()
         .map(|(field, ty, doc, default)| {
             let name = field.replace('_', ".");
-            let name = format!("rust-analyzer.{}", name);
+            let name = format!("rust-analyzer.{name}");
             let props = field_props(field, ty, doc, default);
             (name, props)
         })
@@ -1830,9 +1954,7 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
     let doc = doc.trim_end_matches('\n');
     assert!(
         doc.ends_with('.') && doc.starts_with(char::is_uppercase),
-        "bad docs for {}: {:?}",
-        field,
-        doc
+        "bad docs for {field}: {doc:?}"
     );
     let default = default.parse::<serde_json::Value>().unwrap();
 
@@ -1887,15 +2009,6 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         "Option<Vec<String>>" => set! {
             "type": ["null", "array"],
             "items": { "type": "string" },
-        },
-        "MergeBehaviorDef" => set! {
-            "type": "string",
-            "enum": ["none", "crate", "module"],
-            "enumDescriptions": [
-                "Do not merge imports at all.",
-                "Merge imports from the same crate into a single `use` statement.",
-                "Merge imports from the same module into a single `use` statement."
-            ],
         },
         "ExprFillDefaultDef" => set! {
             "type": "string",
@@ -1992,6 +2105,47 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 "Only show mutable reborrow hints."
             ]
         },
+        "AdjustmentHintsDef" => set! {
+            "type": "string",
+            "enum": [
+                "always",
+                "never",
+                "reborrow"
+            ],
+            "enumDescriptions": [
+                "Always show all adjustment hints.",
+                "Never show adjustment hints.",
+                "Only show auto borrow and dereference adjustment hints."
+            ]
+        },
+        "DiscriminantHintsDef" => set! {
+            "type": "string",
+            "enum": [
+                "always",
+                "never",
+                "fieldless"
+            ],
+            "enumDescriptions": [
+                "Always show all discriminant hints.",
+                "Never show discriminant hints.",
+                "Only show discriminant hints on fieldless enum variants."
+            ]
+        },
+        "AdjustmentHintsModeDef" => set! {
+            "type": "string",
+            "enum": [
+                "prefix",
+                "postfix",
+                "prefer_prefix",
+                "prefer_postfix",
+            ],
+            "enumDescriptions": [
+                "Always show adjustment hints as prefix (`*expr`).",
+                "Always show adjustment hints as postfix (`expr.*`).",
+                "Show prefix or postfix depending on which uses less parenthesis, prefering prefix.",
+                "Show prefix or postfix depending on which uses less parenthesis, prefering postfix.",
+            ]
+        },
         "CargoFeaturesDef" => set! {
             "anyOf": [
                 {
@@ -2080,7 +2234,21 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 "The command will be executed in the project root."
             ],
         },
-        _ => panic!("missing entry for {}: {}", ty, default),
+        "Option<CheckOnSaveTargets>" => set! {
+            "anyOf": [
+                {
+                    "type": "null"
+                },
+                {
+                    "type": "string",
+                },
+                {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+            ],
+        },
+        _ => panic!("missing entry for {ty}: {default}"),
     }
 
     map.into()
@@ -2092,30 +2260,29 @@ fn manual(fields: &[(&'static str, &'static str, &[&str], &str)]) -> String {
         .iter()
         .map(|(field, _ty, doc, default)| {
             let name = format!("rust-analyzer.{}", field.replace('_', "."));
-            let doc = doc_comment_to_string(*doc);
+            let doc = doc_comment_to_string(doc);
             if default.contains('\n') {
                 format!(
-                    r#"[[{}]]{}::
+                    r#"[[{name}]]{name}::
 +
 --
 Default:
 ----
-{}
+{default}
 ----
-{}
+{doc}
 --
-"#,
-                    name, name, default, doc
+"#
                 )
             } else {
-                format!("[[{}]]{} (default: `{}`)::\n+\n--\n{}--\n", name, name, default, doc)
+                format!("[[{name}]]{name} (default: `{default}`)::\n+\n--\n{doc}--\n")
             }
         })
         .collect::<String>()
 }
 
 fn doc_comment_to_string(doc: &[&str]) -> String {
-    doc.iter().map(|it| it.strip_prefix(' ').unwrap_or(it)).map(|it| format!("{}\n", it)).collect()
+    doc.iter().map(|it| it.strip_prefix(' ').unwrap_or(it)).map(|it| format!("{it}\n")).collect()
 }
 
 #[cfg(test)]
@@ -2129,7 +2296,7 @@ mod tests {
     #[test]
     fn generate_package_json_config() {
         let s = Config::json_schema();
-        let schema = format!("{:#}", s);
+        let schema = format!("{s:#}");
         let mut schema = schema
             .trim_start_matches('{')
             .trim_end_matches('}')

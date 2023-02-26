@@ -1,6 +1,6 @@
-use rustc_errors::{IntoDiagnosticArg, MultiSpan};
+use rustc_errors::MultiSpan;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{GenericArg, Ty};
 use rustc_span::Span;
 
 use crate::diagnostics::RegionName;
@@ -55,7 +55,7 @@ pub(crate) struct VarNeedNotMut {
 #[derive(Diagnostic)]
 #[diag(borrowck_var_cannot_escape_closure)]
 #[note]
-#[note(cannot_escape)]
+#[note(borrowck_cannot_escape)]
 pub(crate) struct FnMutError {
     #[primary_span]
     pub span: Span,
@@ -128,18 +128,6 @@ pub(crate) enum LifetimeReturnCategoryErr<'a> {
     },
 }
 
-impl IntoDiagnosticArg for &RegionName {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        format!("{}", self).into_diagnostic_arg()
-    }
-}
-
-impl IntoDiagnosticArg for RegionName {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        format!("{}", self).into_diagnostic_arg()
-    }
-}
-
 #[derive(Subdiagnostic)]
 pub(crate) enum RequireStaticErr {
     #[note(borrowck_used_impl_require_static)]
@@ -147,4 +135,107 @@ pub(crate) enum RequireStaticErr {
         #[primary_span]
         multi_span: MultiSpan,
     },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarPathUseCause {
+    #[label(borrowck_borrow_due_to_use_generator)]
+    BorrowInGenerator {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_use_due_to_use_generator)]
+    UseInGenerator {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_due_to_use_generator)]
+    AssignInGenerator {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_part_due_to_use_generator)]
+    AssignPartInGenerator {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_borrow_due_to_use_closure)]
+    BorrowInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_use_due_to_use_closure)]
+    UseInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_due_to_use_closure)]
+    AssignInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_part_due_to_use_closure)]
+    AssignPartInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarKind {
+    #[label(borrowck_capture_immute)]
+    Immute {
+        #[primary_span]
+        kind_span: Span,
+    },
+    #[label(borrowck_capture_mut)]
+    Mut {
+        #[primary_span]
+        kind_span: Span,
+    },
+    #[label(borrowck_capture_move)]
+    Move {
+        #[primary_span]
+        kind_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarCause {
+    #[label(borrowck_var_borrow_by_use_place_in_generator)]
+    BorrowUsePlaceGenerator {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_borrow_by_use_place_in_closure)]
+    BorrowUsePlaceClosure {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_cannot_move_when_borrowed, code = "E0505")]
+pub(crate) struct MoveBorrow<'a> {
+    pub place: &'a str,
+    pub borrow_place: &'a str,
+    pub value_place: &'a str,
+    #[primary_span]
+    #[label(borrowck_move_label)]
+    pub span: Span,
+    #[label]
+    pub borrow_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_opaque_type_non_generic_param, code = "E0792")]
+pub(crate) struct NonGenericOpaqueTypeParam<'a, 'tcx> {
+    pub ty: GenericArg<'tcx>,
+    pub kind: &'a str,
+    #[primary_span]
+    pub span: Span,
+    #[label]
+    pub param_span: Span,
 }
