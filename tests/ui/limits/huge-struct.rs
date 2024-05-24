@@ -1,11 +1,7 @@
-// build-fail
-// normalize-stderr-test "S32" -> "SXX"
-// normalize-stderr-test "S1M" -> "SXX"
-// error-pattern: too big for the current
-
-// FIXME https://github.com/rust-lang/rust/issues/59774
-// normalize-stderr-test "thread.*panicked.*Metadata module not compiled.*\n" -> ""
-// normalize-stderr-test "note:.*RUST_BACKTRACE=1.*\n" -> ""
+//@ build-fail
+//@ normalize-stderr-test "S32" -> "SXX"
+//@ normalize-stderr-test "S1M" -> "SXX"
+//@ error-pattern: too big for the current
 
 struct S32<T> {
     v0: T,

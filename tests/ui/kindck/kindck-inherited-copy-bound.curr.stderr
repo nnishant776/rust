@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `Box<{integer}>: Copy` is not satisfied
+error[E0277]: the trait bound `Box<{integer}>: Foo` is not satisfied
   --> $DIR/kindck-inherited-copy-bound.rs:21:16
    |
 LL |     take_param(&x);
-   |     ---------- ^^ the trait `Copy` is not implemented for `Box<{integer}>`
+   |     ---------- ^^ the trait `Copy` is not implemented for `Box<{integer}>`, which is required by `Box<{integer}>: Foo`
    |     |
    |     required by a bound introduced by this call
    |
@@ -46,8 +46,7 @@ LL | trait Foo : Copy {
    |       ---   ^^^^ ...because it requires `Self: Sized`
    |       |
    |       this trait cannot be made into an object...
-   = note: required for `&Box<{integer}>` to implement `CoerceUnsized<&dyn Foo>`
-   = note: required by cast to type `&dyn Foo`
+   = note: required for the cast from `&Box<{integer}>` to `&dyn Foo`
 
 error: aborting due to 3 previous errors
 

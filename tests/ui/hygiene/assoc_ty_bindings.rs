@@ -1,5 +1,4 @@
-// check-pass
-// ignore-pretty pretty-printing is unhygienic
+//@ check-pass
 
 #![feature(decl_macro, associated_type_defaults)]
 

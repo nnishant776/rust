@@ -182,6 +182,15 @@ impl Wtf8Buf {
         Wtf8Buf { bytes: Vec::with_capacity(capacity), is_known_utf8: true }
     }
 
+    /// Creates a WTF-8 string from a WTF-8 byte vec.
+    ///
+    /// Since the byte vec is not checked for valid WTF-8, this functions is
+    /// marked unsafe.
+    #[inline]
+    pub unsafe fn from_bytes_unchecked(value: Vec<u8>) -> Wtf8Buf {
+        Wtf8Buf { bytes: value, is_known_utf8: false }
+    }
+
     /// Creates a WTF-8 string from a UTF-8 `String`.
     ///
     /// This takes ownership of the `String` and does not copy.
@@ -402,6 +411,12 @@ impl Wtf8Buf {
         self.bytes.truncate(new_len)
     }
 
+    /// Consumes the WTF-8 string and tries to convert it to a vec of bytes.
+    #[inline]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Consumes the WTF-8 string and tries to convert it to UTF-8.
     ///
     /// This does not copy the data.
@@ -444,6 +459,7 @@ impl Wtf8Buf {
     /// Converts this `Wtf8Buf` into a boxed `Wtf8`.
     #[inline]
     pub fn into_box(self) -> Box<Wtf8> {
+        // SAFETY: relies on `Wtf8` being `repr(transparent)`.
         unsafe { mem::transmute(self.bytes.into_boxed_slice()) }
     }
 
@@ -451,6 +467,12 @@ impl Wtf8Buf {
     pub fn from_box(boxed: Box<Wtf8>) -> Wtf8Buf {
         let bytes: Box<[u8]> = unsafe { mem::transmute(boxed) };
         Wtf8Buf { bytes: bytes.into_vec(), is_known_utf8: false }
+    }
+
+    /// Part of a hack to make PathBuf::push/pop more efficient.
+    #[inline]
+    pub(crate) fn as_mut_vec_for_path_buf(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
     }
 }
 
@@ -496,11 +518,13 @@ impl Extend<CodePoint> for Wtf8Buf {
 /// Similar to `&str`, but can additionally contain surrogate code points
 /// if they’re not in a surrogate pair.
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
 pub struct Wtf8 {
     bytes: [u8],
 }
 
 impl AsInner<[u8]> for Wtf8 {
+    #[inline]
     fn as_inner(&self) -> &[u8] {
         &self.bytes
     }
@@ -569,7 +593,7 @@ impl Wtf8 {
     /// Since the byte slice is not checked for valid WTF-8, this functions is
     /// marked unsafe.
     #[inline]
-    unsafe fn from_bytes_unchecked(value: &[u8]) -> &Wtf8 {
+    pub unsafe fn from_bytes_unchecked(value: &[u8]) -> &Wtf8 {
         mem::transmute(value)
     }
 
@@ -594,7 +618,7 @@ impl Wtf8 {
     }
 
     /// Returns the code point at `position` if it is in the ASCII range,
-    /// or `b'\xFF' otherwise.
+    /// or `b'\xFF'` otherwise.
     ///
     /// # Panics
     ///
@@ -613,19 +637,20 @@ impl Wtf8 {
         Wtf8CodePoints { bytes: self.bytes.iter() }
     }
 
+    /// Access raw bytes of WTF-8 data
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Tries to convert the string to UTF-8 and return a `&str` slice.
     ///
     /// Returns `None` if the string contains surrogates.
     ///
     /// This does not copy the data.
     #[inline]
-    pub fn as_str(&self) -> Option<&str> {
-        // Well-formed WTF-8 is also well-formed UTF-8
-        // if and only if it contains no surrogate.
-        match self.next_surrogate(0) {
-            None => Some(unsafe { str::from_utf8_unchecked(&self.bytes) }),
-            Some(_) => None,
-        }
+    pub fn as_str(&self) -> Result<&str, str::Utf8Error> {
+        str::from_utf8(&self.bytes)
     }
 
     /// Creates an owned `Wtf8Buf` from a borrowed `Wtf8`.
@@ -866,15 +891,43 @@ fn decode_surrogate_pair(lead: u16, trail: u16) -> char {
     unsafe { char::from_u32_unchecked(code_point) }
 }
 
-/// Copied from core::str::StrPrelude::is_char_boundary
+/// Copied from str::is_char_boundary
 #[inline]
 pub fn is_code_point_boundary(slice: &Wtf8, index: usize) -> bool {
-    if index == slice.len() {
+    if index == 0 {
         return true;
     }
     match slice.bytes.get(index) {
-        None => false,
-        Some(&b) => b < 128 || b >= 192,
+        None => index == slice.len(),
+        Some(&b) => (b as i8) >= -0x40,
+    }
+}
+
+/// Verify that `index` is at the edge of either a valid UTF-8 codepoint
+/// (i.e. a codepoint that's not a surrogate) or of the whole string.
+///
+/// These are the cases currently permitted by `OsStr::slice_encoded_bytes`.
+/// Splitting between surrogates is valid as far as WTF-8 is concerned, but
+/// we do not permit it in the public API because WTF-8 is considered an
+/// implementation detail.
+#[track_caller]
+#[inline]
+pub fn check_utf8_boundary(slice: &Wtf8, index: usize) {
+    if index == 0 {
+        return;
+    }
+    match slice.bytes.get(index) {
+        Some(0xED) => (), // Might be a surrogate
+        Some(&b) if (b as i8) >= -0x40 => return,
+        Some(_) => panic!("byte index {index} is not a codepoint boundary"),
+        None if index == slice.len() => return,
+        None => panic!("byte index {index} is out of bounds"),
+    }
+    if slice.bytes[index + 1] >= 0xA0 {
+        // There's a surrogate after index. Now check before index.
+        if index >= 3 && slice.bytes[index - 3] == 0xED && slice.bytes[index - 2] >= 0xA0 {
+            panic!("byte index {index} lies between surrogate codepoints");
+        }
     }
 }
 

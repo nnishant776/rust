@@ -1,12 +1,6 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: The Rust Project Developers (see https://thanks.rust-lang.org)
+
 #![no_std]
 
 pub struct System;
@@ -86,7 +80,6 @@ mod platform {
     extern "system" {
         fn GetProcessHeap() -> HANDLE;
         fn HeapAlloc(hHeap: HANDLE, dwFlags: DWORD, dwBytes: SIZE_T) -> LPVOID;
-        fn HeapReAlloc(hHeap: HANDLE, dwFlags: DWORD, lpMem: LPVOID, dwBytes: SIZE_T) -> LPVOID;
         fn HeapFree(hHeap: HANDLE, dwFlags: DWORD, lpMem: LPVOID) -> BOOL;
         fn GetLastError() -> DWORD;
     }
@@ -117,7 +110,7 @@ mod platform {
             allocate_with_flags(layout, HEAP_ZERO_MEMORY)
         }
         #[inline]
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
             let header = get_header(ptr);
             let err = HeapFree(GetProcessHeap(), 0, header.0 as LPVOID);
             debug_assert!(err != 0, "Failed to free heap memory: {}", GetLastError());

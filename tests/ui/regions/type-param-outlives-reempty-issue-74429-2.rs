@@ -1,7 +1,7 @@
 // Regression test for #74429, where we didn't think that a type parameter
 // outlived `ReEmpty`.
 
-// check-pass
+//@ check-pass
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -55,11 +55,11 @@ where
 }
 
 pub fn x<T: Copy>(a: Array<T>) {
-    // drop just avoids a must_use warning
-    drop((0..1).filter(|_| true));
+    // _ just avoids a must_use warning
+    let _ = (0..1).filter(|_| true);
     let y = a.index_axis();
     a.axis_iter().for_each(|_| {
-        drop(y);
+        let _ = y;
     });
 }
 

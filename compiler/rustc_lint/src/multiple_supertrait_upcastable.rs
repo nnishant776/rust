@@ -1,6 +1,7 @@
 use crate::{LateContext, LateLintPass, LintContext};
 
 use rustc_hir as hir;
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::sym;
 
 declare_lint! {
@@ -10,6 +11,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust
+    /// #![feature(multiple_supertrait_upcastable)]
     /// trait A {}
     /// trait B {}
     ///
@@ -41,18 +43,17 @@ impl<'tcx> LateLintPass<'tcx> for MultipleSupertraitUpcastable {
         if let hir::ItemKind::Trait(_, _, _, _, _) = item.kind
             && cx.tcx.object_safety_violations(def_id).is_empty()
         {
-            let direct_super_traits_iter = cx.tcx
-                    .super_predicates_of(def_id)
-                    .predicates
-                    .into_iter()
-                    .filter_map(|(pred, _)| pred.to_opt_poly_trait_pred());
+            let direct_super_traits_iter = cx
+                .tcx
+                .super_predicates_of(def_id)
+                .predicates
+                .into_iter()
+                .filter_map(|(pred, _)| pred.as_trait_clause());
             if direct_super_traits_iter.count() > 1 {
-                cx.emit_spanned_lint(
+                cx.emit_span_lint(
                     MULTIPLE_SUPERTRAIT_UPCASTABLE,
                     cx.tcx.def_span(def_id),
-                    crate::lints::MultipleSupertraitUpcastable {
-                        ident: item.ident
-                    },
+                    crate::lints::MultipleSupertraitUpcastable { ident: item.ident },
                 );
             }
         }

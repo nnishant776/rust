@@ -1,13 +1,9 @@
-// run-rustfix
+//@ run-rustfix
 
 
 
 fn main() {
     let Some(1) = { Some(1) } else {
-        //~^ ERROR right curly brace `}` before `else` in a `let...else` statement not allowed
-        return;
-    };
-    let Some(1) = loop { break Some(1) } else {
         //~^ ERROR right curly brace `}` before `else` in a `let...else` statement not allowed
         return;
     };

@@ -1,6 +1,6 @@
-use crate::MirPass;
 use rustc_ast::InlineAsmOptions;
 use rustc_middle::mir::*;
+use rustc_middle::span_bug;
 use rustc_middle::ty::layout;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::spec::abi::Abi;
@@ -34,18 +34,15 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
             return;
         }
 
-        // This pass only runs on functions which themselves cannot unwind,
-        // forcibly changing the body of the function to structurally provide
-        // this guarantee by aborting on an unwind. If this function can unwind,
-        // then there's nothing to do because it already should work correctly.
-        //
         // Here we test for this function itself whether its ABI allows
         // unwinding or not.
         let body_ty = tcx.type_of(def_id).skip_binder();
         let body_abi = match body_ty.kind() {
             ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
             ty::Closure(..) => Abi::RustCall,
-            ty::Generator(..) => Abi::Rust,
+            ty::CoroutineClosure(..) => Abi::RustCall,
+            ty::Coroutine(..) => Abi::Rust,
+            ty::Error(_) => return,
             _ => span_bug!(body.span, "unexpected body ty: {:?}", body_ty),
         };
         let body_can_unwind = layout::fn_can_unwind(tcx, Some(def_id), body_abi);
@@ -74,7 +71,7 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
                     };
                     layout::fn_can_unwind(tcx, fn_def_id, sig.abi())
                 }
-                TerminatorKind::Drop { .. } | TerminatorKind::DropAndReplace { .. } => {
+                TerminatorKind::Drop { .. } => {
                     tcx.sess.opts.unstable_opts.panic_in_drop == PanicStrategy::Unwind
                         && layout::fn_can_unwind(tcx, None, Abi::Rust)
                 }
@@ -107,34 +104,17 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
             }
         }
 
-        // For call instructions which need to be terminated, we insert a
-        // singular basic block which simply terminates, and then configure the
-        // `cleanup` attribute for all calls we found to this basic block we
-        // insert which means that any unwinding that happens in the functions
-        // will force an abort of the process.
-        if !calls_to_terminate.is_empty() {
-            let bb = BasicBlockData {
-                statements: Vec::new(),
-                is_cleanup: true,
-                terminator: Some(Terminator {
-                    source_info: SourceInfo::outermost(body.span),
-                    kind: TerminatorKind::Abort,
-                }),
-            };
-            let abort_bb = body.basic_blocks_mut().push(bb);
-
-            for bb in calls_to_terminate {
-                let cleanup = body.basic_blocks_mut()[bb].terminator_mut().unwind_mut().unwrap();
-                *cleanup = Some(abort_bb);
-            }
+        for id in calls_to_terminate {
+            let cleanup = body.basic_blocks_mut()[id].terminator_mut().unwind_mut().unwrap();
+            *cleanup = UnwindAction::Terminate(UnwindTerminateReason::Abi);
         }
 
         for id in cleanups_to_remove {
             let cleanup = body.basic_blocks_mut()[id].terminator_mut().unwind_mut().unwrap();
-            *cleanup = None;
+            *cleanup = UnwindAction::Unreachable;
         }
 
         // We may have invalidated some `cleanup` blocks so clean those up now.
-        super::simplify::remove_dead_blocks(tcx, body);
+        super::simplify::remove_dead_blocks(body);
     }
 }

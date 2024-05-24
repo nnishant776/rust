@@ -1,10 +1,12 @@
 //! Diagnostics emitted during DefMap construction.
 
+use std::ops::Not;
+
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
-use hir_expand::{attrs::AttrId, MacroCallKind};
+use hir_expand::{attrs::AttrId, ErasedAstId, MacroCallKind};
 use la_arena::Idx;
-use syntax::ast::{self, AnyHasAttrs};
+use syntax::ast;
 
 use crate::{
     item_tree::{self, ItemTreeId},
@@ -16,24 +18,33 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefDiagnosticKind {
     UnresolvedModule { ast: AstId<ast::Module>, candidates: Box<[String]> },
-
     UnresolvedExternCrate { ast: AstId<ast::ExternCrate> },
-
-    UnresolvedImport { id: ItemTreeId<item_tree::Import>, index: Idx<ast::UseTree> },
-
-    UnconfiguredCode { ast: AstId<AnyHasAttrs>, cfg: CfgExpr, opts: CfgOptions },
-
+    UnresolvedImport { id: ItemTreeId<item_tree::Use>, index: Idx<ast::UseTree> },
+    UnconfiguredCode { ast: ErasedAstId, cfg: CfgExpr, opts: CfgOptions },
     UnresolvedProcMacro { ast: MacroCallKind, krate: CrateId },
-
     UnresolvedMacroCall { ast: MacroCallKind, path: ModPath },
-
-    MacroError { ast: MacroCallKind, message: String },
-
     UnimplementedBuiltinMacro { ast: AstId<ast::Macro> },
-
     InvalidDeriveTarget { ast: AstId<ast::Item>, id: usize },
-
     MalformedDerive { ast: AstId<ast::Adt>, id: usize },
+    MacroDefError { ast: AstId<ast::Macro>, message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefDiagnostics(Option<triomphe::Arc<Box<[DefDiagnostic]>>>);
+
+impl DefDiagnostics {
+    pub fn new(diagnostics: Vec<DefDiagnostic>) -> Self {
+        Self(
+            diagnostics
+                .is_empty()
+                .not()
+                .then(|| triomphe::Arc::new(diagnostics.into_boxed_slice())),
+        )
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DefDiagnostic> {
+        self.0.as_ref().into_iter().flat_map(|it| &***it)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,7 +77,7 @@ impl DefDiagnostic {
 
     pub(super) fn unresolved_import(
         container: LocalModuleId,
-        id: ItemTreeId<item_tree::Import>,
+        id: ItemTreeId<item_tree::Use>,
         index: Idx<ast::UseTree>,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::UnresolvedImport { id, index } }
@@ -74,14 +85,18 @@ impl DefDiagnostic {
 
     pub fn unconfigured_code(
         container: LocalModuleId,
-        ast: AstId<ast::AnyHasAttrs>,
+        ast: ErasedAstId,
         cfg: CfgExpr,
         opts: CfgOptions,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::UnconfiguredCode { ast, cfg, opts } }
     }
 
-    pub(super) fn unresolved_proc_macro(
+    // FIXME: Whats the difference between this and unresolved_macro_call
+    // FIXME: This is used for a lot of things, unresolved proc macros, disabled proc macros, etc
+    // yet the diagnostic handler in ide-diagnostics has to figure out what happened because this
+    // struct loses all that information!
+    pub fn unresolved_proc_macro(
         container: LocalModuleId,
         ast: MacroCallKind,
         krate: CrateId,
@@ -89,15 +104,8 @@ impl DefDiagnostic {
         Self { in_module: container, kind: DefDiagnosticKind::UnresolvedProcMacro { ast, krate } }
     }
 
-    pub(super) fn macro_error(
-        container: LocalModuleId,
-        ast: MacroCallKind,
-        message: String,
-    ) -> Self {
-        Self { in_module: container, kind: DefDiagnosticKind::MacroError { ast, message } }
-    }
-
-    pub(super) fn unresolved_macro_call(
+    // FIXME: Whats the difference between this and unresolved_proc_macro
+    pub(crate) fn unresolved_macro_call(
         container: LocalModuleId,
         ast: MacroCallKind,
         path: ModPath,

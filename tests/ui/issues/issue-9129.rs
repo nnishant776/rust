@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-// ignore-pretty unreported
 
 pub trait bomb { fn boom(&self, _: Ident); }
 pub struct S;

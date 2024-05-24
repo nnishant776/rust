@@ -1,8 +1,3 @@
-use rustc_data_structures::sync::Lock;
-
-use std::fmt::Debug;
-use std::time::{Duration, Instant};
-
 #[cfg(test)]
 mod tests;
 
@@ -17,7 +12,7 @@ pub fn to_readable_str(mut val: usize) -> String {
             groups.push(group.to_string());
             break;
         } else {
-            groups.push(format!("{:03}", group));
+            groups.push(format!("{group:03}"));
         }
     }
 
@@ -26,42 +21,18 @@ pub fn to_readable_str(mut val: usize) -> String {
     groups.join("_")
 }
 
-pub fn record_time<T, F>(accu: &Lock<Duration>, f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    let start = Instant::now();
-    let rv = f();
-    let duration = start.elapsed();
-    let mut accu = accu.lock();
-    *accu += duration;
-    rv
-}
-
-pub fn indent<R, F>(op: F) -> R
-where
-    R: Debug,
-    F: FnOnce() -> R,
-{
-    // Use in conjunction with the log post-processor like `src/etc/indenter`
-    // to make debug output more readable.
-    debug!(">>");
-    let r = op();
-    debug!("<< (Result = {:?})", r);
-    r
-}
-
-pub struct Indenter {
-    _cannot_construct_outside_of_this_module: (),
-}
-
-impl Drop for Indenter {
-    fn drop(&mut self) {
-        debug!("<<");
+// const wrapper for `if let Some((_, tail)) = name.rsplit_once(':') { tail } else { name }`
+pub const fn c_name(name: &'static str) -> &'static str {
+    // FIXME Simplify the implementation once more `str` methods get const-stable.
+    // and inline into call site
+    let bytes = name.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1] != b':' {
+        i = i - 1;
     }
-}
-
-pub fn indenter() -> Indenter {
-    debug!(">>");
-    Indenter { _cannot_construct_outside_of_this_module: () }
+    let (_, bytes) = bytes.split_at(i);
+    match std::str::from_utf8(bytes) {
+        Ok(name) => name,
+        Err(_) => name,
+    }
 }

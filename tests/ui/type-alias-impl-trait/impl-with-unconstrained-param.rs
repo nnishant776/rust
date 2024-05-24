@@ -1,7 +1,7 @@
 // Ensure that we don't ICE if associated type impl trait is used in an impl
 // with an unconstrained type parameter.
 
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 trait X {
     type I;
@@ -12,6 +12,8 @@ impl<T> X for () {
     //~^ ERROR the type parameter `T` is not constrained
     type I = impl Sized;
     fn f() -> Self::I {}
+    //~^ ERROR type annotations needed
+    //~| ERROR type annotations needed
 }
 
 fn main() {}

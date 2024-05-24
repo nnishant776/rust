@@ -1,10 +1,10 @@
-// edition:2018
-// run-pass
+//@ edition:2018
+//@ run-pass
 
 async fn lotsa_lifetimes<'a, 'b, 'c>(a: &'a u32, b: &'b u32, c: &'c u32) -> (&'a u32, &'b u32)
     where 'b: 'a
 {
-    drop((a, c));
+    let _ = (a, c);
     (b, b)
 }
 

@@ -34,7 +34,7 @@ use crate::io::{self, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut, SeekFrom};
 /// use std::fs::File;
 ///
 /// // a library function we've written
-/// fn write_ten_bytes_at_end<W: Write + Seek>(writer: &mut W) -> io::Result<()> {
+/// fn write_ten_bytes_at_end<W: Write + Seek>(mut writer: W) -> io::Result<()> {
 ///     writer.seek(SeekFrom::End(-10))?;
 ///
 ///     for i in 0..10 {
@@ -51,6 +51,8 @@ use crate::io::{self, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut, SeekFrom};
 /// // We might want to use a BufReader here for efficiency, but let's
 /// // keep this example focused.
 /// let mut file = File::create("foo.txt")?;
+/// // First, we need to allocate 10 bytes to be able to write into.
+/// file.set_len(10)?;
 ///
 /// write_ten_bytes_at_end(&mut file)?;
 /// # Ok(())
@@ -93,7 +95,7 @@ impl<T> Cursor<T> {
     /// # force_inference(&buff);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+    #[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
     pub const fn new(inner: T) -> Cursor<T> {
         Cursor { pos: 0, inner }
     }
@@ -130,7 +132,7 @@ impl<T> Cursor<T> {
     /// let reference = buff.get_ref();
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+    #[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
     pub const fn get_ref(&self) -> &T {
         &self.inner
     }
@@ -176,7 +178,7 @@ impl<T> Cursor<T> {
     /// assert_eq!(buff.position(), 1);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_io_structs", issue = "78812")]
+    #[rustc_const_stable(feature = "const_io_structs", since = "1.79.0")]
     pub const fn position(&self) -> u64 {
         self.pos
     }
@@ -326,7 +328,7 @@ where
     fn read_buf(&mut self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
         let prev_written = cursor.written();
 
-        Read::read_buf(&mut self.fill_buf()?, cursor.reborrow())?;
+        Read::read_buf(&mut self.remaining_slice(), cursor.reborrow())?;
 
         self.pos += (cursor.written() - prev_written) as u64;
 
@@ -350,10 +352,45 @@ where
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let n = buf.len();
-        Read::read_exact(&mut self.remaining_slice(), buf)?;
-        self.pos += n as u64;
-        Ok(())
+        let result = Read::read_exact(&mut self.remaining_slice(), buf);
+
+        match result {
+            Ok(_) => self.pos += buf.len() as u64,
+            // The only possible error condition is EOF, so place the cursor at "EOF"
+            Err(_) => self.pos = self.inner.as_ref().len() as u64,
+        }
+
+        result
+    }
+
+    fn read_buf_exact(&mut self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        let prev_written = cursor.written();
+
+        let result = Read::read_buf_exact(&mut self.remaining_slice(), cursor.reborrow());
+        self.pos += (cursor.written() - prev_written) as u64;
+
+        result
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let content = self.remaining_slice();
+        let len = content.len();
+        buf.try_reserve(len)?;
+        buf.extend_from_slice(content);
+        self.pos += len as u64;
+
+        Ok(len)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        let content =
+            crate::str::from_utf8(self.remaining_slice()).map_err(|_| io::Error::INVALID_UTF8)?;
+        let len = content.len();
+        buf.try_reserve(len)?;
+        buf.push_str(content);
+        self.pos += len as u64;
+
+        Ok(len)
     }
 }
 

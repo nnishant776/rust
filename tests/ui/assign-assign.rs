@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 // Issue 483 - Assignment expressions result in nil
 
 fn test_assign() {
@@ -6,7 +6,7 @@ fn test_assign() {
     let y: () = x = 10;
     assert_eq!(x, 10);
     assert_eq!(y, ());
-    let mut z = x = 11;
+    let mut z: () = x = 11;
     assert_eq!(x, 11);
     assert_eq!(z, ());
     z = x = 12;
@@ -19,7 +19,7 @@ fn test_assign_op() {
     let y: () = x += 10;
     assert_eq!(x, 10);
     assert_eq!(y, ());
-    let mut z = x += 11;
+    let mut z: () = x += 11;
     assert_eq!(x, 21);
     assert_eq!(z, ());
     z = x += 12;

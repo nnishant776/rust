@@ -1,5 +1,6 @@
 use crate::{lints::RedundantSemicolonsDiag, EarlyContext, EarlyLintPass, LintContext};
 use rustc_ast::{Block, StmtKind};
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::Span;
 
 declare_lint! {
@@ -47,7 +48,7 @@ fn maybe_lint_redundant_semis(cx: &EarlyContext<'_>, seq: &mut Option<(Span, boo
             return;
         }
 
-        cx.emit_spanned_lint(
+        cx.emit_span_lint(
             REDUNDANT_SEMICOLONS,
             span,
             RedundantSemicolonsDiag { multiple, suggestion: span },

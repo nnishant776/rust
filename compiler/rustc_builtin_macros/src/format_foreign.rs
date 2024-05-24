@@ -19,10 +19,10 @@ pub(crate) mod printf {
             }
         }
 
-        pub fn position(&self) -> Option<InnerSpan> {
+        pub fn position(&self) -> InnerSpan {
             match self {
-                Substitution::Format(fmt) => Some(fmt.position),
-                &Substitution::Escape((start, end)) => Some(InnerSpan::new(start, end)),
+                Substitution::Format(fmt) => fmt.position,
+                &Substitution::Escape((start, end)) => InnerSpan::new(start, end),
             }
         }
 
@@ -86,10 +86,7 @@ pub(crate) mod printf {
                         '-' => c_left = true,
                         '+' => c_plus = true,
                         _ => {
-                            return Err(Some(format!(
-                                "the flag `{}` is unknown or unsupported",
-                                c
-                            )));
+                            return Err(Some(format!("the flag `{c}` is unknown or unsupported")));
                         }
                     }
                 }
@@ -266,23 +263,23 @@ pub(crate) mod printf {
     }
 
     impl Num {
-        fn from_str(s: &str, arg: Option<&str>) -> Self {
+        fn from_str(s: &str, arg: Option<&str>) -> Option<Self> {
             if let Some(arg) = arg {
-                Num::Arg(arg.parse().unwrap_or_else(|_| panic!("invalid format arg `{:?}`", arg)))
+                arg.parse().ok().map(|arg| Num::Arg(arg))
             } else if s == "*" {
-                Num::Next
+                Some(Num::Next)
             } else {
-                Num::Num(s.parse().unwrap_or_else(|_| panic!("invalid format num `{:?}`", s)))
+                s.parse().ok().map(|num| Num::Num(num))
             }
         }
 
         fn translate(&self, s: &mut String) -> std::fmt::Result {
             use std::fmt::Write;
             match *self {
-                Num::Num(n) => write!(s, "{}", n),
+                Num::Num(n) => write!(s, "{n}"),
                 Num::Arg(n) => {
                     let n = n.checked_sub(1).ok_or(std::fmt::Error)?;
-                    write!(s, "{}$", n)
+                    write!(s, "{n}$")
                 }
                 Num::Next => write!(s, "*"),
             }
@@ -305,10 +302,9 @@ pub(crate) mod printf {
         fn next(&mut self) -> Option<Self::Item> {
             let (mut sub, tail) = parse_next_substitution(self.s)?;
             self.s = tail;
-            if let Some(InnerSpan { start, end }) = sub.position() {
-                sub.set_position(start + self.pos, end + self.pos);
-                self.pos += end;
-            }
+            let InnerSpan { start, end } = sub.position();
+            sub.set_position(start + self.pos, end + self.pos);
+            self.pos += end;
             Some(sub)
         }
 
@@ -425,7 +421,10 @@ pub(crate) mod printf {
                             state = Prec;
                             parameter = None;
                             flags = "";
-                            width = Some(Num::from_str(at.slice_between(end).unwrap(), None));
+                            width = at.slice_between(end).and_then(|num| Num::from_str(num, None));
+                            if width.is_none() {
+                                return fallback();
+                            }
                             move_to!(end);
                         }
                         // It's invalid, is what it is.
@@ -456,7 +455,10 @@ pub(crate) mod printf {
                 '1'..='9' => {
                     let end = at_next_cp_while(next, char::is_ascii_digit);
                     state = Prec;
-                    width = Some(Num::from_str(at.slice_between(end).unwrap(), None));
+                    width = at.slice_between(end).and_then(|num| Num::from_str(num, None));
+                    if width.is_none() {
+                        return fallback();
+                    }
                     move_to!(end);
                 }
                 _ => {
@@ -472,7 +474,7 @@ pub(crate) mod printf {
             match end.next_cp() {
                 Some(('$', end2)) => {
                     state = Prec;
-                    width = Some(Num::from_str("", Some(at.slice_between(end).unwrap())));
+                    width = Num::from_str("", at.slice_between(end));
                     move_to!(end2);
                 }
                 _ => {
@@ -504,7 +506,7 @@ pub(crate) mod printf {
                     match end.next_cp() {
                         Some(('$', end2)) => {
                             state = Length;
-                            precision = Some(Num::from_str("*", next.slice_between(end)));
+                            precision = Num::from_str("*", next.slice_between(end));
                             move_to!(end2);
                         }
                         _ => {
@@ -517,7 +519,7 @@ pub(crate) mod printf {
                 '0'..='9' => {
                     let end = at_next_cp_while(next, char::is_ascii_digit);
                     state = Length;
-                    precision = Some(Num::from_str(at.slice_between(end).unwrap(), None));
+                    precision = at.slice_between(end).and_then(|num| Num::from_str(num, None));
                     move_to!(end);
                 }
                 _ => return fallback(),
@@ -562,15 +564,13 @@ pub(crate) mod printf {
         }
 
         if let Type = state {
-            drop(c);
             type_ = at.slice_between(next).unwrap();
 
             // Don't use `move_to!` here, as we *can* be at the end of the input.
             at = next;
         }
 
-        drop(c);
-        drop(next);
+        let _ = c; // to avoid never used value
 
         end = at;
         let position = InnerSpan::new(start.at, end.at);
@@ -628,15 +628,15 @@ pub mod shell {
     impl Substitution<'_> {
         pub fn as_str(&self) -> String {
             match self {
-                Substitution::Ordinal(n, _) => format!("${}", n),
-                Substitution::Name(n, _) => format!("${}", n),
+                Substitution::Ordinal(n, _) => format!("${n}"),
+                Substitution::Name(n, _) => format!("${n}"),
                 Substitution::Escape(_) => "$$".into(),
             }
         }
 
-        pub fn position(&self) -> Option<InnerSpan> {
+        pub fn position(&self) -> InnerSpan {
             let (Self::Ordinal(_, pos) | Self::Name(_, pos) | Self::Escape(pos)) = self;
-            Some(InnerSpan::new(pos.0, pos.1))
+            InnerSpan::new(pos.0, pos.1)
         }
 
         pub fn set_position(&mut self, start: usize, end: usize) {
@@ -669,10 +669,9 @@ pub mod shell {
         fn next(&mut self) -> Option<Self::Item> {
             let (mut sub, tail) = parse_next_substitution(self.s)?;
             self.s = tail;
-            if let Some(InnerSpan { start, end }) = sub.position() {
-                sub.set_position(start + self.pos, end + self.pos);
-                self.pos += end;
-            }
+            let InnerSpan { start, end } = sub.position();
+            sub.set_position(start + self.pos, end + self.pos);
+            self.pos += end;
             Some(sub)
         }
 

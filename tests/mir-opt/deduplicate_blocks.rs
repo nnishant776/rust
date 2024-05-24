@@ -1,4 +1,6 @@
-// unit-test: DeduplicateBlocks
+// skip-filecheck
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
+//@ test-mir-pass: DeduplicateBlocks
 
 // EMIT_MIR deduplicate_blocks.is_line_doc_comment_2.DeduplicateBlocks.diff
 pub const fn is_line_doc_comment_2(s: &str) -> bool {

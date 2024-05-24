@@ -2,7 +2,7 @@
 
 use std::iter;
 
-use hir::{Module, ModuleSource};
+use hir::{HirFileIdExt, Module};
 use ide_db::{
     base_db::{SourceDatabaseExt, VfsPath},
     FxHashSet, RootDatabase, SymbolKind,
@@ -21,7 +21,7 @@ pub(crate) fn complete_mod(
         return None;
     }
 
-    let _p = profile::span("completion::complete_mod");
+    let _p = tracing::span!(tracing::Level::INFO, "completion::complete_mod").entered();
 
     let mut current_module = ctx.module;
     // For `mod $0`, `ctx.module` is its parent, but for `mod f$0`, it's `mod f` itself, but we're
@@ -42,7 +42,7 @@ pub(crate) fn complete_mod(
     }
 
     let module_definition_file =
-        current_module.definition_source(ctx.db).file_id.original_file(ctx.db);
+        current_module.definition_source_file_id(ctx.db).original_file(ctx.db);
     let source_root = ctx.db.source_root(ctx.db.file_source_root(module_definition_file));
     let directory_to_look_for_submodules = directory_to_look_for_submodules(
         current_module,
@@ -52,12 +52,12 @@ pub(crate) fn complete_mod(
 
     let existing_mod_declarations = current_module
         .children(ctx.db)
-        .filter_map(|module| Some(module.name(ctx.db)?.to_string()))
+        .filter_map(|module| Some(module.name(ctx.db)?.display(ctx.db).to_string()))
         .filter(|module| module != ctx.original_token.text())
         .collect::<FxHashSet<_>>();
 
     let module_declaration_file =
-        current_module.declaration_source(ctx.db).map(|module_declaration_source_file| {
+        current_module.declaration_source_range(ctx.db).map(|module_declaration_source_file| {
             module_declaration_source_file.file_id.original_file(ctx.db)
         });
 
@@ -99,7 +99,7 @@ pub(crate) fn complete_mod(
                 label.push(';');
             }
             let item = CompletionItem::new(SymbolKind::Module, ctx.source_range(), &label);
-            item.add_to(acc)
+            item.add_to(acc, ctx.db)
         });
 
     Some(())
@@ -148,9 +148,7 @@ fn module_chain_to_containing_module_file(
 ) -> Vec<Module> {
     let mut path =
         iter::successors(Some(current_module), |current_module| current_module.parent(db))
-            .take_while(|current_module| {
-                matches!(current_module.definition_source(db).value, ModuleSource::Module(_))
-            })
+            .take_while(|current_module| current_module.is_inline(db))
             .collect::<Vec<_>>();
     path.reverse();
     path

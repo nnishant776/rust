@@ -4,30 +4,32 @@ use crate::infer::canonical::Canonical;
 use crate::mir;
 use crate::traits;
 use crate::ty::fast_reject::SimplifiedType;
-use crate::ty::subst::{GenericArg, SubstsRef};
-use crate::ty::{self, layout::TyAndLayout, Ty, TyCtxt};
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
+use crate::ty::layout::{TyAndLayout, ValidityRequirement};
+use crate::ty::{self, Ty, TyCtxt};
+use crate::ty::{GenericArg, GenericArgsRef};
+use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LocalModDefId, ModDefId, LOCAL_CRATE};
 use rustc_hir::hir_id::{HirId, OwnerId};
-use rustc_query_system::query::{DefaultCacheSelector, SingleCacheSelector, VecCacheSelector};
+use rustc_query_system::query::{DefIdCache, DefaultCache, SingleCache, VecCache};
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
+use rustc_target::abi;
+
+/// Placeholder for `CrateNum`'s "local" counterpart
+#[derive(Copy, Clone, Debug)]
+pub struct LocalCrate;
 
 /// The `Key` trait controls what types can legally be used as the key
 /// for a query.
 pub trait Key: Sized {
-    // N.B. Most of the keys down below have `type CacheSelector = DefaultCacheSelector<Self>;`,
+    // N.B. Most of the keys down below have `type Cache<V> = DefaultCache<Self, V>;`,
     //      it would be reasonable to use associated type defaults, to remove the duplication...
     //
     //      ...But r-a doesn't support them yet and using a default here causes r-a to not infer
     //      return types of queries which is very annoying. Thus, until r-a support associated
-    //      type defaults, plese restrain from using them here <3
+    //      type defaults, please restrain from using them here <3
     //
     //      r-a issue: <https://github.com/rust-lang/rust-analyzer/issues/13693>
-    type CacheSelector;
-
-    /// Given an instance of this key, what crate is it referring to?
-    /// This is used to find the provider.
-    fn query_crate_is_local(&self) -> bool;
+    type Cache<V>;
 
     /// In the event that a cycle occurs, if no explicit span has been
     /// given for a query with key `self`, what span should we use?
@@ -39,18 +41,21 @@ pub trait Key: Sized {
         None
     }
 
-    fn ty_adt_id(&self) -> Option<DefId> {
+    fn ty_def_id(&self) -> Option<DefId> {
         None
     }
 }
 
-impl Key for () {
-    type CacheSelector = SingleCacheSelector;
+pub trait AsLocalKey: Key {
+    type LocalKey;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    /// Given an instance of this key, what crate is it referring to?
+    /// This is used to find the provider.
+    fn as_local_key(&self) -> Option<Self::LocalKey>;
+}
+
+impl Key for () {
+    type Cache<V> = SingleCache<V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -58,25 +63,24 @@ impl Key for () {
 }
 
 impl<'tcx> Key for ty::InstanceDef<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
     }
 }
 
-impl<'tcx> Key for ty::Instance<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> AsLocalKey for ty::InstanceDef<'tcx> {
+    type LocalKey = Self;
 
     #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        self.def_id().is_local().then(|| *self)
     }
+}
+
+impl<'tcx> Key for ty::Instance<'tcx> {
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
@@ -84,12 +88,7 @@ impl<'tcx> Key for ty::Instance<'tcx> {
 }
 
 impl<'tcx> Key for mir::interpret::GlobalId<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.instance.default_span(tcx)
@@ -97,12 +96,7 @@ impl<'tcx> Key for mir::interpret::GlobalId<'tcx> {
 }
 
 impl<'tcx> Key for (Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -110,12 +104,7 @@ impl<'tcx> Key for (Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>) {
 }
 
 impl<'tcx> Key for mir::interpret::LitToConstInput<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -123,464 +112,365 @@ impl<'tcx> Key for mir::interpret::LitToConstInput<'tcx> {
 }
 
 impl Key for CrateNum {
-    type CacheSelector = VecCacheSelector<Self>;
+    type Cache<V> = VecCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        *self == LOCAL_CRATE
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
-impl Key for OwnerId {
-    type CacheSelector = VecCacheSelector<Self>;
+impl AsLocalKey for CrateNum {
+    type LocalKey = LocalCrate;
 
     #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        (*self == LOCAL_CRATE).then_some(LocalCrate)
     }
+}
+
+impl Key for OwnerId {
+    type Cache<V> = VecCache<Self, V>;
+
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.to_def_id().default_span(tcx)
     }
+
     fn key_as_def_id(&self) -> Option<DefId> {
         Some(self.to_def_id())
     }
 }
 
 impl Key for LocalDefId {
-    type CacheSelector = VecCacheSelector<Self>;
+    type Cache<V> = VecCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.to_def_id().default_span(tcx)
     }
+
     fn key_as_def_id(&self) -> Option<DefId> {
         Some(self.to_def_id())
     }
 }
 
 impl Key for DefId {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefIdCache<V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(*self)
     }
+
     #[inline(always)]
     fn key_as_def_id(&self) -> Option<DefId> {
         Some(*self)
     }
 }
 
-impl Key for ty::WithOptConstParam<LocalDefId> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl AsLocalKey for DefId {
+    type LocalKey = LocalDefId;
 
     #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        self.as_local()
     }
+}
+
+impl Key for LocalModDefId {
+    type Cache<V> = DefaultCache<Self, V>;
+
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
-        self.did.default_span(tcx)
+        tcx.def_span(*self)
+    }
+
+    #[inline(always)]
+    fn key_as_def_id(&self) -> Option<DefId> {
+        Some(self.to_def_id())
+    }
+}
+
+impl Key for ModDefId {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.def_span(*self)
+    }
+
+    #[inline(always)]
+    fn key_as_def_id(&self) -> Option<DefId> {
+        Some(self.to_def_id())
+    }
+}
+
+impl AsLocalKey for ModDefId {
+    type LocalKey = LocalModDefId;
+
+    #[inline(always)]
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        self.as_local()
     }
 }
 
 impl Key for SimplifiedType {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl Key for (DefId, DefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
     }
 }
 
 impl<'tcx> Key for (ty::Instance<'tcx>, LocalDefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
 impl Key for (DefId, LocalDefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
     }
 }
 
 impl Key for (LocalDefId, DefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
 impl Key for (LocalDefId, LocalDefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
-impl Key for (DefId, Option<Ident>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl Key for (DefId, Ident) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.0)
     }
+
     #[inline(always)]
     fn key_as_def_id(&self) -> Option<DefId> {
         Some(self.0)
     }
 }
 
-impl Key for (DefId, LocalDefId, Ident) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl Key for (LocalDefId, LocalDefId, Ident) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
     }
 }
 
 impl Key for (CrateNum, DefId) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0 == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
     }
 }
 
-impl Key for (CrateNum, SimplifiedType) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl AsLocalKey for (CrateNum, DefId) {
+    type LocalKey = DefId;
 
     #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0 == LOCAL_CRATE
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        (self.0 == LOCAL_CRATE).then(|| self.1)
     }
+}
+
+impl Key for (CrateNum, SimplifiedType) {
+    type Cache<V> = DefaultCache<Self, V>;
+
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
-impl Key for (DefId, SimplifiedType) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl AsLocalKey for (CrateNum, SimplifiedType) {
+    type LocalKey = SimplifiedType;
 
     #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
+    fn as_local_key(&self) -> Option<Self::LocalKey> {
+        (self.0 == LOCAL_CRATE).then(|| self.1)
     }
+}
+
+impl Key for (DefId, SimplifiedType) {
+    type Cache<V> = DefaultCache<Self, V>;
+
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
-impl<'tcx> Key for SubstsRef<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for GenericArgsRef<'tcx> {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
-impl<'tcx> Key for (DefId, SubstsRef<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for (DefId, GenericArgsRef<'tcx>) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
 impl<'tcx> Key for (ty::UnevaluatedConst<'tcx>, ty::UnevaluatedConst<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        (self.0).def.did.krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
-        (self.0).def.did.default_span(tcx)
+        (self.0).def.default_span(tcx)
     }
 }
 
-impl<'tcx> Key for (LocalDefId, DefId, SubstsRef<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for (LocalDefId, DefId, GenericArgsRef<'tcx>) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
     }
 }
 
-impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::TraitRef<'tcx>) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.1.def_id().krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
-        tcx.def_span(self.1.def_id())
-    }
-}
-
-impl<'tcx> Key for (ty::Const<'tcx>, mir::Field) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
-    fn default_span(&self, _: TyCtxt<'_>) -> Span {
-        DUMMY_SP
-    }
-}
-
-impl<'tcx> Key for mir::interpret::ConstAlloc<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
-    fn default_span(&self, _: TyCtxt<'_>) -> Span {
-        DUMMY_SP
+        tcx.def_span(self.1.def_id)
     }
 }
 
 impl<'tcx> Key for ty::PolyTraitRef<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.def_id().krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
     }
 }
 
 impl<'tcx> Key for ty::PolyExistentialTraitRef<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.def_id().krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
     }
 }
 
 impl<'tcx> Key for (ty::PolyTraitRef<'tcx>, ty::PolyTraitRef<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.0.def_id().krate == LOCAL_CRATE
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.0.def_id())
     }
 }
 
 impl<'tcx> Key for GenericArg<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
-    fn default_span(&self, _: TyCtxt<'_>) -> Span {
-        DUMMY_SP
-    }
-}
-
-impl<'tcx> Key for mir::ConstantKind<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl<'tcx> Key for ty::Const<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl<'tcx> Key for Ty<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
-    fn ty_adt_id(&self) -> Option<DefId> {
-        match self.kind() {
+
+    fn ty_def_id(&self) -> Option<DefId> {
+        match *self.kind() {
             ty::Adt(adt, _) => Some(adt.did()),
+            ty::Coroutine(def_id, ..) => Some(def_id),
             _ => None,
         }
     }
 }
 
 impl<'tcx> Key for TyAndLayout<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl<'tcx> Key for (Ty<'tcx>, Ty<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
-impl<'tcx> Key for &'tcx ty::List<ty::Predicate<'tcx>> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for ty::Clauses<'tcx> {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl<'tcx> Key for ty::ParamEnv<'tcx> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl<'tcx, T: Key> Key for ty::ParamEnvAnd<'tcx, T> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        self.value.query_crate_is_local()
-    }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.value.default_span(tcx)
+    }
+
+    fn ty_def_id(&self) -> Option<DefId> {
+        self.value.ty_def_id()
     }
 }
 
 impl Key for Symbol {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
 impl Key for Option<Symbol> {
-    type CacheSelector = DefaultCacheSelector<Self>;
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
@@ -588,13 +478,8 @@ impl Key for Option<Symbol> {
 
 /// Canonical query goals correspond to abstract trait operations that
 /// are not tied to any crate in particular.
-impl<'tcx, T> Key for Canonical<'tcx, T> {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+impl<'tcx, T: Clone> Key for Canonical<'tcx, T> {
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -602,25 +487,23 @@ impl<'tcx, T> Key for Canonical<'tcx, T> {
 }
 
 impl Key for (Symbol, u32, u32) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
     }
 }
 
-impl<'tcx> Key for (DefId, Ty<'tcx>, SubstsRef<'tcx>, ty::ParamEnv<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
+impl<'tcx> Key for (DefId, Ty<'tcx>, GenericArgsRef<'tcx>, ty::ParamEnv<'tcx>) {
+    type Cache<V> = DefaultCache<Self, V>;
 
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
+    fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
+        DUMMY_SP
     }
+}
+
+impl<'tcx> Key for (Ty<'tcx>, abi::VariantIdx) {
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -628,12 +511,7 @@ impl<'tcx> Key for (DefId, Ty<'tcx>, SubstsRef<'tcx>, ty::ParamEnv<'tcx>) {
 }
 
 impl<'tcx> Key for (ty::Predicate<'tcx>, traits::WellFormedLoc) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -641,12 +519,7 @@ impl<'tcx> Key for (ty::Predicate<'tcx>, traits::WellFormedLoc) {
 }
 
 impl<'tcx> Key for (ty::PolyFnSig<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -654,12 +527,7 @@ impl<'tcx> Key for (ty::PolyFnSig<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
 }
 
 impl<'tcx> Key for (ty::Instance<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -667,12 +535,7 @@ impl<'tcx> Key for (ty::Instance<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
 }
 
 impl<'tcx> Key for (Ty<'tcx>, ty::ValTree<'tcx>) {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -680,12 +543,7 @@ impl<'tcx> Key for (Ty<'tcx>, ty::ValTree<'tcx>) {
 }
 
 impl Key for HirId {
-    type CacheSelector = DefaultCacheSelector<Self>;
-
-    #[inline(always)]
-    fn query_crate_is_local(&self) -> bool {
-        true
-    }
+    type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.hir().span(*self)
@@ -694,5 +552,35 @@ impl Key for HirId {
     #[inline(always)]
     fn key_as_def_id(&self) -> Option<DefId> {
         None
+    }
+}
+
+impl Key for (LocalDefId, HirId) {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.hir().span(self.1)
+    }
+
+    #[inline(always)]
+    fn key_as_def_id(&self) -> Option<DefId> {
+        Some(self.0.into())
+    }
+}
+
+impl<'tcx> Key for (ValidityRequirement, ty::ParamEnvAnd<'tcx, Ty<'tcx>>) {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    // Just forward to `Ty<'tcx>`
+
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+
+    fn ty_def_id(&self) -> Option<DefId> {
+        match self.1.value.kind() {
+            ty::Adt(adt, _) => Some(adt.did()),
+            _ => None,
+        }
     }
 }

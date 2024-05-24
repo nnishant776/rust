@@ -1,5 +1,5 @@
-// check-pass
-// compile-flags:-Zpolymorphize=on
+//@ check-pass
+//@ compile-flags:-Zpolymorphize=on
 
 pub struct OnDrop<F: Fn()>(pub F);
 
@@ -14,7 +14,7 @@ fn foo<R, S: FnOnce()>(
     let bar = || {
         let _ = OnDrop(|| ());
     };
-    let _ = bar();
+    bar();
 }
 
 fn main() {

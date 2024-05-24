@@ -1,17 +1,16 @@
 use crate::method::MethodCallee;
-use crate::{has_expected_num_generic_args, FnCtxt, PlaceOp};
+use crate::{FnCtxt, PlaceOp};
 use rustc_ast as ast;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir_analysis::autoderef::Autoderef;
-use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_infer::infer::InferOk;
-use rustc_middle::ty::adjustment::{Adjust, Adjustment, OverloadedDeref, PointerCast};
+use rustc_middle::span_bug;
+use rustc_middle::ty::adjustment::{Adjust, Adjustment, OverloadedDeref, PointerCoercion};
 use rustc_middle::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc_middle::ty::{self, Ty};
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
-use std::slice;
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Type-check `*oprnd_expr` with `oprnd_expr` type-checked already.
@@ -21,8 +20,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         oprnd_expr: &'tcx hir::Expr<'tcx>,
         oprnd_ty: Ty<'tcx>,
     ) -> Option<Ty<'tcx>> {
-        if let Some(mt) = oprnd_ty.builtin_deref(true) {
-            return Some(mt.ty);
+        if let Some(ty) = oprnd_ty.builtin_deref(true) {
+            return Some(ty);
         }
 
         let ok = self.try_overloaded_deref(expr.span, oprnd_ty)?;
@@ -38,8 +37,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         } else {
             span_bug!(expr.span, "input to deref is not a ref?");
         }
-        let ty = self.make_overloaded_place_return_type(method).ty;
-        self.write_method_call(expr.hir_id, method);
+        let ty = self.make_overloaded_place_return_type(method);
+        self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
         Some(ty)
     }
 
@@ -72,18 +71,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         base_expr: &hir::Expr<'_>,
     ) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
         let ty = self.resolve_vars_if_possible(ty);
-        let mut err = self.tcx.sess.struct_span_err(
+        let mut err = self.dcx().struct_span_err(
             span,
-            &format!("negative integers cannot be used to index on a `{ty}`"),
+            format!("negative integers cannot be used to index on a `{ty}`"),
         );
-        err.span_label(span, &format!("cannot use a negative integer for indexing on `{ty}`"));
+        err.span_label(span, format!("cannot use a negative integer for indexing on `{ty}`"));
         if let (hir::ExprKind::Path(..), Ok(snippet)) =
             (&base_expr.kind, self.tcx.sess.source_map().span_to_snippet(base_expr.span))
         {
             // `foo[-1]` to `foo[foo.len() - 1]`
             err.span_suggestion_verbose(
                 span.shrink_to_lo(),
-                &format!(
+                format!(
                     "to access an element starting from the end of the `{ty}`, compute the index",
                 ),
                 format!("{snippet}.len() "),
@@ -91,7 +90,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             );
         }
         let reported = err.emit();
-        Some((self.tcx.ty_error(reported), self.tcx.ty_error(reported)))
+        Some((Ty::new_error(self.tcx, reported), Ty::new_error(self.tcx, reported)))
     }
 
     /// To type-check `base_expr[index_expr]`, we progressively autoderef
@@ -108,7 +107,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         index_expr: &hir::Expr<'_>,
     ) -> Option<(/*index type*/ Ty<'tcx>, /*element type*/ Ty<'tcx>)> {
         let adjusted_ty =
-            self.structurally_resolved_type(autoderef.span(), autoderef.final_ty(false));
+            self.structurally_resolve_type(autoderef.span(), autoderef.final_ty(false));
         debug!(
             "try_index_step(expr={:?}, base_expr={:?}, adjusted_ty={:?}, \
              index_ty={:?})",
@@ -139,7 +138,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if unsize {
                 // We only unsize arrays here.
                 if let ty::Array(element_ty, _) = adjusted_ty.kind() {
-                    self_ty = self.tcx.mk_slice(*element_ty);
+                    self_ty = Ty::new_slice(self.tcx, *element_ty);
                 } else {
                     continue;
                 }
@@ -148,10 +147,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // If some lookup succeeds, write callee into table and extract index/element
             // type from the method signature.
             // If some lookup succeeded, install method in table
-            let input_ty = self.next_ty_var(TypeVariableOrigin {
-                kind: TypeVariableOriginKind::AutoDeref,
-                span: base_expr.span,
-            });
+            let input_ty = self.next_ty_var(base_expr.span);
             let method =
                 self.try_overloaded_place_op(expr.span, self_ty, &[input_ty], PlaceOp::Index);
 
@@ -163,25 +159,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let ty::Ref(region, _, hir::Mutability::Not) = method.sig.inputs()[0].kind() {
                     adjustments.push(Adjustment {
                         kind: Adjust::Borrow(AutoBorrow::Ref(*region, AutoBorrowMutability::Not)),
-                        target: self.tcx.mk_ref(
-                            *region,
-                            ty::TypeAndMut { mutbl: hir::Mutability::Not, ty: adjusted_ty },
-                        ),
+                        target: Ty::new_imm_ref(self.tcx, *region, adjusted_ty),
                     });
                 } else {
                     span_bug!(expr.span, "input to index is not a ref?");
                 }
                 if unsize {
                     adjustments.push(Adjustment {
-                        kind: Adjust::Pointer(PointerCast::Unsize),
+                        kind: Adjust::Pointer(PointerCoercion::Unsize),
                         target: method.sig.inputs()[0],
                     });
                 }
                 self.apply_adjustments(base_expr, adjustments);
 
-                self.write_method_call(expr.hir_id, method);
+                self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
 
-                return Some((input_ty, self.make_overloaded_place_return_type(method).ty));
+                return Some((input_ty, self.make_overloaded_place_return_type(method)));
             }
         }
 
@@ -201,34 +194,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Option<InferOk<'tcx, MethodCallee<'tcx>>> {
         debug!("try_overloaded_place_op({:?},{:?},{:?})", span, base_ty, op);
 
-        let (imm_tr, imm_op) = match op {
+        let (Some(imm_tr), imm_op) = (match op {
             PlaceOp::Deref => (self.tcx.lang_items().deref_trait(), sym::deref),
             PlaceOp::Index => (self.tcx.lang_items().index_trait(), sym::index),
+        }) else {
+            // Bail if `Deref` or `Index` isn't defined.
+            return None;
         };
 
-        // If the lang item was declared incorrectly, stop here so that we don't
-        // run into an ICE (#83893). The error is reported where the lang item is
-        // declared.
-        if !has_expected_num_generic_args(
-            self.tcx,
+        self.lookup_method_in_trait(
+            self.misc(span),
+            Ident::with_dummy_span(imm_op),
             imm_tr,
-            match op {
-                PlaceOp::Deref => 0,
-                PlaceOp::Index => 1,
-            },
-        ) {
-            return None;
-        }
-
-        imm_tr.and_then(|trait_did| {
-            self.lookup_method_in_trait(
-                self.misc(span),
-                Ident::with_dummy_span(imm_op),
-                trait_did,
-                base_ty,
-                Some(arg_tys),
-            )
-        })
+            base_ty,
+            Some(arg_tys),
+        )
     }
 
     fn try_mutable_overloaded_place_op(
@@ -240,34 +220,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Option<InferOk<'tcx, MethodCallee<'tcx>>> {
         debug!("try_mutable_overloaded_place_op({:?},{:?},{:?})", span, base_ty, op);
 
-        let (mut_tr, mut_op) = match op {
+        let (Some(mut_tr), mut_op) = (match op {
             PlaceOp::Deref => (self.tcx.lang_items().deref_mut_trait(), sym::deref_mut),
             PlaceOp::Index => (self.tcx.lang_items().index_mut_trait(), sym::index_mut),
+        }) else {
+            // Bail if `DerefMut` or `IndexMut` isn't defined.
+            return None;
         };
 
-        // If the lang item was declared incorrectly, stop here so that we don't
-        // run into an ICE (#83893). The error is reported where the lang item is
-        // declared.
-        if !has_expected_num_generic_args(
-            self.tcx,
+        self.lookup_method_in_trait(
+            self.misc(span),
+            Ident::with_dummy_span(mut_op),
             mut_tr,
-            match op {
-                PlaceOp::Deref => 0,
-                PlaceOp::Index => 1,
-            },
-        ) {
-            return None;
-        }
-
-        mut_tr.and_then(|trait_did| {
-            self.lookup_method_in_trait(
-                self.misc(span),
-                Ident::with_dummy_span(mut_op),
-                trait_did,
-                base_ty,
-                Some(arg_tys),
-            )
-        })
+            base_ty,
+            Some(arg_tys),
+        )
     }
 
     /// Convert auto-derefs, indices, etc of an expression from `Deref` and `Index`
@@ -281,9 +248,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Gather up expressions we want to munge.
         let mut exprs = vec![expr];
 
-        while let hir::ExprKind::Field(ref expr, _)
-        | hir::ExprKind::Index(ref expr, _)
-        | hir::ExprKind::Unary(hir::UnOp::Deref, ref expr) = exprs.last().unwrap().kind
+        while let hir::ExprKind::Field(expr, _)
+        | hir::ExprKind::Index(expr, _, _)
+        | hir::ExprKind::Unary(hir::UnOp::Deref, expr) = exprs.last().unwrap().kind
         {
             exprs.push(expr);
         }
@@ -328,17 +295,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // If this is a union field, also throw an error for `DerefMut` of `ManuallyDrop` (see RFC 2514).
                         // This helps avoid accidental drops.
                         if inside_union
-                            && source.ty_adt_def().map_or(false, |adt| adt.is_manually_drop())
+                            && source.ty_adt_def().is_some_and(|adt| adt.is_manually_drop())
                         {
-                            let mut err = self.tcx.sess.struct_span_err(
+                            self.dcx().struct_span_err(
                                 expr.span,
                                 "not automatically applying `DerefMut` on `ManuallyDrop` union field",
-                            );
-                            err.help(
+                            )
+                            .with_help(
                                 "writing to this reference calls the destructor for the old value",
-                            );
-                            err.help("add an explicit `*` if that is desired, or call `ptr::write` to not run the destructor");
-                            err.emit();
+                            )
+                            .with_help("add an explicit `*` if that is desired, or call `ptr::write` to not run the destructor")
+                            .emit();
                         }
                     }
                     source = adjustment.target;
@@ -376,28 +343,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .borrow()
             .expr_ty_adjusted(base_expr)
             .builtin_deref(false)
-            .expect("place op takes something that is not a ref")
-            .ty;
+            .expect("place op takes something that is not a ref");
 
         let arg_ty = match op {
             PlaceOp::Deref => None,
             PlaceOp::Index => {
                 // We would need to recover the `T` used when we resolve `<_ as Index<T>>::index`
-                // in try_index_step. This is the subst at index 1.
+                // in try_index_step. This is the arg at index 1.
                 //
                 // Note: we should *not* use `expr_ty` of index_expr here because autoderef
                 // during coercions can cause type of index_expr to differ from `T` (#72002).
                 // We also could not use `expr_ty_adjusted` of index_expr because reborrowing
                 // during coercions can also cause type of index_expr to differ from `T`,
                 // which can potentially cause regionck failure (#74933).
-                Some(self.typeck_results.borrow().node_substs(expr.hir_id).type_at(1))
+                Some(self.typeck_results.borrow().node_args(expr.hir_id).type_at(1))
             }
         };
-        let arg_tys = match arg_ty {
-            None => &[],
-            Some(ref ty) => slice::from_ref(ty),
-        };
-
+        let arg_tys = arg_ty.as_slice();
         let method = self.try_mutable_overloaded_place_op(expr.span, base_ty, arg_tys, op);
         let method = match method {
             Some(ok) => self.register_infer_ok_obligations(ok),
@@ -406,7 +368,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             None => return,
         };
         debug!("convert_place_op_to_mutable: method={:?}", method);
-        self.write_method_call(expr.hir_id, method);
+        self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
 
         let ty::Ref(region, _, hir::Mutability::Mut) = method.sig.inputs()[0].kind() else {
             span_bug!(expr.span, "input to mutable place op is not a mut ref?");
@@ -430,9 +392,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         allow_two_phase_borrow: AllowTwoPhase::No,
                     };
                     adjustment.kind = Adjust::Borrow(AutoBorrow::Ref(*region, mutbl));
-                    adjustment.target = self
-                        .tcx
-                        .mk_ref(*region, ty::TypeAndMut { ty: source, mutbl: mutbl.into() });
+                    adjustment.target = Ty::new_ref(self.tcx, *region, source, mutbl.into());
                 }
                 source = adjustment.target;
             }
@@ -441,7 +401,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if let [
                 ..,
                 Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(..)), .. },
-                Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), ref mut target },
+                Adjustment { kind: Adjust::Pointer(PointerCoercion::Unsize), ref mut target },
             ] = adjustments[..]
             {
                 *target = method.sig.inputs()[0];

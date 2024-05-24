@@ -153,6 +153,14 @@ pub struct Notification {
     pub params: serde_json::Value,
 }
 
+fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+macro_rules! invalid_data {
+    ($($tt:tt)*) => (invalid_data(format!($($tt)*)))
+}
+
 impl Message {
     pub fn read(r: &mut impl BufRead) -> io::Result<Option<Message>> {
         Message::_read(r)
@@ -162,7 +170,14 @@ impl Message {
             None => return Ok(None),
             Some(text) => text,
         };
-        let msg = serde_json::from_str(&text)?;
+
+        let msg = match serde_json::from_str(&text) {
+            Ok(msg) => msg,
+            Err(e) => {
+                return Err(invalid_data!("malformed LSP payload: {:?}", e));
+            }
+        };
+
         Ok(Some(msg))
     }
     pub fn write(self, w: &mut impl Write) -> io::Result<()> {
@@ -240,13 +255,6 @@ impl Notification {
 }
 
 fn read_msg_text(inp: &mut dyn BufRead) -> io::Result<Option<String>> {
-    fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, error)
-    }
-    macro_rules! invalid_data {
-        ($($tt:tt)*) => (invalid_data(format!($($tt)*)))
-    }
-
     let mut size = None;
     let mut buf = String::new();
     loop {
@@ -265,7 +273,7 @@ fn read_msg_text(inp: &mut dyn BufRead) -> io::Result<Option<String>> {
         let header_name = parts.next().unwrap();
         let header_value =
             parts.next().ok_or_else(|| invalid_data!("malformed header: {:?}", buf))?;
-        if header_name == "Content-Length" {
+        if header_name.eq_ignore_ascii_case("Content-Length") {
             size = Some(header_value.parse::<usize>().map_err(invalid_data)?);
         }
     }

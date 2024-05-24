@@ -1,5 +1,8 @@
-use super::*;
+use expect_test::expect;
+
 use itertools::Itertools;
+
+use super::*;
 
 #[test]
 fn macro_rules_are_globally_visible() {
@@ -203,8 +206,8 @@ macro_rules! bar {
         expect![[r#"
             crate
             Foo: t
-            bar: m
-            foo: m
+            bar: mi
+            foo: mi
         "#]],
     );
 }
@@ -251,10 +254,76 @@ mod priv_mod {
             Bar: t v
             Foo: t v
             bar: t
-            foo: t
+            foo: te
 
             crate::bar
             Baz: t v
+        "#]],
+    );
+}
+
+#[test]
+fn macro_use_filter() {
+    check(
+        r#"
+//- /main.rs crate:main deps:empty,multiple,all
+#[macro_use()]
+extern crate empty;
+
+foo_not_imported!();
+
+#[macro_use(bar1)]
+#[macro_use()]
+#[macro_use(bar2, bar3)]
+extern crate multiple;
+
+bar1!();
+bar2!();
+bar3!();
+bar_not_imported!();
+
+#[macro_use(baz1)]
+#[macro_use]
+#[macro_use(baz2)]
+extern crate all;
+
+baz1!();
+baz2!();
+baz3!();
+
+//- /empty.rs crate:empty
+#[macro_export]
+macro_rules! foo_not_imported { () => { struct NotOkFoo; } }
+
+//- /multiple.rs crate:multiple
+#[macro_export]
+macro_rules! bar1 { () => { struct OkBar1; } }
+#[macro_export]
+macro_rules! bar2 { () => { struct OkBar2; } }
+#[macro_export]
+macro_rules! bar3 { () => { struct OkBar3; } }
+#[macro_export]
+macro_rules! bar_not_imported { () => { struct NotOkBar; } }
+
+//- /all.rs crate:all
+#[macro_export]
+macro_rules! baz1 { () => { struct OkBaz1; } }
+#[macro_export]
+macro_rules! baz2 { () => { struct OkBaz2; } }
+#[macro_export]
+macro_rules! baz3 { () => { struct OkBaz3; } }
+"#,
+        expect![[r#"
+            crate
+            OkBar1: t v
+            OkBar2: t v
+            OkBar3: t v
+            OkBaz1: t v
+            OkBaz2: t v
+            OkBaz3: t v
+            all: te
+            empty: te
+            multiple: te
         "#]],
     );
 }
@@ -485,8 +554,8 @@ fn baz() {}
 "#,
         expect![[r#"
             crate
-            bar: t m
-            baz: t v m
+            bar: ti mi
+            baz: ti v mi
             foo: t m
         "#]],
     );
@@ -517,7 +586,7 @@ mod m {
             crate
             Alias: t v
             Direct: t v
-            foo: t
+            foo: te
         "#]],
     );
 }
@@ -562,9 +631,9 @@ mod m {
             m: t
 
             crate::m
-            alias1: m
-            alias2: m
-            alias3: m
+            alias1: mi
+            alias2: mi
+            alias3: mi
             not_found: _
         "#]],
     );
@@ -616,11 +685,11 @@ pub struct Baz;
 "#,
         expect![[r#"
             crate
-            Bar: t v
-            Baz: t v
+            Bar: ti vi
+            Baz: ti vi
             Foo: t v
-            FooSelf: t v
-            foo: t
+            FooSelf: ti vi
+            foo: te
             m: t
 
             crate::m
@@ -659,9 +728,32 @@ pub struct bar;
 "#,
         expect![[r#"
             crate
-            bar: t v
+            bar: ti vi
         "#]],
     );
+}
+
+#[test]
+fn macro_dollar_crate_is_correct_in_derive_meta() {
+    let map = compute_crate_def_map(
+        r#"
+//- minicore: derive, clone
+//- /main.rs crate:main deps:lib
+lib::foo!();
+
+//- /lib.rs crate:lib
+#[macro_export]
+macro_rules! foo {
+    () => {
+        #[derive($crate::Clone)]
+        struct S;
+    }
+}
+
+pub use core::clone::Clone;
+"#,
+    );
+    assert_eq!(map.modules[DefMap::ROOT].scope.impls().len(), 1);
 }
 
 #[test]
@@ -683,7 +775,7 @@ pub macro Copy {}
 pub macro Clone {}
 "#,
     );
-    assert_eq!(map.modules[map.root].scope.impls().len(), 2);
+    assert_eq!(map.modules[DefMap::ROOT].scope.impls().len(), 2);
 }
 
 #[test]
@@ -726,7 +818,7 @@ pub macro derive($item:item) {}
 pub macro Clone {}
 "#,
     );
-    assert_eq!(map.modules[map.root].scope.impls().len(), 1);
+    assert_eq!(map.modules[DefMap::ROOT].scope.impls().len(), 1);
 }
 
 #[test]
@@ -991,7 +1083,7 @@ macro_rules! mbe {
 
 #[test]
 fn collects_derive_helpers() {
-    let def_map = compute_crate_def_map(
+    let db = TestDB::with_files(
         r#"
 #![crate_type="proc-macro"]
 struct TokenStream;
@@ -1002,11 +1094,13 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
 }
 "#,
     );
+    let krate = db.crate_graph().iter().next().unwrap();
+    let def_map = db.crate_def_map(krate);
 
-    assert_eq!(def_map.exported_derives.len(), 1);
-    match def_map.exported_derives.values().next() {
+    assert_eq!(def_map.data.exported_derives.len(), 1);
+    match def_map.data.exported_derives.values().next() {
         Some(helpers) => match &**helpers {
-            [attr] => assert_eq!(attr.to_string(), "helper_attr"),
+            [attr] => assert_eq!(attr.display(&db).to_string(), "helper_attr"),
             _ => unreachable!(),
         },
         _ => unreachable!(),
@@ -1168,8 +1262,56 @@ struct A;
 }
 
 #[test]
+fn nested_include() {
+    check(
+        r#"
+//- minicore: include
+//- /lib.rs
+include!("out_dir/includes.rs");
+
+//- /out_dir/includes.rs
+pub mod company_name {
+    pub mod network {
+        pub mod v1 {
+            include!("company_name.network.v1.rs");
+        }
+    }
+}
+//- /out_dir/company_name.network.v1.rs
+pub struct IpAddress {
+    pub ip_type: &'static str,
+}
+/// Nested message and enum types in `IpAddress`.
+pub mod ip_address {
+    pub enum IpType {
+        IpV4(u32),
+    }
+}
+
+"#,
+        expect![[r#"
+            crate
+            company_name: t
+
+            crate::company_name
+            network: t
+
+            crate::company_name::network
+            v1: t
+
+            crate::company_name::network::v1
+            IpAddress: t
+            ip_address: t
+
+            crate::company_name::network::v1::ip_address
+            IpType: t
+        "#]],
+    );
+}
+
+#[test]
 fn macro_use_imports_all_macro_types() {
-    let def_map = compute_crate_def_map(
+    let db = TestDB::with_files(
         r#"
 //- /main.rs crate:main deps:lib
 #[macro_use]
@@ -1192,18 +1334,153 @@ struct TokenStream;
 fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
     "#,
     );
+    let krate = db.crate_graph().iter().next().unwrap();
+    let def_map = db.crate_def_map(krate);
 
-    let root = &def_map[def_map.root()].scope;
-    let actual = root
-        .legacy_macros()
-        .sorted_by(|a, b| std::cmp::Ord::cmp(&a.0, &b.0))
-        .map(|(name, _)| format!("{name}\n"))
-        .collect::<String>();
+    let root_module = &def_map[DefMap::ROOT].scope;
+    assert!(
+        root_module.legacy_macros().count() == 0,
+        "`#[macro_use]` shouldn't bring macros into textual macro scope",
+    );
+
+    let actual = def_map
+        .macro_use_prelude
+        .keys()
+        .map(|name| name.display(&db).to_string())
+        .sorted()
+        .join("\n");
 
     expect![[r#"
         legacy
         macro20
-        proc_attr
-    "#]]
+        proc_attr"#]]
     .assert_eq(&actual);
+}
+
+#[test]
+fn non_prelude_macros_take_precedence_over_macro_use_prelude() {
+    check(
+        r#"
+//- /lib.rs edition:2021 crate:lib deps:dep,core
+#[macro_use]
+extern crate dep;
+
+macro foo() { struct Ok; }
+macro bar() { fn ok() {} }
+
+foo!();
+bar!();
+
+//- /dep.rs crate:dep
+#[macro_export]
+macro_rules! foo {
+    () => { struct NotOk; }
+}
+
+//- /core.rs crate:core
+pub mod prelude {
+    pub mod rust_2021 {
+        #[macro_export]
+        macro_rules! bar {
+            () => { fn not_ok() {} }
+        }
+    }
+}
+        "#,
+        expect![[r#"
+            crate
+            Ok: t v
+            bar: m
+            dep: te
+            foo: m
+            ok: v
+        "#]],
+    );
+}
+
+#[test]
+fn macro_use_prelude_is_eagerly_expanded() {
+    // See FIXME in `ModCollector::collect_macro_call()`.
+    check(
+        r#"
+//- /main.rs crate:main deps:lib
+#[macro_use]
+extern crate lib;
+mk_foo!();
+mod a {
+    foo!();
+}
+//- /lib.rs crate:lib
+#[macro_export]
+macro_rules! mk_foo {
+    () => {
+        macro_rules! foo {
+            () => { struct Ok; }
+        }
+    }
+}
+    "#,
+        expect![[r#"
+            crate
+            a: t
+            lib: te
+
+            crate::a
+            Ok: t v
+        "#]],
+    );
+}
+
+#[test]
+fn macro_sub_namespace() {
+    let map = compute_crate_def_map(
+        r#"
+//- minicore: derive, clone
+macro_rules! Clone { () => {} }
+macro_rules! derive { () => {} }
+
+#[derive(Clone)]
+struct S;
+    "#,
+    );
+    assert_eq!(map.modules[DefMap::ROOT].scope.impls().len(), 1);
+}
+
+#[test]
+fn macro_sub_namespace2() {
+    check(
+        r#"
+//- /main.rs edition:2021 crate:main deps:proc,core
+use proc::{foo, bar};
+
+foo!();
+bar!();
+
+//- /proc.rs crate:proc
+#![crate_type="proc-macro"]
+#[proc_macro_derive(foo)]
+pub fn foo() {}
+#[proc_macro_attribute]
+pub fn bar() {}
+
+//- /core.rs crate:core
+pub mod prelude {
+    pub mod rust_2021 {
+        pub macro foo() {
+            struct Ok;
+        }
+        pub macro bar() {
+            fn ok() {}
+        }
+    }
+}
+    "#,
+        expect![[r#"
+            crate
+            Ok: t v
+            bar: mi
+            foo: mi
+            ok: v
+        "#]],
+    );
 }

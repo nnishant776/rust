@@ -1,5 +1,4 @@
-// run-pass
-// ignore-pretty issue #37195
+//@ run-pass
 
 #![allow(dead_code)]
 

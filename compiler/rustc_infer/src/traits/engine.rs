@@ -1,7 +1,8 @@
 use crate::infer::InferCtxt;
 use crate::traits::Obligation;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, ToPredicate, Ty};
+use rustc_macros::extension;
+use rustc_middle::ty::{self, Ty, Upcast};
 
 use super::FulfillmentError;
 use super::{ObligationCause, PredicateObligation};
@@ -18,14 +19,14 @@ pub trait TraitEngine<'tcx>: 'tcx {
         def_id: DefId,
         cause: ObligationCause<'tcx>,
     ) {
-        let trait_ref = infcx.tcx.mk_trait_ref(def_id, [ty]);
+        let trait_ref = ty::TraitRef::new(infcx.tcx, def_id, [ty]);
         self.register_predicate_obligation(
             infcx,
             Obligation {
                 cause,
                 recursion_depth: 0,
                 param_env,
-                predicate: ty::Binder::dummy(trait_ref).without_const().to_predicate(infcx.tcx),
+                predicate: trait_ref.upcast(infcx.tcx),
             },
         );
     }
@@ -36,9 +37,10 @@ pub trait TraitEngine<'tcx>: 'tcx {
         obligation: PredicateObligation<'tcx>,
     );
 
+    #[must_use]
     fn select_where_possible(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>>;
 
-    fn collect_remaining_errors(&mut self) -> Vec<FulfillmentError<'tcx>>;
+    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>>;
 
     fn pending_obligations(&self) -> Vec<PredicateObligation<'tcx>>;
 
@@ -51,17 +53,8 @@ pub trait TraitEngine<'tcx>: 'tcx {
     ) -> Vec<PredicateObligation<'tcx>>;
 }
 
-pub trait TraitEngineExt<'tcx> {
-    fn register_predicate_obligations(
-        &mut self,
-        infcx: &InferCtxt<'tcx>,
-        obligations: impl IntoIterator<Item = PredicateObligation<'tcx>>,
-    );
-
-    fn select_all_or_error(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>>;
-}
-
-impl<'tcx, T: ?Sized + TraitEngine<'tcx>> TraitEngineExt<'tcx> for T {
+#[extension(pub trait TraitEngineExt<'tcx>)]
+impl<'tcx, T: ?Sized + TraitEngine<'tcx>> T {
     fn register_predicate_obligations(
         &mut self,
         infcx: &InferCtxt<'tcx>,
@@ -72,12 +65,13 @@ impl<'tcx, T: ?Sized + TraitEngine<'tcx>> TraitEngineExt<'tcx> for T {
         }
     }
 
+    #[must_use]
     fn select_all_or_error(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>> {
         let errors = self.select_where_possible(infcx);
         if !errors.is_empty() {
             return errors;
         }
 
-        self.collect_remaining_errors()
+        self.collect_remaining_errors(infcx)
     }
 }

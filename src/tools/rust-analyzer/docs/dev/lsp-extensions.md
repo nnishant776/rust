@@ -1,5 +1,5 @@
 <!---
-lsp_ext.rs hash: d87477896dfe41d4
+lsp/ext.rs hash: a39009c351009d16
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -57,8 +57,9 @@ export interface TextDocumentEdit {
 }
 ```
 
-When applying such code action or text edit, the editor should insert snippet, with tab stops and placeholder.
-At the moment, rust-analyzer guarantees that only a single edit will have `InsertTextFormat.Snippet`.
+When applying such code action or text edit, the editor should insert snippet, with tab stops and placeholders.
+At the moment, rust-analyzer guarantees that only a single `TextDocumentEdit` will have edits which can be `InsertTextFormat.Snippet`.
+Any additional `TextDocumentEdit`s will only have edits which are `InsertTextFormat.PlainText`.
 
 ### Example
 
@@ -238,13 +239,13 @@ The primary goal of `onEnter` is to handle automatic indentation when opening a 
 This is not yet implemented.
 The secondary goal is to handle fixing up syntax, like continuing doc strings and comments, and escaping `\n` in string literals.
 
-As proper cursor positioning is raison-d'etat for `onEnter`, it uses `SnippetTextEdit`.
+As proper cursor positioning is raison d'être for `onEnter`, it uses `SnippetTextEdit`.
 
 ### Unresolved Question
 
 * How to deal with synchronicity of the request?
   One option is to require the client to block until the server returns the response.
-  Another option is to do a OT-style merging of edits from client and server.
+  Another option is to do a operational transforms style merging of edits from client and server.
   A third option is to do a record-replay: client applies heuristic on enter immediately, then applies all user's keypresses.
   When the server is ready with the response, the client rollbacks all the changes and applies the recorded actions on top of the correct response.
 * How to deal with multiple carets?
@@ -322,7 +323,7 @@ Position[]
 
 ```rust
 fn main() {
-    let x: Vec<()>/*cursor here*/ = vec![]
+    let x: Vec<()>/*cursor here*/ = vec![];
 }
 ```
 
@@ -333,7 +334,7 @@ Moreover, it would be cool if editors didn't need to implement even basic langua
 
 ### Unresolved Question
 
-* Should we return a nested brace structure, to allow paredit-like actions of jump *out* of the current brace pair?
+* Should we return a nested brace structure, to allow [paredit](https://paredit.org/)-like actions of jump *out* of the current brace pair?
   This is how `SelectionRange` request works.
 * Alternatively, should we perhaps flag certain `SelectionRange`s as being brace pairs?
 
@@ -362,7 +363,7 @@ interface RunnablesParams {
 ```typescript
 interface Runnable {
     label: string;
-    /// If this Runnable is associated with a specific function/module, etc, the location of this item
+    /// If this Runnable is associated with a specific function/module, etc., the location of this item
     location?: LocationLink;
     /// Running things is necessary technology specific, `kind` needs to be advertised via server capabilities,
     // the type of `args` is specific to `kind`. The actual running is handled by the client.
@@ -384,16 +385,163 @@ rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look
 }
 ```
 
+## Test explorer
+
+**Experimental Client Capability:** `{ "testExplorer": boolean }`
+
+If this capability is set, the `experimental/discoveredTests` notification will be sent from the
+server to the client.
+
+**Method:** `experimental/discoverTest`
+
+**Request:** `DiscoverTestParams`
+
+```typescript
+interface DiscoverTestParams {
+    // The test that we need to resolve its children. If not present,
+    // the response should return top level tests.
+    testId?: string | undefined;
+}
+```
+
+**Response:** `DiscoverTestResults`
+
+```typescript
+interface TestItem {
+    // A unique identifier for the test
+    id: string;
+    // The file containing this test
+    textDocument?: lc.TextDocumentIdentifier | undefined;
+    // The range in the file containing this test
+    range?: lc.Range | undefined;
+    // A human readable name for this test
+    label: string;
+    // The kind of this test item. Based on the kind,
+	// an icon is chosen by the editor.
+    kind: "package" | "module" | "test";
+    // True if this test may have children not available eagerly
+    canResolveChildren: boolean;
+    // The id of the parent test in the test tree. If not present, this test
+    // is a top level test.
+    parent?: string | undefined;
+    // The information useful for running the test. The client can use `runTest`
+    // request for simple execution, but for more complex execution forms
+    // like debugging, this field is useful.
+    // Note that this field includes some information about label and location as well, but
+    // those exist just for keeping things in sync with other methods of running runnables
+    // (for example using one consistent name in the vscode's launch.json) so for any propose
+    // other than running tests this field should not be used.
+    runnable?: Runnable | undefined;
+};
+
+interface DiscoverTestResults {
+    // The discovered tests.
+    tests: TestItem[];
+    // For each test which its id is in this list, the response
+    // contains all tests that are children of this test, and
+    // client should remove old tests not included in the response.
+    scope: string[] | undefined;
+    // For each file which its uri is in this list, the response
+    // contains all tests that are located in this file, and
+    // client should remove old tests not included in the response.
+    scopeFile: lc.TextDocumentIdentifier[] | undefined;
+}
+```
+
+**Method:** `experimental/discoveredTests`
+
+**Notification:** `DiscoverTestResults`
+
+This notification is sent from the server to the client when the
+server detect changes in the existing tests. The `DiscoverTestResults` is
+the same as the one in `experimental/discoverTest` response.
+
+**Method:** `experimental/runTest`
+
+**Request:** `RunTestParams`
+
+```typescript
+interface RunTestParams {
+    // Id of the tests to be run. If a test is included, all of its children are included implicitly. If
+    // this property is undefined, then the server should simply run all tests.
+    include?: string[] | undefined;
+    // An array of test ids the user has marked as excluded from the test included in this run; exclusions
+    // should apply after inclusions.
+    // May be omitted if no exclusions were requested. Server should not run excluded tests or
+    // any children of excluded tests.
+    exclude?: string[] | undefined;
+}
+```
+
+**Response:** `void`
+
+**Method:** `experimental/endRunTest`
+
+**Notification:**
+
+This notification is sent from the server to the client when the current running
+session is finished. The server should not send any run notification
+after this.
+
+**Method:** `experimental/abortRunTest`
+
+**Notification:**
+
+This notification is sent from the client to the server when the user is no longer
+interested in the test results. The server should clean up its resources and send
+a `experimental/endRunTest` when is done.
+
+**Method:** `experimental/changeTestState`
+
+**Notification:** `ChangeTestStateParams`
+
+```typescript
+type TestState = { tag: "passed" }
+    | {
+        tag: "failed";
+        // The standard error of the test, containing the panic message. Clients should
+        // render it similar to a terminal, and e.g. handle ansi colors.
+        message: string;
+    }
+    | { tag: "started" }
+    | { tag: "enqueued" }
+    | { tag: "skipped" };
+
+interface ChangeTestStateParams {
+    testId: string;
+    state: TestState;
+}
+```
+
+**Method:** `experimental/appendOutputToRunTest`
+
+**Notification:** `string`
+
+This notification is used for reporting messages independent of any single test and related to the run session
+in general, e.g. cargo compiling progress messages or warnings.
+
 ## Open External Documentation
 
-This request is sent from client to server to get a URL to documentation for the symbol under the cursor, if available.
+This request is sent from the client to the server to obtain web and local URL(s) for documentation related to the symbol under the cursor, if available.
 
-**Method** `experimental/externalDocs`
+**Method:** `experimental/externalDocs`
 
-**Request:**: `TextDocumentPositionParams`
+**Request:** `TextDocumentPositionParams`
 
-**Response** `string | null`
+**Response:** `string | null`
 
+## Local Documentation
+
+**Experimental Client Capability:** `{ "localDocs": boolean }`
+
+If this capability is set, the `Open External Documentation` request returned from the server will have the following structure:
+
+```typescript
+interface ExternalDocsResponse {
+    web?: string;
+    local?: string;
+}
+```
 
 ## Analyzer Status
 
@@ -421,6 +569,35 @@ Returns internal status message, mostly for debugging purposes.
 **Response:** `null`
 
 Reloads project information (that is, re-executes `cargo metadata`).
+
+## Rebuild proc-macros
+
+**Method:** `rust-analyzer/rebuildProcMacros`
+
+**Request:** `null`
+
+**Response:** `null`
+
+Rebuilds build scripts and proc-macros, and runs the build scripts to reseed the build data.
+
+## Unindexed Project
+
+**Experimental Client Capability:** `{ "unindexedProject": boolean }`
+
+**Method:** `rust-analyzer/unindexedProject`
+
+**Notification:**
+
+```typescript
+interface UnindexedProjectParams {
+    /// A list of documents that rust-analyzer has determined are not indexed.
+    textDocuments: lc.TextDocumentIdentifier[]
+}
+```
+
+This notification is sent from the server to the client. The client is expected
+to determine the appropriate owners of `textDocuments` and update `linkedProjects`
+if an owner can be determined successfully.
 
 ## Server Status
 
@@ -526,6 +703,29 @@ Primarily for debugging, but very useful for all people working on rust-analyzer
 
 Returns a textual representation of the HIR of the function containing the cursor.
 For debugging or when working on rust-analyzer itself.
+
+## View Mir
+
+**Method:** `rust-analyzer/viewMir`
+
+**Request:** `TextDocumentPositionParams`
+
+**Response:** `string`
+
+Returns a textual representation of the MIR of the function containing the cursor.
+For debugging or when working on rust-analyzer itself.
+
+## Interpret Function
+
+**Method:** `rust-analyzer/interpretFunction`
+
+**Request:** `TextDocumentPositionParams`
+
+**Response:** `string`
+
+Tries to evaluate the function using internal rust analyzer knowledge, without compiling
+the code. Currently evaluates the function under cursor, but will give a runnable in
+future. Highly experimental.
 
 ## View File Text
 
@@ -818,3 +1018,71 @@ export interface Diagnostic {
         rendered?: string;
     };
 }
+```
+
+## Dependency Tree
+
+**Method:** `rust-analyzer/fetchDependencyList`
+
+**Request:**
+
+```typescript
+export interface FetchDependencyListParams {}
+```
+
+**Response:**
+```typescript
+export interface FetchDependencyListResult {
+    crates: {
+        name: string;
+        version: string;
+        path: string;
+    }[];
+}
+```
+Returns all crates from this workspace, so it can be used create a viewTree to help navigate the dependency tree.
+
+## View Recursive Memory Layout
+
+**Method:** `rust-analyzer/viewRecursiveMemoryLayout`
+
+**Request:** `TextDocumentPositionParams`
+
+**Response:**
+
+```typescript
+export interface RecursiveMemoryLayoutNode = {
+    /// Name of the item, or [ROOT], `.n` for tuples
+    item_name: string;
+    /// Full name of the type (type aliases are ignored)
+    typename: string;
+    /// Size of the type in bytes
+    size: number;
+    /// Alignment of the type in bytes
+    alignment: number;
+    /// Offset of the type relative to its parent (or 0 if its the root)
+    offset: number;
+    /// Index of the node's parent (or -1 if its the root)
+    parent_idx: number;
+    /// Index of the node's children (or -1 if it does not have children)
+    children_start: number;
+    /// Number of child nodes (unspecified it does not have children)
+    children_len: number;
+};
+
+export interface RecursiveMemoryLayout = {
+    nodes: RecursiveMemoryLayoutNode[];
+};
+```
+
+Returns a vector of nodes representing items in the datatype as a tree, `RecursiveMemoryLayout::nodes[0]` is the root node.
+
+If `RecursiveMemoryLayout::nodes::length == 0` we could not find a suitable type.
+
+Generic Types do not give anything because they are incomplete. Fully specified generic types do not give anything if they are selected directly but do work when a child of other types [this is consistent with other behavior](https://github.com/rust-lang/rust-analyzer/issues/15010).
+
+### Unresolved questions:
+
+- How should enums/unions be represented? currently they do not produce any children because they have multiple distinct sets of children.
+- Should niches be represented? currently they are not reported.
+- A visual representation of the memory layout is not specified, see the provided implementation for an example, however it may not translate well to terminal based editors or other such things.

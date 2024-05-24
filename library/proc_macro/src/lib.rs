@@ -17,6 +17,8 @@
     test(no_crate_inject, attr(deny(warnings))),
     test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
 )]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
 // This library is copied into rust-analyzer to allow loading rustc compiled proc macros.
 // Please avoid unstable features where possible to minimize the amount of changes necessary
 // to make it compile with rust-analyzer on stable.
@@ -24,15 +26,17 @@
 #![feature(staged_api)]
 #![feature(allow_internal_unstable)]
 #![feature(decl_macro)]
-#![feature(local_key_cell_methods)]
 #![feature(maybe_uninit_write_slice)]
 #![feature(negative_impls)]
 #![feature(new_uninit)]
+#![feature(panic_can_unwind)]
 #![feature(restricted_std)]
 #![feature(rustc_attrs)]
 #![feature(min_specialization)]
 #![feature(strict_provenance)]
 #![recursion_limit = "256"]
+#![allow(internal_features)]
+#![deny(ffi_unwind_calls)]
 
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
@@ -43,11 +47,11 @@ mod diagnostic;
 #[unstable(feature = "proc_macro_diagnostic", issue = "54140")]
 pub use diagnostic::{Diagnostic, Level, MultiSpan};
 
-use std::cmp::Ordering;
-use std::ops::RangeBounds;
+use std::ffi::CStr;
+use std::ops::{Range, RangeBounds};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{error, fmt, iter};
+use std::{error, fmt};
 
 /// Determines whether proc_macro has been made accessible to the currently
 /// running program.
@@ -69,7 +73,7 @@ pub fn is_available() -> bool {
 
 /// The main type provided by this crate, representing an abstract stream of
 /// tokens, or, more specifically, a sequence of token trees.
-/// The type provide interfaces for iterating over those token trees and, conversely,
+/// The type provides interfaces for iterating over those token trees and, conversely,
 /// collecting a number of token trees into one stream.
 ///
 /// This is both the input and output of `#[proc_macro]`, `#[proc_macro_attribute]`
@@ -178,6 +182,7 @@ impl FromStr for TokenStream {
 
 // N.B., the bridge only provides `to_string`, implement `fmt::Display`
 // based on it (the reverse of the usual relationship between the two).
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 impl ToString for TokenStream {
     fn to_string(&self) -> String {
@@ -188,8 +193,17 @@ impl ToString for TokenStream {
 /// Prints the token stream as a string that is supposed to be losslessly convertible back
 /// into the same token stream (modulo spans), except for possibly `TokenTree::Group`s
 /// with `Delimiter::None` delimiters and negative numeric literals.
+///
+/// Note: the exact form of the output is subject to change, e.g. there might
+/// be changes in the whitespace used between tokens. Therefore, you should
+/// *not* do any kind of simple substring matching on the output string (as
+/// produced by `to_string`) to implement a proc macro, because that matching
+/// might stop working if such changes happen. Instead, you should work at the
+/// `TokenTree` level, e.g. matching against `TokenTree::Ident`,
+/// `TokenTree::Punct`, or `TokenTree::Literal`.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 impl fmt::Display for TokenStream {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -310,7 +324,7 @@ impl ConcatStreamsHelper {
 
 /// Collects a number of token trees into a single stream.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
-impl iter::FromIterator<TokenTree> for TokenStream {
+impl FromIterator<TokenTree> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenTree>>(trees: I) -> Self {
         let iter = trees.into_iter();
         let mut builder = ConcatTreesHelper::new(iter.size_hint().0);
@@ -322,7 +336,7 @@ impl iter::FromIterator<TokenTree> for TokenStream {
 /// A "flattening" operation on token streams, collects token trees
 /// from multiple token streams into a single stream.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
-impl iter::FromIterator<TokenStream> for TokenStream {
+impl FromIterator<TokenStream> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenStream>>(streams: I) -> Self {
         let iter = streams.into_iter();
         let mut builder = ConcatStreamsHelper::new(iter.size_hint().0);
@@ -488,28 +502,38 @@ impl Span {
         Span(self.0.source())
     }
 
-    /// Gets the starting line/column in the source file for this span.
+    /// Returns the span's byte position range in the source file.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
-    pub fn start(&self) -> LineColumn {
-        self.0.start().add_1_to_column()
-    }
-
-    /// Gets the ending line/column in the source file for this span.
-    #[unstable(feature = "proc_macro_span", issue = "54725")]
-    pub fn end(&self) -> LineColumn {
-        self.0.end().add_1_to_column()
+    pub fn byte_range(&self) -> Range<usize> {
+        self.0.byte_range()
     }
 
     /// Creates an empty span pointing to directly before this span.
-    #[unstable(feature = "proc_macro_span_shrink", issue = "87552")]
-    pub fn before(&self) -> Span {
-        Span(self.0.before())
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn start(&self) -> Span {
+        Span(self.0.start())
     }
 
     /// Creates an empty span pointing to directly after this span.
-    #[unstable(feature = "proc_macro_span_shrink", issue = "87552")]
-    pub fn after(&self) -> Span {
-        Span(self.0.after())
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn end(&self) -> Span {
+        Span(self.0.end())
+    }
+
+    /// The one-indexed line of the source file where the span starts.
+    ///
+    /// To obtain the line of the span's end, use `span.end().line()`.
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn line(&self) -> usize {
+        self.0.line()
+    }
+
+    /// The one-indexed column of the source file where the span starts.
+    ///
+    /// To obtain the column of the span's end, use `span.end().column()`.
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn column(&self) -> usize {
+        self.0.column()
     }
 
     /// Creates a new span encompassing `self` and `other`.
@@ -577,44 +601,6 @@ impl Span {
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-/// A line-column pair representing the start or end of a `Span`.
-#[unstable(feature = "proc_macro_span", issue = "54725")]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LineColumn {
-    /// The 1-indexed line in the source file on which the span starts or ends (inclusive).
-    #[unstable(feature = "proc_macro_span", issue = "54725")]
-    pub line: usize,
-    /// The 1-indexed column (number of bytes in UTF-8 encoding) in the source
-    /// file on which the span starts or ends (inclusive).
-    #[unstable(feature = "proc_macro_span", issue = "54725")]
-    pub column: usize,
-}
-
-impl LineColumn {
-    fn add_1_to_column(self) -> Self {
-        LineColumn { line: self.line, column: self.column + 1 }
-    }
-}
-
-#[unstable(feature = "proc_macro_span", issue = "54725")]
-impl !Send for LineColumn {}
-#[unstable(feature = "proc_macro_span", issue = "54725")]
-impl !Sync for LineColumn {}
-
-#[unstable(feature = "proc_macro_span", issue = "54725")]
-impl Ord for LineColumn {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.line.cmp(&other.line).then(self.column.cmp(&other.column))
-    }
-}
-
-#[unstable(feature = "proc_macro_span", issue = "54725")]
-impl PartialOrd for LineColumn {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -767,6 +753,7 @@ impl From<Literal> for TokenTree {
 
 // N.B., the bridge only provides `to_string`, implement `fmt::Display`
 // based on it (the reverse of the usual relationship between the two).
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 impl ToString for TokenTree {
     fn to_string(&self) -> String {
@@ -782,8 +769,17 @@ impl ToString for TokenTree {
 /// Prints the token tree as a string that is supposed to be losslessly convertible back
 /// into the same token tree (modulo spans), except for possibly `TokenTree::Group`s
 /// with `Delimiter::None` delimiters and negative numeric literals.
+///
+/// Note: the exact form of the output is subject to change, e.g. there might
+/// be changes in the whitespace used between tokens. Therefore, you should
+/// *not* do any kind of simple substring matching on the output string (as
+/// produced by `to_string`) to implement a proc macro, because that matching
+/// might stop working if such changes happen. Instead, you should work at the
+/// `TokenTree` level, e.g. matching against `TokenTree::Ident`,
+/// `TokenTree::Punct`, or `TokenTree::Literal`.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl fmt::Display for TokenTree {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -814,11 +810,23 @@ pub enum Delimiter {
     /// `[ ... ]`
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     Bracket,
-    /// `Ø ... Ø`
+    /// `∅ ... ∅`
     /// An invisible delimiter, that may, for example, appear around tokens coming from a
     /// "macro variable" `$var`. It is important to preserve operator priorities in cases like
     /// `$var * 3` where `$var` is `1 + 2`.
     /// Invisible delimiters might not survive roundtrip of a token stream through a string.
+    ///
+    /// <div class="warning">
+    ///
+    /// Note: rustc currently can ignore the grouping of tokens delimited by `None` in the output
+    /// of a proc_macro. Only `None`-delimited groups created by a macro_rules macro in the input
+    /// of a proc_macro macro are preserved, and only in very specific circumstances.
+    /// Any `None`-delimited groups (re)created by a proc_macro will therefore not preserve
+    /// operator priorities as indicated above. The other `Delimiter` variants should be used
+    /// instead in this context. This is a rustc bug. For details, see
+    /// [rust-lang/rust#67062](https://github.com/rust-lang/rust/issues/67062).
+    ///
+    /// </div>
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     None,
 }
@@ -901,6 +909,7 @@ impl Group {
 
 // N.B., the bridge only provides `to_string`, implement `fmt::Display`
 // based on it (the reverse of the usual relationship between the two).
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 impl ToString for Group {
     fn to_string(&self) -> String {
@@ -913,6 +922,7 @@ impl ToString for Group {
 /// with `Delimiter::None` delimiters.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl fmt::Display for Group {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -942,21 +952,32 @@ impl !Send for Punct {}
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl !Sync for Punct {}
 
-/// Describes whether a `Punct` is followed immediately by another `Punct` ([`Spacing::Joint`]) or
-/// by a different token or whitespace ([`Spacing::Alone`]).
+/// Indicates whether a `Punct` token can join with the following token
+/// to form a multi-character operator.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 pub enum Spacing {
-    /// A `Punct` is not immediately followed by another `Punct`.
-    /// E.g. `+` is `Alone` in `+ =`, `+ident` and `+()`.
-    #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
-    Alone,
-    /// A `Punct` is immediately followed by another `Punct`.
-    /// E.g. `+` is `Joint` in `+=` and `++`.
+    /// A `Punct` token can join with the following token to form a multi-character operator.
     ///
-    /// Additionally, single quote `'` can join with identifiers to form lifetimes: `'ident`.
+    /// In token streams constructed using proc macro interfaces, `Joint` punctuation tokens can be
+    /// followed by any other tokens. However, in token streams parsed from source code, the
+    /// compiler will only set spacing to `Joint` in the following cases.
+    /// - When a `Punct` is immediately followed by another `Punct` without a whitespace. E.g. `+`
+    ///   is `Joint` in `+=` and `++`.
+    /// - When a single quote `'` is immediately followed by an identifier without a whitespace.
+    ///   E.g. `'` is `Joint` in `'lifetime`.
+    ///
+    /// This list may be extended in the future to enable more token combinations.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     Joint,
+    /// A `Punct` token cannot join with the following token to form a multi-character operator.
+    ///
+    /// `Alone` punctuation tokens can be followed by any other tokens. In token streams parsed
+    /// from source code, the compiler will set spacing to `Alone` in all cases not covered by the
+    /// conditions for `Joint` above. E.g. `+` is `Alone` in `+ =`, `+ident` and `+()`. In
+    /// particular, tokens not followed by anything will be marked as `Alone`.
+    #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
+    Alone,
 }
 
 impl Punct {
@@ -988,10 +1009,9 @@ impl Punct {
         self.0.ch as char
     }
 
-    /// Returns the spacing of this punctuation character, indicating whether it's immediately
-    /// followed by another `Punct` in the token stream, so they can potentially be combined into
-    /// a multi-character operator (`Joint`), or it's followed by some other token or whitespace
-    /// (`Alone`) so the operator has certainly ended.
+    /// Returns the spacing of this punctuation character, indicating whether it can be potentially
+    /// combined into a multi-character operator with the following token (`Joint`), or whether the
+    /// operator has definitely ended (`Alone`).
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn spacing(&self) -> Spacing {
         if self.0.joint { Spacing::Joint } else { Spacing::Alone }
@@ -1010,6 +1030,7 @@ impl Punct {
     }
 }
 
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl ToString for Punct {
     fn to_string(&self) -> String {
@@ -1112,8 +1133,7 @@ impl Ident {
     }
 }
 
-/// Converts the identifier to a string that should be losslessly convertible
-/// back into the same identifier.
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl ToString for Ident {
     fn to_string(&self) -> String {
@@ -1351,11 +1371,25 @@ impl Literal {
         Literal::new(bridge::LitKind::Char, symbol, None)
     }
 
+    /// Byte character literal.
+    #[stable(feature = "proc_macro_byte_character", since = "1.79.0")]
+    pub fn byte_character(byte: u8) -> Literal {
+        let string = [byte].escape_ascii().to_string();
+        Literal::new(bridge::LitKind::Byte, &string, None)
+    }
+
     /// Byte string literal.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn byte_string(bytes: &[u8]) -> Literal {
         let string = bytes.escape_ascii().to_string();
         Literal::new(bridge::LitKind::ByteStr, &string, None)
+    }
+
+    /// C string literal.
+    #[stable(feature = "proc_macro_c_str_literals", since = "1.79.0")]
+    pub fn c_string(string: &CStr) -> Literal {
+        let string = string.to_bytes().escape_ascii().to_string();
+        Literal::new(bridge::LitKind::CStr, &string, None)
     }
 
     /// Returns the span encompassing this literal.
@@ -1425,7 +1459,15 @@ impl Literal {
                 let hashes = get_hashes_str(n);
                 f(&["br", hashes, "\"", symbol, "\"", hashes, suffix])
             }
-            _ => f(&[symbol, suffix]),
+            bridge::LitKind::CStr => f(&["c\"", symbol, "\"", suffix]),
+            bridge::LitKind::CStrRaw(n) => {
+                let hashes = get_hashes_str(n);
+                f(&["cr", hashes, "\"", symbol, "\"", hashes, suffix])
+            }
+
+            bridge::LitKind::Integer | bridge::LitKind::Float | bridge::LitKind::ErrWithGuar => {
+                f(&[symbol, suffix])
+            }
         })
     }
 }
@@ -1452,6 +1494,7 @@ impl FromStr for Literal {
     }
 }
 
+#[doc(hidden)]
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl ToString for Literal {
     fn to_string(&self) -> String {
@@ -1501,7 +1544,8 @@ pub mod tracked_env {
     #[unstable(feature = "proc_macro_tracked_env", issue = "99515")]
     pub fn var<K: AsRef<OsStr> + AsRef<str>>(key: K) -> Result<String, VarError> {
         let key: &str = key.as_ref();
-        let value = env::var(key);
+        let value = crate::bridge::client::FreeFunctions::injected_env_var(key)
+            .map_or_else(|| env::var(key), Ok);
         crate::bridge::client::FreeFunctions::track_env_var(key, value.as_deref().ok());
         value
     }

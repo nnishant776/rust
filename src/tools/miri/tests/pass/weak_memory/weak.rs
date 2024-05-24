@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering::*;
 use std::sync::atomic::{fence, AtomicUsize};
 use std::thread::spawn;
 
+#[allow(dead_code)]
 #[derive(Copy, Clone)]
 struct EvilSend<T>(pub T);
 
@@ -36,6 +37,8 @@ fn relaxed() -> bool {
     let x = static_atomic(0);
     let j1 = spawn(move || {
         x.store(1, Relaxed);
+        // Preemption is disabled, so the store above will never be the
+        // latest store visible to another thread.
         x.store(2, Relaxed);
     });
 
@@ -137,6 +140,7 @@ fn faa_replaced_by_load() -> bool {
 }
 
 /// Asserts that the function returns true at least once in 100 runs
+#[track_caller]
 fn assert_once(f: fn() -> bool) {
     assert!(std::iter::repeat_with(|| f()).take(100).any(|x| x));
 }

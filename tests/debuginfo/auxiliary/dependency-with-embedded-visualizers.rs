@@ -1,8 +1,7 @@
-// compile-flags:-g
-// ignore-lldb
-// no-prefer-dynamic
+//@ compile-flags:-g
+//@ ignore-lldb
+//@ no-prefer-dynamic
 
-#![feature(debugger_visualizer)]
 #![debugger_visualizer(natvis_file = "dependency-with-embedded-visualizers.natvis")]
 #![debugger_visualizer(gdb_script_file = "dependency-with-embedded-visualizers.py")]
 #![crate_type = "rlib"]

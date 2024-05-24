@@ -11,7 +11,7 @@ use crate::{fmt, io, mem, ptr};
 #[cfg(not(unix))]
 #[allow(non_camel_case_types)]
 mod libc {
-    pub use libc::c_int;
+    pub use core::ffi::c_int;
     pub type socklen_t = u32;
     pub struct sockaddr;
     #[derive(Clone)]
@@ -21,7 +21,7 @@ mod libc {
 fn sun_path_offset(addr: &libc::sockaddr_un) -> usize {
     // Work with an actual instance of the type since using a null pointer is UB
     let base = (addr as *const libc::sockaddr_un).addr();
-    let path = (&addr.sun_path as *const libc::c_char).addr();
+    let path = core::ptr::addr_of!(addr.sun_path).addr();
     path - base
 }
 
@@ -98,7 +98,7 @@ impl SocketAddr {
         unsafe {
             let mut addr: libc::sockaddr_un = mem::zeroed();
             let mut len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-            cvt(f(&mut addr as *mut _ as *mut _, &mut len))?;
+            cvt(f(core::ptr::addr_of_mut!(addr) as *mut _, &mut len))?;
             SocketAddr::from_parts(addr, len)
         }
     }
@@ -107,6 +107,16 @@ impl SocketAddr {
         addr: libc::sockaddr_un,
         mut len: libc::socklen_t,
     ) -> io::Result<SocketAddr> {
+        if cfg!(target_os = "openbsd") {
+            // on OpenBSD, getsockname(2) returns the actual size of the socket address,
+            // and not the len of the content. Figure out the length for ourselves.
+            // https://marc.info/?l=openbsd-bugs&m=170105481926736&w=2
+            let sun_path: &[u8] =
+                unsafe { mem::transmute::<&[libc::c_char], &[u8]>(&addr.sun_path) };
+            len = core::slice::memchr::memchr(0, sun_path)
+                .map_or(len, |new_len| (new_len + sun_path_offset(&addr)) as libc::socklen_t);
+        }
+
         if len == 0 {
             // When there is a datagram from unnamed unix socket
             // linux returns zero bytes of address
@@ -245,12 +255,12 @@ impl SocketAddr {
     }
 }
 
-#[unstable(feature = "unix_socket_abstract", issue = "85410")]
+#[stable(feature = "unix_socket_abstract", since = "1.70.0")]
 impl Sealed for SocketAddr {}
 
 #[doc(cfg(any(target_os = "android", target_os = "linux")))]
 #[cfg(any(doc, target_os = "android", target_os = "linux"))]
-#[unstable(feature = "unix_socket_abstract", issue = "85410")]
+#[stable(feature = "unix_socket_abstract", since = "1.70.0")]
 impl linux_ext::addr::SocketAddrExt for SocketAddr {
     fn as_abstract_name(&self) -> Option<&[u8]> {
         if let AddressKind::Abstract(name) = self.address() { Some(name) } else { None }

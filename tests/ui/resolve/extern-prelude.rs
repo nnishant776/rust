@@ -1,7 +1,7 @@
-// build-pass (FIXME(62277): could be check-pass?)
-// compile-flags:--extern extern_prelude --extern Vec
-// aux-build:extern-prelude.rs
-// aux-build:extern-prelude-vec.rs
+//@ build-pass (FIXME(62277): could be check-pass?)
+//@ compile-flags:--extern extern_prelude --extern Vec
+//@ aux-build:extern-prelude.rs
+//@ aux-build:extern-prelude-vec.rs
 
 fn basic() {
     // It works
@@ -25,7 +25,7 @@ fn shadow_mod() {
 
 fn shadow_prelude() {
     // Extern prelude shadows standard library prelude
-    let x = Vec::new(0f32, ()); // OK
+    let x: () = Vec::new(0f32, ()); // OK
 }
 
 fn main() {}

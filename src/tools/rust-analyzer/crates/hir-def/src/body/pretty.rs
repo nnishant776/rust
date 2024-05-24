@@ -2,10 +2,13 @@
 
 use std::fmt::{self, Write};
 
-use syntax::ast::HasName;
+use itertools::Itertools;
 
 use crate::{
-    expr::{Array, BindingAnnotation, ClosureKind, Literal, Movability, Statement},
+    hir::{
+        Array, BindingAnnotation, CaptureBy, ClosureKind, Literal, LiteralOrConst, Movability,
+        Statement,
+    },
     pretty::{print_generic_args, print_path, print_type_ref},
     type_ref::TypeRef,
 };
@@ -13,44 +16,70 @@ use crate::{
 use super::*;
 
 pub(super) fn print_body_hir(db: &dyn DefDatabase, body: &Body, owner: DefWithBodyId) -> String {
-    let needs_semi;
     let header = match owner {
         DefWithBodyId::FunctionId(it) => {
-            needs_semi = false;
-            let item_tree_id = it.lookup(db).id;
-            format!("fn {}(…) ", item_tree_id.item_tree(db)[item_tree_id.value].name)
+            it.lookup(db).id.resolved(db, |it| format!("fn {}", it.name.display(db.upcast())))
         }
-        DefWithBodyId::StaticId(it) => {
-            needs_semi = true;
-            let item_tree_id = it.lookup(db).id;
-            format!("static {} = ", item_tree_id.item_tree(db)[item_tree_id.value].name)
-        }
-        DefWithBodyId::ConstId(it) => {
-            needs_semi = true;
-            let item_tree_id = it.lookup(db).id;
-            let name = match &item_tree_id.item_tree(db)[item_tree_id.value].name {
-                Some(name) => name.to_string(),
-                None => "_".to_string(),
-            };
-            format!("const {name} = ")
-        }
+        DefWithBodyId::StaticId(it) => it
+            .lookup(db)
+            .id
+            .resolved(db, |it| format!("static {} = ", it.name.display(db.upcast()))),
+        DefWithBodyId::ConstId(it) => it.lookup(db).id.resolved(db, |it| {
+            format!(
+                "const {} = ",
+                match &it.name {
+                    Some(name) => name.display(db.upcast()).to_string(),
+                    None => "_".to_owned(),
+                }
+            )
+        }),
+        DefWithBodyId::InTypeConstId(_) => "In type const = ".to_owned(),
         DefWithBodyId::VariantId(it) => {
-            needs_semi = false;
-            let src = it.parent.child_source(db);
-            let variant = &src.value[it.local_id];
-            let name = match &variant.name() {
-                Some(name) => name.to_string(),
-                None => "_".to_string(),
-            };
-            format!("{name}")
+            let loc = it.lookup(db);
+            let enum_loc = loc.parent.lookup(db);
+            format!(
+                "enum {}::{}",
+                enum_loc.id.item_tree(db)[enum_loc.id.value].name.display(db.upcast()),
+                loc.id.item_tree(db)[loc.id.value].name.display(db.upcast()),
+            )
         }
     };
 
-    let mut p = Printer { body, buf: header, indent_level: 0, needs_indent: false };
+    let mut p = Printer { db, body, buf: header, indent_level: 0, needs_indent: false };
+    if let DefWithBodyId::FunctionId(it) = owner {
+        p.buf.push('(');
+        let params = &db.function_data(it).params;
+        let mut params = params.iter();
+        if let Some(self_param) = body.self_param {
+            p.print_binding(self_param);
+            p.buf.push(':');
+            if let Some(ty) = params.next() {
+                p.print_type_ref(ty);
+            }
+        }
+        body.params.iter().zip(params).for_each(|(&param, ty)| {
+            p.print_pat(param);
+            p.buf.push(':');
+            p.print_type_ref(ty);
+        });
+        p.buf.push(')');
+        p.buf.push(' ');
+    }
     p.print_expr(body.body_expr);
-    if needs_semi {
+    if matches!(owner, DefWithBodyId::StaticId(_) | DefWithBodyId::ConstId(_)) {
         p.buf.push(';');
     }
+    p.buf
+}
+
+pub(super) fn print_expr_hir(
+    db: &dyn DefDatabase,
+    body: &Body,
+    _owner: DefWithBodyId,
+    expr: ExprId,
+) -> String {
+    let mut p = Printer { db, body, buf: String::new(), indent_level: 0, needs_indent: false };
+    p.print_expr(expr);
     p.buf
 }
 
@@ -70,13 +99,14 @@ macro_rules! wln {
 }
 
 struct Printer<'a> {
+    db: &'a dyn DefDatabase,
     body: &'a Body,
     buf: String,
     indent_level: usize,
     needs_indent: bool,
 }
 
-impl<'a> Write for Printer<'a> {
+impl Write for Printer<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for line in s.split_inclusive('\n') {
             if self.needs_indent {
@@ -96,13 +126,13 @@ impl<'a> Write for Printer<'a> {
     }
 }
 
-impl<'a> Printer<'a> {
+impl Printer<'_> {
     fn indented(&mut self, f: impl FnOnce(&mut Self)) {
         self.indent_level += 1;
         wln!(self);
         f(self);
         self.indent_level -= 1;
-        self.buf = self.buf.trim_end_matches('\n').to_string();
+        self.buf = self.buf.trim_end_matches('\n').to_owned();
     }
 
     fn whitespace(&mut self) {
@@ -113,9 +143,14 @@ impl<'a> Printer<'a> {
     }
 
     fn newline(&mut self) {
-        match self.buf.chars().rev().find(|ch| *ch != ' ') {
-            Some('\n') | None => {}
-            _ => writeln!(self).unwrap(),
+        match self.buf.chars().rev().find_position(|ch| *ch != ' ') {
+            Some((_, '\n')) | None => {}
+            Some((idx, _)) => {
+                if idx != 0 {
+                    self.buf.drain(self.buf.len() - idx..);
+                }
+                writeln!(self).unwrap()
+            }
         }
     }
 
@@ -125,6 +160,19 @@ impl<'a> Printer<'a> {
         match expr {
             Expr::Missing => w!(self, "�"),
             Expr::Underscore => w!(self, "_"),
+            Expr::InlineAsm(_) => w!(self, "builtin#asm(_)"),
+            Expr::OffsetOf(offset_of) => {
+                w!(self, "builtin#offset_of(");
+                self.print_type_ref(&offset_of.container);
+                w!(
+                    self,
+                    ", {})",
+                    offset_of
+                        .fields
+                        .iter()
+                        .format_with(".", |field, f| f(&field.display(self.db.upcast())))
+                );
+            }
             Expr::Path(path) => self.print_path(path),
             Expr::If { condition, then_branch, else_branch } => {
                 w!(self, "if ");
@@ -144,27 +192,9 @@ impl<'a> Printer<'a> {
             }
             Expr::Loop { body, label } => {
                 if let Some(lbl) = label {
-                    w!(self, "{}: ", self.body[*lbl].name);
+                    w!(self, "{}: ", self.body[*lbl].name.display(self.db.upcast()));
                 }
                 w!(self, "loop ");
-                self.print_expr(*body);
-            }
-            Expr::While { condition, body, label } => {
-                if let Some(lbl) = label {
-                    w!(self, "{}: ", self.body[*lbl].name);
-                }
-                w!(self, "while ");
-                self.print_expr(*condition);
-                self.print_expr(*body);
-            }
-            Expr::For { iterable, pat, body, label } => {
-                if let Some(lbl) = label {
-                    w!(self, "{}: ", self.body[*lbl].name);
-                }
-                w!(self, "for ");
-                self.print_pat(*pat);
-                w!(self, " in ");
-                self.print_expr(*iterable);
                 self.print_expr(*body);
             }
             Expr::Call { callee, args, is_assignee_expr: _ } => {
@@ -182,10 +212,10 @@ impl<'a> Printer<'a> {
             }
             Expr::MethodCall { receiver, method_name, args, generic_args } => {
                 self.print_expr(*receiver);
-                w!(self, ".{}", method_name);
+                w!(self, ".{}", method_name.display(self.db.upcast()));
                 if let Some(args) = generic_args {
                     w!(self, "::<");
-                    print_generic_args(args, self).unwrap();
+                    print_generic_args(self.db, args, self).unwrap();
                     w!(self, ">");
                 }
                 w!(self, "(");
@@ -219,14 +249,14 @@ impl<'a> Printer<'a> {
             }
             Expr::Continue { label } => {
                 w!(self, "continue");
-                if let Some(label) = label {
-                    w!(self, " {}", label);
+                if let Some(lbl) = label {
+                    w!(self, " {}", self.body[*lbl].name.display(self.db.upcast()));
                 }
             }
             Expr::Break { expr, label } => {
                 w!(self, "break");
-                if let Some(label) = label {
-                    w!(self, " {}", label);
+                if let Some(lbl) = label {
+                    w!(self, " {}", self.body[*lbl].name.display(self.db.upcast()));
                 }
                 if let Some(expr) = expr {
                     self.whitespace();
@@ -239,6 +269,11 @@ impl<'a> Printer<'a> {
                     self.whitespace();
                     self.print_expr(*expr);
                 }
+            }
+            Expr::Become { expr } => {
+                w!(self, "become");
+                self.whitespace();
+                self.print_expr(*expr);
             }
             Expr::Yield { expr } => {
                 w!(self, "yield");
@@ -265,7 +300,7 @@ impl<'a> Printer<'a> {
                 w!(self, "{{");
                 self.indented(|p| {
                     for field in &**fields {
-                        w!(p, "{}: ", field.name);
+                        w!(p, "{}: ", field.name.display(self.db.upcast()));
                         p.print_expr(field.expr);
                         wln!(p, ",");
                     }
@@ -282,27 +317,11 @@ impl<'a> Printer<'a> {
             }
             Expr::Field { expr, name } => {
                 self.print_expr(*expr);
-                w!(self, ".{}", name);
+                w!(self, ".{}", name.display(self.db.upcast()));
             }
             Expr::Await { expr } => {
                 self.print_expr(*expr);
                 w!(self, ".await");
-            }
-            Expr::Try { expr } => {
-                self.print_expr(*expr);
-                w!(self, "?");
-            }
-            Expr::TryBlock { body } => {
-                w!(self, "try ");
-                self.print_expr(*body);
-            }
-            Expr::Async { body } => {
-                w!(self, "async ");
-                self.print_expr(*body);
-            }
-            Expr::Const { body } => {
-                w!(self, "const ");
-                self.print_expr(*body);
             }
             Expr::Cast { expr, type_ref } => {
                 self.print_expr(*expr);
@@ -365,15 +384,27 @@ impl<'a> Printer<'a> {
                     w!(self, ") ");
                 }
             }
-            Expr::Index { base, index } => {
+            Expr::Index { base, index, is_assignee_expr: _ } => {
                 self.print_expr(*base);
                 w!(self, "[");
                 self.print_expr(*index);
                 w!(self, "]");
             }
-            Expr::Closure { args, arg_types, ret_type, body, closure_kind } => {
-                if let ClosureKind::Generator(Movability::Static) = closure_kind {
-                    w!(self, "static ");
+            Expr::Closure { args, arg_types, ret_type, body, closure_kind, capture_by } => {
+                match closure_kind {
+                    ClosureKind::Coroutine(Movability::Static) => {
+                        w!(self, "static ");
+                    }
+                    ClosureKind::Async => {
+                        w!(self, "async ");
+                    }
+                    _ => (),
+                }
+                match capture_by {
+                    CaptureBy::Value => {
+                        w!(self, "move ");
+                    }
+                    CaptureBy::Ref => (),
                 }
                 w!(self, "|");
                 for (i, (pat, ty)) in args.iter().zip(arg_types.iter()).enumerate() {
@@ -402,10 +433,6 @@ impl<'a> Printer<'a> {
                 }
                 w!(self, ")");
             }
-            Expr::Unsafe { body } => {
-                w!(self, "unsafe ");
-                self.print_expr(*body);
-            }
             Expr::Array(arr) => {
                 w!(self, "[");
                 if !matches!(arr, Array::ElementList { elements, .. } if elements.is_empty()) {
@@ -428,25 +455,45 @@ impl<'a> Printer<'a> {
             }
             Expr::Literal(lit) => self.print_literal(lit),
             Expr::Block { id: _, statements, tail, label } => {
-                self.whitespace();
-                if let Some(lbl) = label {
-                    w!(self, "{}: ", self.body[*lbl].name);
-                }
-                w!(self, "{{");
-                if !statements.is_empty() || tail.is_some() {
-                    self.indented(|p| {
-                        for stmt in &**statements {
-                            p.print_stmt(stmt);
-                        }
-                        if let Some(tail) = tail {
-                            p.print_expr(*tail);
-                        }
-                        p.newline();
-                    });
-                }
-                w!(self, "}}");
+                let label =
+                    label.map(|lbl| format!("{}: ", self.body[lbl].name.display(self.db.upcast())));
+                self.print_block(label.as_deref(), statements, tail);
+            }
+            Expr::Unsafe { id: _, statements, tail } => {
+                self.print_block(Some("unsafe "), statements, tail);
+            }
+            Expr::Async { id: _, statements, tail } => {
+                self.print_block(Some("async "), statements, tail);
+            }
+            Expr::Const(id) => {
+                w!(self, "const {{ /* {id:?} */ }}");
             }
         }
+    }
+
+    fn print_block(
+        &mut self,
+        label: Option<&str>,
+        statements: &[Statement],
+        tail: &Option<la_arena::Idx<Expr>>,
+    ) {
+        self.whitespace();
+        if let Some(lbl) = label {
+            w!(self, "{}", lbl);
+        }
+        w!(self, "{{");
+        if !statements.is_empty() || tail.is_some() {
+            self.indented(|p| {
+                for stmt in statements {
+                    p.print_stmt(stmt);
+                }
+                if let Some(tail) = tail {
+                    p.print_expr(*tail);
+                }
+                p.newline();
+            });
+        }
+        w!(self, "}}");
     }
 
     fn print_pat(&mut self, pat: PatId) {
@@ -485,7 +532,7 @@ impl<'a> Printer<'a> {
                 w!(self, " {{");
                 self.indented(|p| {
                     for arg in args.iter() {
-                        w!(p, "{}: ", arg.name);
+                        w!(p, "{}: ", arg.name.display(self.db.upcast()));
                         p.print_pat(arg.pat);
                         wln!(p, ",");
                     }
@@ -496,9 +543,13 @@ impl<'a> Printer<'a> {
                 w!(self, "}}");
             }
             Pat::Range { start, end } => {
-                self.print_expr(*start);
-                w!(self, "...");
-                self.print_expr(*end);
+                if let Some(start) = start {
+                    self.print_literal_or_const(start);
+                }
+                w!(self, "..=");
+                if let Some(end) = end {
+                    self.print_literal_or_const(end);
+                }
             }
             Pat::Slice { prefix, slice, suffix } => {
                 w!(self, "[");
@@ -518,14 +569,8 @@ impl<'a> Printer<'a> {
             }
             Pat::Path(path) => self.print_path(path),
             Pat::Lit(expr) => self.print_expr(*expr),
-            Pat::Bind { mode, name, subpat } => {
-                let mode = match mode {
-                    BindingAnnotation::Unannotated => "",
-                    BindingAnnotation::Mutable => "mut ",
-                    BindingAnnotation::Ref => "ref ",
-                    BindingAnnotation::RefMut => "ref mut ",
-                };
-                w!(self, "{}{}", mode, name);
+            Pat::Bind { id, subpat } => {
+                self.print_binding(*id);
                 if let Some(pat) = subpat {
                     self.whitespace();
                     self.print_pat(*pat);
@@ -592,6 +637,14 @@ impl<'a> Printer<'a> {
                 }
                 wln!(self);
             }
+            Statement::Item => (),
+        }
+    }
+
+    fn print_literal_or_const(&mut self, literal_or_const: &LiteralOrConst) {
+        match literal_or_const {
+            LiteralOrConst::Literal(l) => self.print_literal(l),
+            LiteralOrConst::Const(c) => self.print_pat(*c),
         }
     }
 
@@ -599,6 +652,7 @@ impl<'a> Printer<'a> {
         match literal {
             Literal::String(it) => w!(self, "{:?}", it),
             Literal::ByteString(it) => w!(self, "\"{}\"", it.escape_ascii()),
+            Literal::CString(it) => w!(self, "\"{}\\0\"", it.escape_ascii()),
             Literal::Char(it) => w!(self, "'{}'", it.escape_debug()),
             Literal::Bool(it) => w!(self, "{}", it),
             Literal::Int(i, suffix) => {
@@ -623,10 +677,21 @@ impl<'a> Printer<'a> {
     }
 
     fn print_type_ref(&mut self, ty: &TypeRef) {
-        print_type_ref(ty, self).unwrap();
+        print_type_ref(self.db, ty, self).unwrap();
     }
 
     fn print_path(&mut self, path: &Path) {
-        print_path(path, self).unwrap();
+        print_path(self.db, path, self).unwrap();
+    }
+
+    fn print_binding(&mut self, id: BindingId) {
+        let Binding { name, mode, .. } = &self.body.bindings[id];
+        let mode = match mode {
+            BindingAnnotation::Unannotated => "",
+            BindingAnnotation::Mutable => "mut ",
+            BindingAnnotation::Ref => "ref ",
+            BindingAnnotation::RefMut => "ref mut ",
+        };
+        w!(self, "{}{}", mode, name.display(self.db.upcast()));
     }
 }

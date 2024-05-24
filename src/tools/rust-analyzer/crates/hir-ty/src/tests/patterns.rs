@@ -1,11 +1,12 @@
 use expect_test::expect;
 
-use super::{check, check_infer, check_infer_with_mismatches, check_types};
+use super::{check, check_infer, check_infer_with_mismatches, check_no_mismatches, check_types};
 
 #[test]
 fn infer_pattern() {
     check_infer(
         r#"
+        //- minicore: iterator
         fn test(x: &i32) {
             let y = x;
             let &z = x;
@@ -31,21 +32,30 @@ fn infer_pattern() {
         }
         "#,
         expect![[r#"
-            8..9 'x': &i32
+            8..9 'x': &'? i32
             17..400 '{     ...o_x; }': ()
-            27..28 'y': &i32
-            31..32 'x': &i32
-            42..44 '&z': &i32
+            27..28 'y': &'? i32
+            31..32 'x': &'? i32
+            42..44 '&z': &'? i32
             43..44 'z': i32
-            47..48 'x': &i32
+            47..48 'x': &'? i32
             58..59 'a': i32
             62..63 'z': i32
-            73..79 '(c, d)': (i32, &str)
+            73..79 '(c, d)': (i32, &'static str)
             74..75 'c': i32
-            77..78 'd': &str
-            82..94 '(1, "hello")': (i32, &str)
+            77..78 'd': &'static str
+            82..94 '(1, "hello")': (i32, &'static str)
             83..84 '1': i32
-            86..93 '"hello"': &str
+            86..93 '"hello"': &'static str
+            101..151 'for (e...     }': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
+            101..151 'for (e...     }': {unknown}
+            101..151 'for (e...     }': !
+            101..151 'for (e...     }': {unknown}
+            101..151 'for (e...     }': &'? mut {unknown}
+            101..151 'for (e...     }': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            101..151 'for (e...     }': Option<({unknown}, {unknown})>
+            101..151 'for (e...     }': ()
+            101..151 'for (e...     }': ()
             101..151 'for (e...     }': ()
             105..111 '(e, f)': ({unknown}, {unknown})
             106..107 'e': {unknown}
@@ -64,14 +74,14 @@ fn infer_pattern() {
             194..197 'val': {unknown}
             210..236 'if let...rue {}': ()
             213..233 'let x ... &true': bool
-            217..225 'x @ true': &bool
+            217..225 'x @ true': &'? bool
             221..225 'true': bool
             221..225 'true': bool
-            228..233 '&true': &bool
+            228..233 '&true': &'? bool
             229..233 'true': bool
             234..236 '{}': ()
-            246..252 'lambda': |u64, u64, i32| -> i32
-            255..287 '|a: u6...b; c }': |u64, u64, i32| -> i32
+            246..252 'lambda': impl Fn(u64, u64, i32) -> i32
+            255..287 '|a: u6...b; c }': impl Fn(u64, u64, i32) -> i32
             256..257 'a': u64
             264..265 'b': u64
             267..268 'c': i32
@@ -80,14 +90,14 @@ fn infer_pattern() {
             277..282 'a + b': u64
             281..282 'b': u64
             284..285 'c': i32
-            298..310 'ref ref_to_x': &&i32
-            313..314 'x': &i32
-            324..333 'mut mut_x': &i32
-            336..337 'x': &i32
-            347..367 'ref mu...f_to_x': &mut &i32
-            370..371 'x': &i32
-            381..382 'k': &mut &i32
-            385..397 'mut_ref_to_x': &mut &i32
+            298..310 'ref ref_to_x': &'? &'? i32
+            313..314 'x': &'? i32
+            324..333 'mut mut_x': &'? i32
+            336..337 'x': &'? i32
+            347..367 'ref mu...f_to_x': &'? mut &'? i32
+            370..371 'x': &'? i32
+            381..382 'k': &'? mut &'? i32
+            385..397 'mut_ref_to_x': &'? mut &'? i32
         "#]],
     );
 }
@@ -110,14 +120,14 @@ fn infer_literal_pattern() {
             17..28 '{ loop {} }': T
             19..26 'loop {}': !
             24..26 '{}': ()
-            37..38 'x': &i32
+            37..38 'x': &'? i32
             46..208 '{     ...) {} }': ()
             52..75 'if let...y() {}': ()
             55..72 'let "f... any()': bool
-            59..64 '"foo"': &str
-            59..64 '"foo"': &str
-            67..70 'any': fn any<&str>() -> &str
-            67..72 'any()': &str
+            59..64 '"foo"': &'static str
+            59..64 '"foo"': &'static str
+            67..70 'any': fn any<&'static str>() -> &'static str
+            67..72 'any()': &'static str
             73..75 '{}': ()
             80..99 'if let...y() {}': ()
             83..96 'let 1 = any()': bool
@@ -168,7 +178,7 @@ fn infer_range_pattern() {
         }
         "#,
         expect![[r#"
-            8..9 'x': &i32
+            8..9 'x': &'? i32
             17..75 '{     ...2 {} }': ()
             23..45 'if let...u32 {}': ()
             26..42 'let 1....= 2u32': bool
@@ -198,15 +208,15 @@ fn infer_pattern_match_ergonomics() {
         expect![[r#"
             27..78 '{     ...(1); }': ()
             37..41 'A(n)': A<i32>
-            39..40 'n': &i32
-            44..49 '&A(1)': &A<i32>
-            45..46 'A': A<i32>(i32) -> A<i32>
+            39..40 'n': &'? i32
+            44..49 '&A(1)': &'? A<i32>
+            45..46 'A': extern "rust-call" A<i32>(i32) -> A<i32>
             45..49 'A(1)': A<i32>
             47..48 '1': i32
             59..63 'A(n)': A<i32>
-            61..62 'n': &mut i32
-            66..75 '&mut A(1)': &mut A<i32>
-            71..72 'A': A<i32>(i32) -> A<i32>
+            61..62 'n': &'? mut i32
+            66..75 '&mut A(1)': &'? mut A<i32>
+            71..72 'A': extern "rust-call" A<i32>(i32) -> A<i32>
             71..75 'A(1)': A<i32>
             73..74 '1': i32
         "#]],
@@ -225,18 +235,33 @@ fn infer_pattern_match_ergonomics_ref() {
         "#,
         expect![[r#"
             10..56 '{     ...= v; }': ()
-            20..21 'v': &(i32, &i32)
-            24..32 '&(1, &2)': &(i32, &i32)
-            25..32 '(1, &2)': (i32, &i32)
+            20..21 'v': &'? (i32, &'? i32)
+            24..32 '&(1, &2)': &'? (i32, &'? i32)
+            25..32 '(1, &2)': (i32, &'? i32)
             26..27 '1': i32
-            29..31 '&2': &i32
+            29..31 '&2': &'? i32
             30..31 '2': i32
-            42..49 '(_, &w)': (i32, &i32)
+            42..49 '(_, &w)': (i32, &'? i32)
             43..44 '_': i32
-            46..48 '&w': &i32
+            46..48 '&w': &'? i32
             47..48 'w': i32
-            52..53 'v': &(i32, &i32)
+            52..53 'v': &'? (i32, &'? i32)
         "#]],
+    );
+}
+
+#[test]
+fn ref_pat_with_inference_variable() {
+    check_no_mismatches(
+        r#"
+enum E { A }
+fn test() {
+    let f = |e| match e {
+        &E::A => {}
+    };
+    f(&E::A);
+}
+"#,
     );
 }
 
@@ -261,28 +286,28 @@ fn infer_pattern_match_slice() {
         "#,
         expect![[r#"
             10..209 '{     ...   } }': ()
-            20..25 'slice': &[f64]
-            36..42 '&[0.0]': &[f64; 1]
+            20..25 'slice': &'? [f64]
+            36..42 '&[0.0]': &'? [f64; 1]
             37..42 '[0.0]': [f64; 1]
             38..41 '0.0': f64
             48..207 'match ...     }': ()
-            54..59 'slice': &[f64]
-            70..73 '&[]': &[f64]
+            54..59 'slice': &'? [f64]
+            70..73 '&[]': &'? [f64]
             71..73 '[]': [f64]
             77..79 '{}': ()
-            89..93 '&[a]': &[f64]
+            89..93 '&[a]': &'? [f64]
             90..93 '[a]': [f64]
             91..92 'a': f64
             97..123 '{     ...     }': ()
             111..112 'a': f64
-            133..140 '&[b, c]': &[f64]
+            133..140 '&[b, c]': &'? [f64]
             134..140 '[b, c]': [f64]
             135..136 'b': f64
             138..139 'c': f64
             144..185 '{     ...     }': ()
             158..159 'b': f64
             173..174 'c': f64
-            194..195 '_': &[f64]
+            194..195 '_': &'? [f64]
             199..201 '{}': ()
         "#]],
     );
@@ -302,14 +327,14 @@ fn infer_pattern_match_string_literal() {
         "#,
         expect![[r#"
             10..98 '{     ...   } }': ()
-            20..21 's': &str
-            30..37 '"hello"': &str
+            20..21 's': &'? str
+            30..37 '"hello"': &'static str
             43..96 'match ...     }': ()
-            49..50 's': &str
-            61..68 '"hello"': &str
-            61..68 '"hello"': &str
+            49..50 's': &'? str
+            61..68 '"hello"': &'static str
+            61..68 '"hello"': &'static str
             72..74 '{}': ()
-            83..84 '_': &str
+            83..84 '_': &'? str
             88..90 '{}': ()
         "#]],
     );
@@ -333,27 +358,27 @@ fn infer_pattern_match_byte_string_literal() {
         }
         "#,
         expect![[r#"
-            105..109 'self': &[T; N]
+            105..109 'self': &'? [T; N]
             111..116 'index': {unknown}
-            157..180 '{     ...     }': &[u8]
+            157..180 '{     ...     }': &'? [u8]
             167..174 'loop {}': !
             172..174 '{}': ()
             191..192 'v': [u8; 3]
             203..261 '{     ...v {} }': ()
             209..233 'if let...[S] {}': ()
             212..230 'let b"... &v[S]': bool
-            216..222 'b"foo"': &[u8]
-            216..222 'b"foo"': &[u8]
-            225..230 '&v[S]': &[u8]
+            216..222 'b"foo"': &'static [u8]
+            216..222 'b"foo"': &'static [u8]
+            225..230 '&v[S]': &'? [u8]
             226..227 'v': [u8; 3]
             226..230 'v[S]': [u8]
             228..229 'S': S
             231..233 '{}': ()
             238..259 'if let... &v {}': ()
             241..256 'let b"foo" = &v': bool
-            245..251 'b"foo"': &[u8; 3]
-            245..251 'b"foo"': &[u8; 3]
-            254..256 '&v': &[u8; 3]
+            245..251 'b"foo"': &'static [u8; 3]
+            245..251 'b"foo"': &'static [u8; 3]
+            254..256 '&v': &'? [u8; 3]
             255..256 'v': [u8; 3]
             257..259 '{}': ()
         "#]],
@@ -374,17 +399,17 @@ fn infer_pattern_match_or() {
         "#,
         expect![[r#"
             10..108 '{     ...   } }': ()
-            20..21 's': &str
-            30..37 '"hello"': &str
+            20..21 's': &'? str
+            30..37 '"hello"': &'static str
             43..106 'match ...     }': ()
-            49..50 's': &str
-            61..68 '"hello"': &str
-            61..68 '"hello"': &str
-            61..78 '"hello...world"': &str
-            71..78 '"world"': &str
-            71..78 '"world"': &str
+            49..50 's': &'? str
+            61..68 '"hello"': &'static str
+            61..68 '"hello"': &'static str
+            61..78 '"hello...world"': &'? str
+            71..78 '"world"': &'static str
+            71..78 '"world"': &'static str
             82..84 '{}': ()
-            93..94 '_': &str
+            93..94 '_': &'? str
             98..100 '{}': ()
         "#]],
     );
@@ -480,10 +505,10 @@ fn infer_adt_pattern() {
             216..217 '1': usize
             227..231 'E::B': E
             235..237 '10': usize
-            255..274 'ref d ...{ .. }': &E
+            255..274 'ref d ...{ .. }': &'? E
             263..274 'E::A { .. }': E
             277..278 'e': E
-            284..285 'd': &E
+            284..285 'd': &'? E
         "#]],
     );
 }
@@ -504,20 +529,20 @@ impl Foo {
         expect![[r#"
             42..151 '{     ...     }': ()
             56..64 'Self(s,)': Foo
-            61..62 's': &usize
-            67..75 '&Foo(0,)': &Foo
-            68..71 'Foo': Foo(usize) -> Foo
+            61..62 's': &'? usize
+            67..75 '&Foo(0,)': &'? Foo
+            68..71 'Foo': extern "rust-call" Foo(usize) -> Foo
             68..75 'Foo(0,)': Foo
             72..73 '0': usize
             89..97 'Self(s,)': Foo
-            94..95 's': &mut usize
-            100..112 '&mut Foo(0,)': &mut Foo
-            105..108 'Foo': Foo(usize) -> Foo
+            94..95 's': &'? mut usize
+            100..112 '&mut Foo(0,)': &'? mut Foo
+            105..108 'Foo': extern "rust-call" Foo(usize) -> Foo
             105..112 'Foo(0,)': Foo
             109..110 '0': usize
             126..134 'Self(s,)': Foo
             131..132 's': usize
-            137..140 'Foo': Foo(usize) -> Foo
+            137..140 'Foo': extern "rust-call" Foo(usize) -> Foo
             137..144 'Foo(0,)': Foo
             141..142 '0': usize
         "#]],
@@ -644,7 +669,7 @@ fn main() {
 }
         "#,
         expect![[r#"
-            27..31 'self': &S
+            27..31 'self': &'? S
             41..50 '{ false }': bool
             43..48 'false': bool
             64..115 '{     ...   } }': ()
@@ -654,7 +679,7 @@ fn main() {
             93..94 's': S
             93..100 's.foo()': bool
             104..106 '()': ()
-    "#]],
+        "#]],
     )
 }
 
@@ -677,29 +702,29 @@ fn test() {
             51..58 'loop {}': !
             56..58 '{}': ()
             72..171 '{     ... x); }': ()
-            78..81 'foo': fn foo<&(i32, &str), i32, |&(i32, &str)| -> i32>(&(i32, &str), |&(i32, &str)| -> i32) -> i32
+            78..81 'foo': fn foo<&'? (i32, &'? str), i32, impl FnOnce(&'? (i32, &'? str)) -> i32>(&'? (i32, &'? str), impl FnOnce(&'? (i32, &'? str)) -> i32) -> i32
             78..105 'foo(&(...y)| x)': i32
-            82..91 '&(1, "a")': &(i32, &str)
-            83..91 '(1, "a")': (i32, &str)
+            82..91 '&(1, "a")': &'? (i32, &'static str)
+            83..91 '(1, "a")': (i32, &'static str)
             84..85 '1': i32
-            87..90 '"a"': &str
-            93..104 '|&(x, y)| x': |&(i32, &str)| -> i32
-            94..101 '&(x, y)': &(i32, &str)
-            95..101 '(x, y)': (i32, &str)
+            87..90 '"a"': &'static str
+            93..104 '|&(x, y)| x': impl FnOnce(&'? (i32, &'? str)) -> i32
+            94..101 '&(x, y)': &'? (i32, &'? str)
+            95..101 '(x, y)': (i32, &'? str)
             96..97 'x': i32
-            99..100 'y': &str
+            99..100 'y': &'? str
             103..104 'x': i32
-            142..145 'foo': fn foo<&(i32, &str), &i32, |&(i32, &str)| -> &i32>(&(i32, &str), |&(i32, &str)| -> &i32) -> &i32
-            142..168 'foo(&(...y)| x)': &i32
-            146..155 '&(1, "a")': &(i32, &str)
-            147..155 '(1, "a")': (i32, &str)
+            142..145 'foo': fn foo<&'? (i32, &'? str), &'? i32, impl FnOnce(&'? (i32, &'? str)) -> &'? i32>(&'? (i32, &'? str), impl FnOnce(&'? (i32, &'? str)) -> &'? i32) -> &'? i32
+            142..168 'foo(&(...y)| x)': &'? i32
+            146..155 '&(1, "a")': &'? (i32, &'static str)
+            147..155 '(1, "a")': (i32, &'static str)
             148..149 '1': i32
-            151..154 '"a"': &str
-            157..167 '|(x, y)| x': |&(i32, &str)| -> &i32
-            158..164 '(x, y)': (i32, &str)
-            159..160 'x': &i32
-            162..163 'y': &&str
-            166..167 'x': &i32
+            151..154 '"a"': &'static str
+            157..167 '|(x, y)| x': impl FnOnce(&'? (i32, &'? str)) -> &'? i32
+            158..164 '(x, y)': (i32, &'? str)
+            159..160 'x': &'? i32
+            162..163 'y': &'? &'? str
+            166..167 'x': &'? i32
         "#]],
     );
 }
@@ -716,13 +741,13 @@ fn slice_tail_pattern() {
         }
         "#,
         expect![[r#"
-            7..13 'params': &[i32]
+            7..13 'params': &'? [i32]
             23..92 '{     ...   } }': ()
             29..90 'match ...     }': ()
-            35..41 'params': &[i32]
+            35..41 'params': &'? [i32]
             52..69 '[head,... @ ..]': [i32]
-            53..57 'head': &i32
-            59..68 'tail @ ..': &[i32]
+            53..57 'head': &'? i32
+            59..68 'tail @ ..': &'? [i32]
             66..68 '..': [i32]
             73..84 '{         }': ()
         "#]],
@@ -891,7 +916,7 @@ fn foo(foo: Foo) {
             48..51 'foo': Foo
             62..84 'const ... 32) }': Foo
             68..84 '{ Foo(... 32) }': Foo
-            70..73 'Foo': Foo(usize) -> Foo
+            70..73 'Foo': extern "rust-call" Foo(usize) -> Foo
             70..82 'Foo(15 + 32)': Foo
             74..76 '15': usize
             74..81 '15 + 32': usize
@@ -953,9 +978,9 @@ fn main() {
             42..51 'true | ()': bool
             49..51 '()': ()
             57..59 '{}': ()
-            68..80 '(() | true,)': ((),)
+            68..80 '(() | true,)': (bool,)
             69..71 '()': ()
-            69..78 '() | true': ()
+            69..78 '() | true': bool
             74..78 'true': bool
             74..78 'true': bool
             84..86 '{}': ()
@@ -964,19 +989,15 @@ fn main() {
             96..102 '_ | ()': bool
             100..102 '()': ()
             108..110 '{}': ()
-            119..128 '(() | _,)': ((),)
+            119..128 '(() | _,)': (bool,)
             120..122 '()': ()
-            120..126 '() | _': ()
+            120..126 '() | _': bool
             125..126 '_': bool
             132..134 '{}': ()
             49..51: expected bool, got ()
-            68..80: expected (bool,), got ((),)
             69..71: expected bool, got ()
-            69..78: expected bool, got ()
             100..102: expected bool, got ()
-            119..128: expected (bool,), got ((),)
             120..122: expected bool, got ()
-            120..126: expected bool, got ()
         "#]],
     );
 }
@@ -1088,7 +1109,119 @@ fn var_args() {
 #[lang = "va_list"]
 pub struct VaListImpl<'f>;
 fn my_fn(foo: ...) {}
-       //^^^ VaListImpl
+       //^^^ VaListImpl<'?>
 "#,
+    );
+}
+
+#[test]
+fn ref_pat_mutability() {
+    check(
+        r#"
+fn foo() {
+    let &() = &();
+    let &mut () = &mut ();
+    let &mut () = &();
+      //^^^^^^^ expected &'? (), got &'? mut ()
+    let &() = &mut ();
+      //^^^ expected &'? mut (), got &'? ()
+}
+"#,
+    );
+}
+
+#[test]
+fn generic_alias() {
+    check_types(
+        r#"
+type Wrap<T> = T;
+
+enum X {
+    A { cool: u32, stuff: u32 },
+    B,
+}
+
+fn main() {
+    let wrapped = Wrap::<X>::A {
+        cool: 100,
+        stuff: 100,
+    };
+
+    if let Wrap::<X>::A { cool, ..} = &wrapped {}
+                        //^^^^ &'? u32
+}
+"#,
+    );
+}
+
+#[test]
+fn generic_alias_with_qualified_path() {
+    check_types(
+        r#"
+type Wrap<T> = T;
+
+struct S;
+
+trait Schematic {
+    type Props;
+}
+
+impl Schematic for S {
+    type Props = X;
+}
+
+enum X {
+    A { cool: u32, stuff: u32 },
+    B,
+}
+
+fn main() {
+    let wrapped = Wrap::<<S as Schematic>::Props>::A {
+        cool: 100,
+        stuff: 100,
+    };
+
+    if let Wrap::<<S as Schematic>::Props>::A { cool, ..} = &wrapped {}
+                                              //^^^^ &'? u32
+}
+"#,
+    );
+}
+
+#[test]
+fn type_mismatch_pat_const_reference() {
+    check_no_mismatches(
+        r#"
+const TEST_STR: &'static str = "abcd";
+
+fn main() {
+    let s = "abcd";
+    match s {
+        TEST_STR => (),
+        _ => (),
+    }
+}
+
+            "#,
+    );
+    check(
+        r#"
+struct Foo<T>(T);
+
+impl<T> Foo<T> {
+    const TEST_I32_REF: &'static i32 = &3;
+    const TEST_I32: i32 = 3;
+}
+
+fn main() {
+    match &6 {
+        Foo::<i32>::TEST_I32_REF => (),
+        Foo::<i32>::TEST_I32 => (),
+      //^^^^^^^^^^^^^^^^^^^^ expected &'? i32, got i32
+        _ => (),
+    }
+}
+
+            "#,
     );
 }

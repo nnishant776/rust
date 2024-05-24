@@ -1,10 +1,9 @@
-// pp-exact
+//@ pp-exact
 
 fn main() {}
 
 #[cfg(FALSE)]
 fn syntax() {
-    let _ = #[attr] box 0;
     let _ = #[attr] [];
     let _ = #[attr] [0];
     let _ = #[attr] [0; 0];
@@ -14,17 +13,17 @@ fn syntax() {
     let _ = #[attr] ();
     let _ = #[attr] (#[attr] 0,);
     let _ = #[attr] (#[attr] 0, 0);
-    let _ = #[attr] 0 + #[attr] 0;
-    let _ = #[attr] 0 / #[attr] 0;
-    let _ = #[attr] 0 & #[attr] 0;
-    let _ = #[attr] 0 % #[attr] 0;
+    let _ = (#[attr] 0) + #[attr] 0;
+    let _ = (#[attr] 0) / #[attr] 0;
+    let _ = (#[attr] 0) & #[attr] 0;
+    let _ = (#[attr] 0) % #[attr] 0;
     let _ = #[attr] (0 + 0);
     let _ = #[attr] !0;
     let _ = #[attr] -0;
     let _ = #[attr] false;
     let _ = #[attr] 0;
     let _ = #[attr] 'c';
-    let _ = #[attr] x as Y;
+    let _ = (#[attr] x) as Y;
     let _ = #[attr] (x as Y);
     let _ =
         #[attr] while true {
@@ -89,9 +88,9 @@ fn syntax() {
             let _ = ();
             foo
         };
-    let _ = #[attr] x = y;
+    let _ = (#[attr] x) = y;
     let _ = #[attr] (x = y);
-    let _ = #[attr] x += y;
+    let _ = (#[attr] x) += y;
     let _ = #[attr] (x += y);
     let _ = #[attr] foo.bar;
     let _ = (#[attr] foo).bar;
@@ -99,8 +98,8 @@ fn syntax() {
     let _ = (#[attr] foo).0;
     let _ = #[attr] foo[bar];
     let _ = (#[attr] foo)[bar];
-    let _ = #[attr] 0..#[attr] 0;
-    let _ = #[attr] 0..;
+    let _ = (#[attr] 0)..#[attr] 0;
+    let _ = (#[attr] 0)..;
     let _ = #[attr] (0..0);
     let _ = #[attr] (0..);
     let _ = #[attr] (..0);

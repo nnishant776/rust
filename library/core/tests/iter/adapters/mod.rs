@@ -13,6 +13,7 @@ mod fuse;
 mod inspect;
 mod intersperse;
 mod map;
+mod map_windows;
 mod peekable;
 mod scan;
 mod skip;
@@ -24,7 +25,7 @@ mod zip;
 
 use core::cell::Cell;
 
-/// An iterator that panics whenever `next` or next_back` is called
+/// An iterator that panics whenever `next` or `next_back` is called
 /// after `None` has already been returned. This does not violate
 /// `Iterator`'s contract. Used to test that iterator adapters don't
 /// poll their inner iterators after exhausting them.

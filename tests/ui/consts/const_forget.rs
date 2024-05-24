@@ -1,4 +1,6 @@
-// check-pass
+//@ check-pass
+
+#![allow(forgetting_copy_types)]
 
 use std::mem::forget;
 

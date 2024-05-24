@@ -38,6 +38,7 @@ fn make_test_crate_name() {
     let input = "use asdf::qwop;
 assert_eq!(2+2, 4);";
     let expected = "#![allow(unused)]
+#[allow(unused_extern_crates)]
 extern crate r#asdf;
 fn main() {
 use asdf::qwop;
@@ -52,7 +53,8 @@ assert_eq!(2+2, 4);
 fn make_test_no_crate_inject() {
     // Even if you do use the crate within the test, setting `opts.no_crate_inject` will skip
     // adding it anyway.
-    let opts = GlobalTestOptions { no_crate_inject: true, attrs: vec![] };
+    let opts =
+        GlobalTestOptions { no_crate_inject: true, attrs: vec![], insert_indent_space: false };
     let input = "use asdf::qwop;
 assert_eq!(2+2, 4);";
     let expected = "#![allow(unused)]
@@ -128,6 +130,7 @@ fn make_test_opts_attrs() {
     let input = "use asdf::qwop;
 assert_eq!(2+2, 4);";
     let expected = "#![feature(sick_rad)]
+#[allow(unused_extern_crates)]
 extern crate r#asdf;
 fn main() {
 use asdf::qwop;
@@ -141,6 +144,7 @@ assert_eq!(2+2, 4);
     opts.attrs.push("feature(hella_dope)".to_string());
     let expected = "#![feature(sick_rad)]
 #![feature(hella_dope)]
+#[allow(unused_extern_crates)]
 extern crate r#asdf;
 fn main() {
 use asdf::qwop;
@@ -236,6 +240,7 @@ assert_eq!(asdf::foo, 4);";
 
     let expected = "#![allow(unused)]
 extern crate hella_qwop;
+#[allow(unused_extern_crates)]
 extern crate r#asdf;
 fn main() {
 assert_eq!(asdf::foo, 4);
@@ -297,4 +302,45 @@ assert_eq!(2+2, 4);
     let (output, len, _) =
         make_test(input, None, false, &opts, DEFAULT_EDITION, Some("_some_unique_name"));
     assert_eq!((output, len), (expected, 2));
+}
+
+#[test]
+fn make_test_insert_extra_space() {
+    // will insert indent spaces in the code block if `insert_indent_space` is true
+    let opts =
+        GlobalTestOptions { no_crate_inject: false, attrs: vec![], insert_indent_space: true };
+    let input = "use std::*;
+assert_eq!(2+2, 4);
+eprintln!(\"hello anan\");
+";
+    let expected = "#![allow(unused)]
+fn main() {
+    use std::*;
+    assert_eq!(2+2, 4);
+    eprintln!(\"hello anan\");
+}"
+    .to_string();
+    let (output, len, _) = make_test(input, None, false, &opts, DEFAULT_EDITION, None);
+    assert_eq!((output, len), (expected, 2));
+}
+
+#[test]
+fn make_test_insert_extra_space_fn_main() {
+    // if input already has a fn main, it should insert a space before it
+    let opts =
+        GlobalTestOptions { no_crate_inject: false, attrs: vec![], insert_indent_space: true };
+    let input = "use std::*;
+fn main() {
+    assert_eq!(2+2, 4);
+    eprintln!(\"hello anan\");
+}";
+    let expected = "#![allow(unused)]
+use std::*;
+fn main() {
+    assert_eq!(2+2, 4);
+    eprintln!(\"hello anan\");
+}"
+    .to_string();
+    let (output, len, _) = make_test(input, None, false, &opts, DEFAULT_EDITION, None);
+    assert_eq!((output, len), (expected, 1));
 }

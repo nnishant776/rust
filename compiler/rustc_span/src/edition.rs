@@ -1,8 +1,7 @@
-use crate::symbol::{sym, Symbol};
 use std::fmt;
 use std::str::FromStr;
 
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 
 /// The edition of the compiler. (See [RFC 2052](https://github.com/rust-lang/rfcs/blob/master/text/2052-epochs.md).)
 #[derive(Clone, Copy, Hash, PartialEq, PartialOrd, Debug, Encodable, Decodable, Eq)]
@@ -58,15 +57,6 @@ impl Edition {
         }
     }
 
-    pub fn feature_name(self) -> Symbol {
-        match self {
-            Edition::Edition2015 => sym::rust_2015_preview,
-            Edition::Edition2018 => sym::rust_2018_preview,
-            Edition::Edition2021 => sym::rust_2021_preview,
-            Edition::Edition2024 => sym::rust_2024_preview,
-        }
-    }
-
     pub fn is_stable(self) -> bool {
         match self {
             Edition::Edition2015 => true,
@@ -82,17 +72,17 @@ impl Edition {
     }
 
     /// Are we allowed to use features from the Rust 2018 edition?
-    pub fn rust_2018(self) -> bool {
+    pub fn at_least_rust_2018(self) -> bool {
         self >= Edition::Edition2018
     }
 
     /// Are we allowed to use features from the Rust 2021 edition?
-    pub fn rust_2021(self) -> bool {
+    pub fn at_least_rust_2021(self) -> bool {
         self >= Edition::Edition2021
     }
 
     /// Are we allowed to use features from the Rust 2024 edition?
-    pub fn rust_2024(self) -> bool {
+    pub fn at_least_rust_2024(self) -> bool {
         self >= Edition::Edition2024
     }
 }

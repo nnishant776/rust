@@ -1,9 +1,10 @@
-use rustc_middle::mir;
-use rustc_middle::mir::NonDivergingIntrinsic;
+use rustc_middle::mir::{self, NonDivergingIntrinsic};
+use rustc_middle::span_bug;
+use rustc_session::config::OptLevel;
+use tracing::instrument;
 
 use super::FunctionCx;
 use super::LocalRef;
-use crate::traits::BuilderMethods;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
@@ -18,12 +19,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         LocalRef::UnsizedPlace(cg_indirect_dest) => {
                             self.codegen_rvalue_unsized(bx, cg_indirect_dest, rvalue)
                         }
-                        LocalRef::Operand(None) => {
+                        LocalRef::PendingOperand => {
                             let operand = self.codegen_rvalue_operand(bx, rvalue);
-                            self.locals[index] = LocalRef::Operand(Some(operand));
+                            self.overwrite_local(index, LocalRef::Operand(operand));
                             self.debug_introduce_local(bx, index);
                         }
-                        LocalRef::Operand(Some(op)) => {
+                        LocalRef::Operand(op) => {
                             if !op.layout.is_zst() {
                                 span_bug!(
                                     statement.source_info.span,
@@ -64,12 +65,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     cg_indirect_place.storage_dead(bx);
                 }
             }
-            mir::StatementKind::Coverage(box ref coverage) => {
-                self.codegen_coverage(bx, coverage.clone(), statement.source_info.scope);
+            mir::StatementKind::Coverage(ref kind) => {
+                self.codegen_coverage(bx, kind, statement.source_info.scope);
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(ref op)) => {
-                let op_val = self.codegen_operand(bx, op);
-                bx.assume(op_val.immediate());
+                if !matches!(bx.tcx().sess.opts.optimize, OptLevel::No | OptLevel::Less) {
+                    let op_val = self.codegen_operand(bx, op);
+                    bx.assume(op_val.immediate());
+                }
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
                 mir::CopyNonOverlapping { ref count, ref src, ref dst },
@@ -92,6 +95,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             | mir::StatementKind::Retag { .. }
             | mir::StatementKind::AscribeUserType(..)
             | mir::StatementKind::ConstEvalCounter
+            | mir::StatementKind::PlaceMention(..)
             | mir::StatementKind::Nop => {}
         }
     }

@@ -5,7 +5,7 @@ use itertools::Itertools;
 use rustc_lexer::{tokenize, unescape, LiteralKind, TokenKind};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write as _};
 use std::ops::Range;
@@ -36,60 +36,6 @@ pub enum UpdateMode {
 pub fn update(update_mode: UpdateMode) {
     let (lints, deprecated_lints, renamed_lints) = gather_all();
     generate_lint_files(update_mode, &lints, &deprecated_lints, &renamed_lints);
-    remove_old_files(update_mode);
-}
-
-/// Remove files no longer needed after <https://github.com/rust-lang/rust-clippy/pull/9541>
-/// that may be reintroduced unintentionally
-///
-/// FIXME: This is a temporary measure that should be removed when there are no more PRs that
-/// include the stray files
-fn remove_old_files(update_mode: UpdateMode) {
-    let mut failed = false;
-    let mut remove_file = |path: &Path| match update_mode {
-        UpdateMode::Check => {
-            if path.exists() {
-                failed = true;
-                println!("unexpected file: {}", path.display());
-            }
-        },
-        UpdateMode::Change => {
-            if fs::remove_file(path).is_ok() {
-                println!("removed file: {}", path.display());
-            }
-        },
-    };
-
-    let files = [
-        "clippy_lints/src/lib.register_all.rs",
-        "clippy_lints/src/lib.register_cargo.rs",
-        "clippy_lints/src/lib.register_complexity.rs",
-        "clippy_lints/src/lib.register_correctness.rs",
-        "clippy_lints/src/lib.register_internal.rs",
-        "clippy_lints/src/lib.register_lints.rs",
-        "clippy_lints/src/lib.register_nursery.rs",
-        "clippy_lints/src/lib.register_pedantic.rs",
-        "clippy_lints/src/lib.register_perf.rs",
-        "clippy_lints/src/lib.register_restriction.rs",
-        "clippy_lints/src/lib.register_style.rs",
-        "clippy_lints/src/lib.register_suspicious.rs",
-        "src/docs.rs",
-    ];
-
-    for file in files {
-        remove_file(Path::new(file));
-    }
-
-    if let Ok(docs_dir) = fs::read_dir("src/docs") {
-        for doc_file in docs_dir {
-            let path = doc_file.unwrap().path();
-            remove_file(&path);
-        }
-    }
-
-    if failed {
-        exit_with_failure();
-    }
 }
 
 fn generate_lint_files(
@@ -368,7 +314,7 @@ const DEFAULT_DEPRECATION_REASON: &str = "default deprecation note";
 /// # Panics
 ///
 /// If a file path could not read from or written to
-pub fn deprecate(name: &str, reason: Option<&String>) {
+pub fn deprecate(name: &str, reason: Option<&str>) {
     fn finish(
         (lints, mut deprecated_lints, renamed_lints): (Vec<Lint>, Vec<DeprecatedLint>, Vec<RenamedLint>),
         name: &str,
@@ -389,12 +335,15 @@ pub fn deprecate(name: &str, reason: Option<&String>) {
         println!("note: you must run `cargo uitest` to update the test results");
     }
 
-    let reason = reason.map_or(DEFAULT_DEPRECATION_REASON, String::as_str);
+    let reason = reason.unwrap_or(DEFAULT_DEPRECATION_REASON);
     let name_lower = name.to_lowercase();
     let name_upper = name.to_uppercase();
 
     let (mut lints, deprecated_lints, renamed_lints) = gather_all();
-    let Some(lint) = lints.iter().find(|l| l.name == name_lower) else { eprintln!("error: failed to find lint `{name}`"); return; };
+    let Some(lint) = lints.iter().find(|l| l.name == name_lower) else {
+        eprintln!("error: failed to find lint `{name}`");
+        return;
+    };
 
     let mod_path = {
         let mut mod_path = PathBuf::from(format!("clippy_lints/src/{}", lint.module));
@@ -537,17 +486,13 @@ fn declare_deprecated(name: &str, path: &Path, reason: &str) -> io::Result<()> {
             /// Nothing. This lint has been deprecated.
             ///
             /// ### Deprecation reason
-            /// {}
-            #[clippy::version = \"{}\"]
-            pub {},
-            \"{}\"
+            /// {deprecation_reason}
+            #[clippy::version = \"{version}\"]
+            pub {name},
+            \"{reason}\"
         }}
 
-        ",
-        deprecation_reason,
-        version,
-        name,
-        reason,
+        "
     )
 }
 
@@ -559,9 +504,8 @@ fn replace_ident_like(contents: &str, replacements: &[(&str, &str)]) -> Option<S
     }
 
     let searcher = AhoCorasickBuilder::new()
-        .dfa(true)
         .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-        .build_with_size::<u16, _, _>(replacements.iter().map(|&(x, _)| x.as_bytes()))
+        .build(replacements.iter().map(|&(x, _)| x.as_bytes()))
         .unwrap();
 
     let mut result = String::with_capacity(contents.len() + 1024);
@@ -643,7 +587,7 @@ impl Lint {
             .collect()
     }
 
-    /// Returns all internal lints (not `internal_warn` lints)
+    /// Returns all internal lints
     #[must_use]
     fn internal_lints(lints: &[Self]) -> Vec<Self> {
         lints.iter().filter(|l| l.group == "internal").cloned().collect()
@@ -691,7 +635,7 @@ fn gen_deprecated(lints: &[DeprecatedLint]) -> String {
     let mut output = GENERATED_FILE_COMMENT.to_string();
     output.push_str("{\n");
     for lint in lints {
-        let _ = write!(
+        let _: fmt::Result = write!(
             output,
             concat!(
                 "    store.register_removed(\n",
@@ -726,7 +670,7 @@ fn gen_declared_lints<'a>(
         if !is_public {
             output.push_str("    #[cfg(feature = \"internal\")]\n");
         }
-        let _ = writeln!(output, "    crate::{module_name}::{lint_name}_INFO,");
+        let _: fmt::Result = writeln!(output, "    crate::{module_name}::{lint_name}_INFO,");
     }
     output.push_str("];\n");
 
@@ -745,7 +689,8 @@ fn gen_deprecated_lints_test(lints: &[DeprecatedLint]) -> String {
 fn gen_renamed_lints_test(lints: &[RenamedLint]) -> String {
     let mut seen_lints = HashSet::new();
     let mut res: String = GENERATED_FILE_COMMENT.into();
-    res.push_str("// run-rustfix\n\n");
+
+    res.push_str("#![allow(clippy::duplicated_attributes)]\n");
     for lint in lints {
         if seen_lints.insert(&lint.new_name) {
             writeln!(res, "#![allow({})]", lint.new_name).unwrap();
@@ -984,7 +929,7 @@ fn remove_line_splices(s: &str) -> String {
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or_else(|| panic!("expected quoted string, found `{s}`"));
     let mut res = String::with_capacity(s.len());
-    unescape::unescape_literal(s, unescape::Mode::Str, &mut |range, ch| {
+    unescape::unescape_unicode(s, unescape::Mode::Str, &mut |range, ch| {
         if ch.is_ok() {
             res.push_str(&s[range]);
         }
@@ -1047,7 +992,7 @@ fn replace_region_in_text<'a>(
 }
 
 fn try_rename_file(old_name: &Path, new_name: &Path) -> bool {
-    match fs::OpenOptions::new().create_new(true).write(true).open(new_name) {
+    match OpenOptions::new().create_new(true).write(true).open(new_name) {
         Ok(file) => drop(file),
         Err(e) if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound) => return false,
         Err(e) => panic_file(e, new_name, "create"),
@@ -1071,7 +1016,7 @@ fn panic_file(error: io::Error, name: &Path, action: &str) -> ! {
 }
 
 fn rewrite_file(path: &Path, f: impl FnOnce(&str) -> Option<String>) {
-    let mut file = fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .read(true)
         .open(path)

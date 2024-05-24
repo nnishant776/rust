@@ -1,11 +1,10 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
 #![allow(unused_unsafe)]
-// ignore-wasm32-bare seems unimportant to test
 
 // Issue #2303
 
-#![feature(intrinsics)]
+#![feature(intrinsics, rustc_attrs)]
 
 use std::mem;
 
@@ -37,13 +36,16 @@ struct Outer {
           target_os = "emscripten",
           target_os = "freebsd",
           target_os = "fuchsia",
+          target_os = "hurd",
           target_os = "illumos",
           target_os = "linux",
           target_os = "macos",
           target_os = "netbsd",
           target_os = "openbsd",
           target_os = "solaris",
-          target_os = "vxworks"))]
+          target_os = "vxworks",
+          target_os = "nto",
+))]
 mod m {
     #[cfg(target_arch = "x86")]
     pub mod m {
@@ -68,6 +70,14 @@ mod m {
 }
 
 #[cfg(target_os = "windows")]
+mod m {
+    pub mod m {
+        pub fn align() -> usize { 8 }
+        pub fn size() -> usize { 16 }
+    }
+}
+
+#[cfg(target_family = "wasm")]
 mod m {
     pub mod m {
         pub fn align() -> usize { 8 }

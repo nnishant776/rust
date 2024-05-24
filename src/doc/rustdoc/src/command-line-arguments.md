@@ -131,6 +131,20 @@ This flag accepts the same values as `rustc --cfg`, and uses it to configure
 compilation. The example above uses `feature`, but any of the `cfg` values
 are acceptable.
 
+## `--check-cfg`: check configuration flags
+
+This flag accepts the same values as `rustc --check-cfg`, and uses it to
+check configuration flags.
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --check-cfg='cfg(my_cfg, values("foo", "bar"))'
+```
+
+The example above check every well known names and values (`target_os`, `doc`, `test`, ...)
+and check the values of `my_cfg`: `foo` and `bar`.
+
 ## `--extern`: specify a dependency's location
 
 Using this flag looks like this:
@@ -179,7 +193,7 @@ $ rustdoc src/lib.rs --test
 This flag will run your code examples as tests. For more, see [the chapter
 on documentation tests](write-documentation/documentation-tests.md).
 
-See also `--test-args`.
+See also `--test-args` and `--test-run-directory`.
 
 ## `--test-args`: pass options to test runner
 
@@ -190,6 +204,19 @@ $ rustdoc src/lib.rs --test --test-args ignored
 ```
 
 This flag will pass options to the test runner when running documentation tests.
+For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
+
+See also `--test`.
+
+## `--test-run-directory`: run code examples in a specific directory
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --test --test-run-directory=/path/to/working/directory
+```
+
+This flag will run your code examples in the specified working directory.
 For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
 
 See also `--test`.
@@ -246,7 +273,7 @@ will be added.
 
 When rendering Rust files, this flag is ignored.
 
-## `--html-in-header`: include more HTML in <head>
+## `--html-in-header`: include more HTML in `<head>`
 
 Using this flag looks like this:
 
@@ -320,10 +347,7 @@ $ rustdoc src/lib.rs --extend-css extra.css
 ```
 
 With this flag, the contents of the files you pass are included at the bottom
-of Rustdoc's `theme.css` file.
-
-While this flag is stable, the contents of `theme.css` are not, so be careful!
-Updates may break your theme extensions.
+of the `theme.css` file.
 
 ## `--sysroot`: override the system root
 
@@ -393,6 +417,12 @@ When `rustdoc` receives this flag, it will print an extra "Version (version)" in
 the crate root's docs. You can use this flag to differentiate between different versions of your
 library's documentation.
 
+## `-`: load source code from the standard input
+
+If you specify `-` as the INPUT on the command line, then `rustdoc` will read the
+source code from stdin (standard input stream) until the EOF, instead of the file
+system with an otherwise specified path.
+
 ## `@path`: load command-line flags from a path
 
 If you specify `@path` on the command-line, then it will open `path` and read
@@ -417,3 +447,32 @@ This flag is **deprecated** and **has no effect**.
 Rustdoc only supports Rust source code and Markdown input formats. If the
 file ends in `.md` or `.markdown`, `rustdoc` treats it as a Markdown file.
 Otherwise, it assumes that the input file is Rust.
+
+## `--test-builder`: `rustc`-like program to build tests
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc --test-builder /path/to/rustc src/lib.rs
+```
+
+Rustdoc will use the provided program to compile tests instead of the default `rustc` program from
+the sysroot.
+
+## `--test-builder-wrapper`: wrap calls to the test builder
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc --test-builder-wrapper /path/to/rustc-wrapper src/lib.rs
+$ rustdoc \
+    --test-builder-wrapper rustc-wrapper1 \
+    --test-builder-wrapper rustc-wrapper2 \
+    --test-builder rustc \
+    src/lib.rs
+```
+
+Similar to cargo `build.rustc-wrapper` option, this flag takes a `rustc` wrapper program.
+The first argument to the program will be the test builder program.
+
+This flag can be passed multiple times to nest wrappers.

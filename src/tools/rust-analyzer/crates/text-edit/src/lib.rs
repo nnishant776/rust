@@ -4,7 +4,7 @@
 //! so `TextEdit` is the ultimate representation of the work done by
 //! rust-analyzer.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 use itertools::Itertools;
 use std::cmp::max;
@@ -176,6 +176,7 @@ impl TextEditBuilder {
     pub fn finish(self) -> TextEdit {
         let mut indels = self.indels;
         assert_disjoint_or_equal(&mut indels);
+        indels = coalesce_indels(indels);
         TextEdit { indels }
     }
     pub fn invalidates_offset(&self, offset: TextSize) -> bool {
@@ -205,6 +206,21 @@ where
     indels.clone().zip(indels.skip(1)).all(|(l, r)| l.delete.end() <= r.delete.start() || l == r)
 }
 
+fn coalesce_indels(indels: Vec<Indel>) -> Vec<Indel> {
+    indels
+        .into_iter()
+        .coalesce(|mut a, b| {
+            if a.delete.end() == b.delete.start() {
+                a.insert.push_str(&b.insert);
+                a.delete = TextRange::new(a.delete.start(), b.delete.end());
+                Ok(a)
+            } else {
+                Err((a, b))
+            }
+        })
+        .collect_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TextEdit, TextEditBuilder, TextRange};
@@ -215,11 +231,11 @@ mod tests {
 
     #[test]
     fn test_apply() {
-        let mut text = "_11h1_2222_xx3333_4444_6666".to_string();
+        let mut text = "_11h1_2222_xx3333_4444_6666".to_owned();
         let mut builder = TextEditBuilder::default();
-        builder.replace(range(3, 4), "1".to_string());
+        builder.replace(range(3, 4), "1".to_owned());
         builder.delete(range(11, 13));
-        builder.insert(22.into(), "_5555".to_string());
+        builder.insert(22.into(), "_5555".to_owned());
 
         let text_edit = builder.finish();
         text_edit.apply(&mut text);
@@ -260,5 +276,41 @@ mod tests {
         let mut edit1 = TextEdit::delete(range(7, 11));
         let edit2 = TextEdit::delete(range(9, 13));
         assert!(edit1.union(edit2).is_err());
+    }
+
+    #[test]
+    fn test_coalesce_disjoint() {
+        let mut builder = TextEditBuilder::default();
+        builder.replace(range(1, 3), "aa".into());
+        builder.replace(range(5, 7), "bb".into());
+        let edit = builder.finish();
+
+        assert_eq!(edit.indels.len(), 2);
+    }
+
+    #[test]
+    fn test_coalesce_adjacent() {
+        let mut builder = TextEditBuilder::default();
+        builder.replace(range(1, 3), "aa".into());
+        builder.replace(range(3, 5), "bb".into());
+
+        let edit = builder.finish();
+        assert_eq!(edit.indels.len(), 1);
+        assert_eq!(edit.indels[0].insert, "aabb");
+        assert_eq!(edit.indels[0].delete, range(1, 5));
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_series() {
+        let mut builder = TextEditBuilder::default();
+        builder.replace(range(1, 3), "au".into());
+        builder.replace(range(3, 5), "www".into());
+        builder.replace(range(5, 8), "".into());
+        builder.replace(range(8, 9), "ub".into());
+
+        let edit = builder.finish();
+        assert_eq!(edit.indels.len(), 1);
+        assert_eq!(edit.indels[0].insert, "auwwwub");
+        assert_eq!(edit.indels[0].delete, range(1, 9));
     }
 }

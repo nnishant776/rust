@@ -1,13 +1,15 @@
 //! Logic for rendering the different hover messages
-use std::fmt::Display;
+use std::{mem, ops::Not};
 
 use either::Either;
 use hir::{
-    Adt, AsAssocItem, AttributeTemplate, HasAttrs, HasSource, HirDisplay, Semantics, TypeInfo,
+    Adt, AsAssocItem, AsExternAssocItem, CaptureKind, HasCrate, HasSource, HirDisplay, Layout,
+    LayoutError, Name, Semantics, Trait, Type, TypeInfo,
 };
 use ide_db::{
     base_db::SourceDatabase,
     defs::Definition,
+    documentation::HasDocs,
     famous_defs::FamousDefs,
     generated::lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
     syntax_helpers::insert_whitespace_into_node,
@@ -15,18 +17,13 @@ use ide_db::{
 };
 use itertools::Itertools;
 use stdx::format_to;
-use syntax::{
-    algo,
-    ast::{self, RecordPat},
-    match_ast, AstNode, Direction,
-    SyntaxKind::{LET_EXPR, LET_STMT},
-    SyntaxToken, T,
-};
+use syntax::{algo, ast, match_ast, AstNode, AstToken, Direction, SyntaxToken, T};
 
 use crate::{
     doc_links::{remove_links, rewrite_links},
-    hover::walk_and_push_ty,
-    HoverAction, HoverConfig, HoverResult, Markup,
+    hover::{notable_traits, walk_and_push_ty},
+    HoverAction, HoverConfig, HoverResult, Markup, MemoryLayoutHoverConfig,
+    MemoryLayoutHoverRenderKind,
 };
 
 pub(super) fn type_info_of(
@@ -34,11 +31,20 @@ pub(super) fn type_info_of(
     _config: &HoverConfig,
     expr_or_pat: &Either<ast::Expr, ast::Pat>,
 ) -> Option<HoverResult> {
-    let TypeInfo { original, adjusted } = match expr_or_pat {
+    let ty_info = match expr_or_pat {
         Either::Left(expr) => sema.type_of_expr(expr)?,
         Either::Right(pat) => sema.type_of_pat(pat)?,
     };
-    type_info(sema, _config, original, adjusted)
+    type_info(sema, _config, ty_info)
+}
+
+pub(super) fn closure_expr(
+    sema: &Semantics<'_, RootDatabase>,
+    config: &HoverConfig,
+    c: ast::ClosureExpr,
+) -> Option<HoverResult> {
+    let TypeInfo { original, .. } = sema.type_of_expr(&c.into())?;
+    closure_ty(sema, config, &TypeInfo { original, adjusted: None })
 }
 
 pub(super) fn try_expr(
@@ -91,7 +97,7 @@ pub(super) fn try_expr(
                 if let Some((inner, body)) = error_type_args {
                     inner_ty = inner;
                     body_ty = body;
-                    s = "Try Error".to_owned();
+                    "Try Error".clone_into(&mut s);
                 }
             }
         }
@@ -107,7 +113,9 @@ pub(super) fn try_expr(
     };
     walk_and_push_ty(sema.db, &inner_ty, &mut push_new_def);
     walk_and_push_ty(sema.db, &body_ty, &mut push_new_def);
-    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets) {
+        res.actions.push(actions);
+    }
 
     let inner_ty = inner_ty.display(sema.db).to_string();
     let body_ty = body_ty.display(sema.db).to_string();
@@ -116,7 +124,7 @@ pub(super) fn try_expr(
     let l = "Propagated as: ".len() - " Type: ".len();
     let static_text_len_diff = l as isize - s.len() as isize;
     let tpad = static_text_len_diff.max(0) as usize;
-    let ppad = static_text_len_diff.min(0).abs() as usize;
+    let ppad = static_text_len_diff.min(0).unsigned_abs();
 
     res.markup = format!(
         "```text\n{} Type: {:>pad0$}\nPropagated as: {:>pad1$}\n```\n",
@@ -185,7 +193,9 @@ pub(super) fn deref_expr(
         )
         .into()
     };
-    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets) {
+        res.actions.push(actions);
+    }
 
     Some(res)
 }
@@ -246,11 +256,11 @@ pub(super) fn keyword(
     let KeywordHint { description, keyword_mod, actions } = keyword_hints(sema, token, parent);
 
     let doc_owner = find_std_module(&famous_defs, &keyword_mod)?;
-    let docs = doc_owner.attrs(sema.db).docs()?;
+    let docs = doc_owner.docs(sema.db)?;
     let markup = process_markup(
         sema.db,
         Definition::Module(doc_owner),
-        &markup(Some(docs.into()), description, None)?,
+        &markup(Some(docs.into()), description, None),
         config,
     );
     Some(HoverResult { markup, actions })
@@ -262,7 +272,7 @@ pub(super) fn keyword(
 pub(super) fn struct_rest_pat(
     sema: &Semantics<'_, RootDatabase>,
     _config: &HoverConfig,
-    pattern: &RecordPat,
+    pattern: &ast::RecordPat,
 ) -> HoverResult {
     let missing_fields = sema.record_pattern_missing_fields(pattern);
 
@@ -292,7 +302,9 @@ pub(super) fn struct_rest_pat(
 
         Markup::fenced_block(&s)
     };
-    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets) {
+        res.actions.push(actions);
+    }
     res
 }
 
@@ -326,7 +338,7 @@ pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<Hove
         tmp = format!("clippy::{}", token.text());
         &tmp
     } else {
-        &*token.text()
+        token.text()
     };
 
     let lint =
@@ -353,14 +365,22 @@ fn definition_owner_name(db: &RootDatabase, def: &Definition) -> Option<String> 
     match def {
         Definition::Field(f) => Some(f.parent_def(db).name(db)),
         Definition::Local(l) => l.parent(db).name(db),
-        Definition::Function(f) => match f.as_assoc_item(db)?.container(db) {
-            hir::AssocItemContainer::Trait(t) => Some(t.name(db)),
-            hir::AssocItemContainer::Impl(i) => i.self_ty(db).as_adt().map(|adt| adt.name(db)),
-        },
         Definition::Variant(e) => Some(e.parent_enum(db).name(db)),
-        _ => None,
+
+        d => {
+            if let Some(assoc_item) = d.as_assoc_item(db) {
+                match assoc_item.container(db) {
+                    hir::AssocItemContainer::Trait(t) => Some(t.name(db)),
+                    hir::AssocItemContainer::Impl(i) => {
+                        i.self_ty(db).as_adt().map(|adt| adt.name(db))
+                    }
+                }
+            } else {
+                return d.as_extern_assoc_item(db).map(|_| "<extern>".to_owned());
+            }
+        }
     }
-    .map(|name| name.to_string())
+    .map(|name| name.display(db).to_string())
 }
 
 pub(super) fn path(db: &RootDatabase, module: hir::Module, item_name: Option<String>) -> String {
@@ -370,7 +390,7 @@ pub(super) fn path(db: &RootDatabase, module: hir::Module, item_name: Option<Str
         .path_to_root(db)
         .into_iter()
         .rev()
-        .flat_map(|it| it.name(db).map(|name| name.to_string()));
+        .flat_map(|it| it.name(db).map(|name| name.display(db).to_string()));
     crate_name.into_iter().chain(module_path).chain(item_name).join("::")
 }
 
@@ -378,49 +398,58 @@ pub(super) fn definition(
     db: &RootDatabase,
     def: Definition,
     famous_defs: Option<&FamousDefs<'_, '_>>,
+    notable_traits: &[(Trait, Vec<(Option<Type>, Name)>)],
+    macro_arm: Option<u32>,
     config: &HoverConfig,
-) -> Option<Markup> {
+) -> Markup {
     let mod_path = definition_mod_path(db, &def);
-    let (label, docs) = match def {
-        Definition::Macro(it) => label_and_docs(db, it),
-        Definition::Field(it) => label_and_layout_info_and_docs(db, it, |&it| {
-            let var_def = it.parent_def(db);
-            let id = it.index();
-            let layout = it.layout(db).ok()?;
-            let offset = match var_def {
-                hir::VariantDef::Struct(s) => Adt::from(s)
-                    .layout(db)
-                    .ok()
-                    .map(|layout| format!(", offset = {}", layout.fields.offset(id).bytes())),
-                _ => None,
-            };
-            Some(format!(
-                "size = {}, align = {}{}",
-                layout.size.bytes(),
-                layout.align.abi.bytes(),
-                offset.as_deref().unwrap_or_default()
-            ))
-        }),
-        Definition::Module(it) => label_and_docs(db, it),
-        Definition::Function(it) => label_and_docs(db, it),
-        Definition::Adt(it) => label_and_layout_info_and_docs(db, it, |&it| {
-            let layout = it.layout(db).ok()?;
-            Some(format!("size = {}, align = {}", layout.size.bytes(), layout.align.abi.bytes()))
-        }),
-        Definition::Variant(it) => label_value_and_docs(db, it, |&it| {
+    let label = match def {
+        Definition::Trait(trait_) => {
+            trait_.display_limited(db, config.max_trait_assoc_items_count).to_string()
+        }
+        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
+            adt.display_limited(db, config.max_fields_count).to_string()
+        }
+        Definition::Variant(variant) => {
+            variant.display_limited(db, config.max_fields_count).to_string()
+        }
+        Definition::Adt(adt @ Adt::Enum(_)) => {
+            adt.display_limited(db, config.max_enum_variants_count).to_string()
+        }
+        Definition::SelfType(impl_def) => {
+            let self_ty = &impl_def.self_ty(db);
+            match self_ty.as_adt() {
+                Some(adt) => adt.display_limited(db, config.max_fields_count).to_string(),
+                None => self_ty.display(db).to_string(),
+            }
+        }
+        Definition::Macro(it) => {
+            let mut label = it.display(db).to_string();
+            if let Some(macro_arm) = macro_arm {
+                format_to!(label, " // matched arm #{}", macro_arm);
+            }
+            label
+        }
+        _ => def.label(db),
+    };
+    let docs = def.docs(db, famous_defs);
+    let value = (|| match def {
+        Definition::Variant(it) => {
             if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
-                    Ok(x) => Some(format!("{x}")),
-                    Err(_) => it.value(db).map(|x| format!("{x:?}")),
+                    Ok(it) => {
+                        Some(if it >= 10 { format!("{it} ({it:#X})") } else { format!("{it}") })
+                    }
+                    Err(_) => it.value(db).map(|it| format!("{it:?}")),
                 }
             } else {
                 None
             }
-        }),
-        Definition::Const(it) => label_value_and_docs(db, it, |it| {
-            let body = it.eval(db);
+        }
+        Definition::Const(it) => {
+            let body = it.render_eval(db);
             match body {
-                Ok(x) => Some(format!("{x}")),
+                Ok(it) => Some(it),
                 Err(_) => {
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
@@ -430,55 +459,166 @@ pub(super) fn definition(
                     Some(body.to_string())
                 }
             }
-        }),
-        Definition::Static(it) => label_value_and_docs(db, it, |it| {
+        }
+        Definition::Static(it) => {
             let source = it.source(db)?;
             let mut body = source.value.body()?.syntax().clone();
             if source.file_id.is_macro() {
                 body = insert_whitespace_into_node::insert_ws_into(body);
             }
             Some(body.to_string())
-        }),
-        Definition::Trait(it) => label_and_docs(db, it),
-        Definition::TypeAlias(it) => label_and_docs(db, it),
-        Definition::BuiltinType(it) => {
-            return famous_defs
-                .and_then(|fd| builtin(fd, it))
-                .or_else(|| Some(Markup::fenced_block(&it.name())))
         }
-        Definition::Local(it) => return local(db, it),
-        Definition::SelfType(impl_def) => {
-            impl_def.self_ty(db).as_adt().map(|adt| label_and_docs(db, adt))?
+        _ => None,
+    })();
+
+    let layout_info = match def {
+        Definition::Field(it) => render_memory_layout(
+            config.memory_layout,
+            || it.layout(db),
+            |_| {
+                let var_def = it.parent_def(db);
+                match var_def {
+                    hir::VariantDef::Struct(s) => {
+                        Adt::from(s).layout(db).ok().and_then(|layout| layout.field_offset(it))
+                    }
+                    _ => None,
+                }
+            },
+            |_| None,
+        ),
+        Definition::Adt(it) => {
+            render_memory_layout(config.memory_layout, || it.layout(db), |_| None, |_| None)
         }
-        Definition::GenericParam(it) => label_and_docs(db, it),
-        Definition::Label(it) => return Some(Markup::fenced_block(&it.name(db))),
-        // FIXME: We should be able to show more info about these
-        Definition::BuiltinAttr(it) => return render_builtin_attr(db, it),
-        Definition::ToolModule(it) => return Some(Markup::fenced_block(&it.name(db))),
-        Definition::DeriveHelper(it) => (format!("derive_helper {}", it.name(db)), None),
+        Definition::Variant(it) => render_memory_layout(
+            config.memory_layout,
+            || it.layout(db),
+            |_| None,
+            |layout| layout.enum_tag_size(),
+        ),
+        Definition::TypeAlias(it) => {
+            render_memory_layout(config.memory_layout, || it.ty(db).layout(db), |_| None, |_| None)
+        }
+        Definition::Local(it) => {
+            render_memory_layout(config.memory_layout, || it.ty(db).layout(db), |_| None, |_| None)
+        }
+        _ => None,
     };
 
-    let docs = docs
-        .filter(|_| config.documentation)
-        .or_else(|| {
-            // docs are missing, for assoc items of trait impls try to fall back to the docs of the
-            // original item of the trait
-            let assoc = def.as_assoc_item(db)?;
-            let trait_ = assoc.containing_trait_impl(db)?;
-            let name = Some(assoc.name(db)?);
-            let item = trait_.items(db).into_iter().find(|it| it.name(db) == name)?;
-            item.docs(db)
-        })
-        .map(Into::into);
-    markup(docs, label, mod_path)
+    let mut desc = String::new();
+    if let Some(notable_traits) = render_notable_trait_comment(db, notable_traits) {
+        desc.push_str(&notable_traits);
+        desc.push('\n');
+    }
+    if let Some(layout_info) = layout_info {
+        desc.push_str(&layout_info);
+        desc.push('\n');
+    }
+    desc.push_str(&label);
+    if let Some(value) = value {
+        desc.push_str(" = ");
+        desc.push_str(&value);
+    }
+
+    markup(docs.map(Into::into), desc, mod_path)
+}
+
+pub(super) fn literal(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> Option<Markup> {
+    let lit = token.parent().and_then(ast::Literal::cast)?;
+    let ty = if let Some(p) = lit.syntax().parent().and_then(ast::Pat::cast) {
+        sema.type_of_pat(&p)?
+    } else {
+        sema.type_of_expr(&ast::Expr::Literal(lit))?
+    }
+    .original;
+
+    let value = match_ast! {
+        match token {
+            ast::String(string)     => string.value().as_ref().map_err(|e| format!("{e:?}")).map(ToString::to_string),
+            ast::ByteString(string) => string.value().as_ref().map_err(|e| format!("{e:?}")).map(|it| format!("{it:?}")),
+            ast::CString(string)    => string.value().as_ref().map_err(|e| format!("{e:?}")).map(|it| std::str::from_utf8(it).map_or_else(|e| format!("{e:?}"), ToOwned::to_owned)),
+            ast::Char(char)         => char  .value().as_ref().map_err(|e| format!("{e:?}")).map(ToString::to_string),
+            ast::Byte(byte)         => byte  .value().as_ref().map_err(|e| format!("{e:?}")).map(|it| format!("0x{it:X}")),
+            ast::FloatNumber(num) => {
+                let (text, _) = num.split_into_parts();
+                let text = text.replace('_', "");
+                if ty.as_builtin().map(|it| it.is_f32()).unwrap_or(false) {
+                    match text.parse::<f32>() {
+                        Ok(num) => Ok(format!("{num} (bits: 0x{:X})", num.to_bits())),
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    match text.parse::<f64>() {
+                        Ok(num) => Ok(format!("{num} (bits: 0x{:X})", num.to_bits())),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            },
+            ast::IntNumber(num) => match num.value() {
+                Ok(num) => Ok(format!("{num} (0x{num:X}|0b{num:b})")),
+                Err(e) => Err(e.to_string()),
+            },
+            _ => return None
+        }
+    };
+    let ty = ty.display(sema.db);
+
+    let mut s = format!("```rust\n{ty}\n```\n___\n\n");
+    match value {
+        Ok(value) => {
+            if let Some(newline) = value.find('\n') {
+                format_to!(s, "value of literal (truncated up to newline): {}", &value[..newline])
+            } else {
+                format_to!(s, "value of literal: {value}")
+            }
+        }
+        Err(error) => format_to!(s, "invalid literal: {error}"),
+    }
+    Some(s.into())
+}
+
+fn render_notable_trait_comment(
+    db: &RootDatabase,
+    notable_traits: &[(Trait, Vec<(Option<Type>, Name)>)],
+) -> Option<String> {
+    let mut desc = String::new();
+    let mut needs_impl_header = true;
+    for (trait_, assoc_types) in notable_traits {
+        desc.push_str(if mem::take(&mut needs_impl_header) {
+            "// Implements notable traits: "
+        } else {
+            ", "
+        });
+        format_to!(desc, "{}", trait_.name(db).display(db),);
+        if !assoc_types.is_empty() {
+            desc.push('<');
+            format_to!(
+                desc,
+                "{}",
+                assoc_types.iter().format_with(", ", |(ty, name), f| {
+                    f(&name.display(db))?;
+                    f(&" = ")?;
+                    match ty {
+                        Some(ty) => f(&ty.display(db)),
+                        None => f(&"?"),
+                    }
+                })
+            );
+            desc.push('>');
+        }
+    }
+    desc.is_empty().not().then_some(desc)
 }
 
 fn type_info(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
-    original: hir::Type,
-    adjusted: Option<hir::Type>,
+    config: &HoverConfig,
+    ty: TypeInfo,
 ) -> Option<HoverResult> {
+    if let Some(res) = closure_ty(sema, config, &ty) {
+        return Some(res);
+    };
+    let db = sema.db;
+    let TypeInfo { original, adjusted } = ty;
     let mut res = HoverResult::default();
     let mut targets: Vec<hir::ModuleDef> = Vec::new();
     let mut push_new_def = |item: hir::ModuleDef| {
@@ -486,15 +626,49 @@ fn type_info(
             targets.push(item);
         }
     };
-    walk_and_push_ty(sema.db, &original, &mut push_new_def);
+    walk_and_push_ty(db, &original, &mut push_new_def);
 
     res.markup = if let Some(adjusted_ty) = adjusted {
-        walk_and_push_ty(sema.db, &adjusted_ty, &mut push_new_def);
-        let original = original.display(sema.db).to_string();
-        let adjusted = adjusted_ty.display(sema.db).to_string();
+        walk_and_push_ty(db, &adjusted_ty, &mut push_new_def);
+
+        let notable = {
+            let mut desc = String::new();
+            let mut needs_impl_header = true;
+            for (trait_, assoc_types) in notable_traits(db, &original) {
+                desc.push_str(if mem::take(&mut needs_impl_header) {
+                    "Implements Notable Traits: "
+                } else {
+                    ", "
+                });
+                format_to!(desc, "{}", trait_.name(db).display(db),);
+                if !assoc_types.is_empty() {
+                    desc.push('<');
+                    format_to!(
+                        desc,
+                        "{}",
+                        assoc_types.into_iter().format_with(", ", |(ty, name), f| {
+                            f(&name.display(db))?;
+                            f(&" = ")?;
+                            match ty {
+                                Some(ty) => f(&ty.display(db)),
+                                None => f(&"?"),
+                            }
+                        })
+                    );
+                    desc.push('>');
+                }
+            }
+            if !desc.is_empty() {
+                desc.push('\n');
+            }
+            desc
+        };
+
+        let original = original.display(db).to_string();
+        let adjusted = adjusted_ty.display(db).to_string();
         let static_text_diff_len = "Coerced to: ".len() - "Type: ".len();
         format!(
-            "```text\nType: {:>apad$}\nCoerced to: {:>opad$}\n```\n",
+            "```text\nType: {:>apad$}\nCoerced to: {:>opad$}\n{notable}```\n",
             original,
             adjusted,
             apad = static_text_diff_len + adjusted.len().max(original.len()),
@@ -502,88 +676,93 @@ fn type_info(
         )
         .into()
     } else {
-        Markup::fenced_block(&original.display(sema.db))
+        let mut desc = match render_notable_trait_comment(db, &notable_traits(db, &original)) {
+            Some(desc) => desc + "\n",
+            None => String::new(),
+        };
+        format_to!(desc, "{}", original.display(db));
+        Markup::fenced_block(&desc)
     };
-    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    if let Some(actions) = HoverAction::goto_type_from_targets(db, targets) {
+        res.actions.push(actions);
+    }
     Some(res)
 }
 
-fn render_builtin_attr(db: &RootDatabase, attr: hir::BuiltinAttr) -> Option<Markup> {
-    let name = attr.name(db);
-    let desc = format!("#[{name}]");
-
-    let AttributeTemplate { word, list, name_value_str } = match attr.template(db) {
-        Some(template) => template,
-        None => return Some(Markup::fenced_block(&attr.name(db))),
+fn closure_ty(
+    sema: &Semantics<'_, RootDatabase>,
+    config: &HoverConfig,
+    TypeInfo { original, adjusted }: &TypeInfo,
+) -> Option<HoverResult> {
+    let c = original.as_closure()?;
+    let mut captures_rendered = c.captured_items(sema.db)
+        .into_iter()
+        .map(|it| {
+            let borrow_kind = match it.kind() {
+                CaptureKind::SharedRef => "immutable borrow",
+                CaptureKind::UniqueSharedRef => "unique immutable borrow ([read more](https://doc.rust-lang.org/stable/reference/types/closure.html#unique-immutable-borrows-in-captures))",
+                CaptureKind::MutableRef => "mutable borrow",
+                CaptureKind::Move => "move",
+            };
+            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
+        })
+        .join("\n");
+    if captures_rendered.trim().is_empty() {
+        "This closure captures nothing".clone_into(&mut captures_rendered);
+    }
+    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+    let mut push_new_def = |item: hir::ModuleDef| {
+        if !targets.contains(&item) {
+            targets.push(item);
+        }
     };
-    let mut docs = "Valid forms are:".to_owned();
-    if word {
-        format_to!(docs, "\n - #\\[{}]", name);
-    }
-    if let Some(list) = list {
-        format_to!(docs, "\n - #\\[{}({})]", name, list);
-    }
-    if let Some(name_value_str) = name_value_str {
-        format_to!(docs, "\n - #\\[{} = {}]", name, name_value_str);
-    }
-    markup(Some(docs.replace('*', "\\*")), desc, None)
-}
+    walk_and_push_ty(sema.db, original, &mut push_new_def);
+    c.capture_types(sema.db).into_iter().for_each(|ty| {
+        walk_and_push_ty(sema.db, &ty, &mut push_new_def);
+    });
 
-fn label_and_docs<D>(db: &RootDatabase, def: D) -> (String, Option<hir::Documentation>)
-where
-    D: HasAttrs + HirDisplay,
-{
-    let label = def.display(db).to_string();
-    let docs = def.attrs(db).docs();
-    (label, docs)
-}
-
-fn label_and_layout_info_and_docs<D, E, V>(
-    db: &RootDatabase,
-    def: D,
-    value_extractor: E,
-) -> (String, Option<hir::Documentation>)
-where
-    D: HasAttrs + HirDisplay,
-    E: Fn(&D) -> Option<V>,
-    V: Display,
-{
-    let label = if let Some(value) = value_extractor(&def) {
-        format!("{} // {value}", def.display(db))
+    let adjusted = if let Some(adjusted_ty) = adjusted {
+        walk_and_push_ty(sema.db, adjusted_ty, &mut push_new_def);
+        format!(
+            "\nCoerced to: {}",
+            adjusted_ty.display(sema.db).with_closure_style(hir::ClosureStyle::ImplFn)
+        )
     } else {
-        def.display(db).to_string()
+        String::new()
     };
-    let docs = def.attrs(db).docs();
-    (label, docs)
-}
+    let mut markup = format!("```rust\n{}", c.display_with_id(sema.db),);
 
-fn label_value_and_docs<D, E, V>(
-    db: &RootDatabase,
-    def: D,
-    value_extractor: E,
-) -> (String, Option<hir::Documentation>)
-where
-    D: HasAttrs + HirDisplay,
-    E: Fn(&D) -> Option<V>,
-    V: Display,
-{
-    let label = if let Some(value) = value_extractor(&def) {
-        format!("{} = {value}", def.display(db))
-    } else {
-        def.display(db).to_string()
-    };
-    let docs = def.attrs(db).docs();
-    (label, docs)
+    if let Some(layout) =
+        render_memory_layout(config.memory_layout, || original.layout(sema.db), |_| None, |_| None)
+    {
+        format_to!(markup, " {layout}");
+    }
+    if let Some(trait_) = c.fn_trait(sema.db).get_id(sema.db, original.krate(sema.db).into()) {
+        push_new_def(hir::Trait::from(trait_).into())
+    }
+    format_to!(
+        markup,
+        "\n{}\n```{adjusted}\n\n## Captures\n{}",
+        c.display_with_impl(sema.db),
+        captures_rendered,
+    );
+
+    let mut res = HoverResult::default();
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets) {
+        res.actions.push(actions);
+    }
+    res.markup = markup.into();
+    Some(res)
 }
 
 fn definition_mod_path(db: &RootDatabase, def: &Definition) -> Option<String> {
-    if let Definition::GenericParam(_) = def {
+    if matches!(def, Definition::GenericParam(_) | Definition::Local(_) | Definition::Label(_)) {
         return None;
     }
     def.module(db).map(|module| path(db, module, definition_owner_name(db, def)))
 }
 
-fn markup(docs: Option<String>, desc: String, mod_path: Option<String>) -> Option<Markup> {
+fn markup(docs: Option<String>, desc: String, mod_path: Option<String>) -> Markup {
     let mut buf = String::new();
 
     if let Some(mod_path) = mod_path {
@@ -596,47 +775,87 @@ fn markup(docs: Option<String>, desc: String, mod_path: Option<String>) -> Optio
     if let Some(doc) = docs {
         format_to!(buf, "\n___\n\n{}", doc);
     }
-    Some(buf.into())
-}
-
-fn builtin(famous_defs: &FamousDefs<'_, '_>, builtin: hir::BuiltinType) -> Option<Markup> {
-    // std exposes prim_{} modules with docstrings on the root to document the builtins
-    let primitive_mod = format!("prim_{}", builtin.name());
-    let doc_owner = find_std_module(famous_defs, &primitive_mod)?;
-    let docs = doc_owner.attrs(famous_defs.0.db).docs()?;
-    markup(Some(docs.into()), builtin.name().to_string(), None)
+    buf.into()
 }
 
 fn find_std_module(famous_defs: &FamousDefs<'_, '_>, name: &str) -> Option<hir::Module> {
     let db = famous_defs.0.db;
     let std_crate = famous_defs.std()?;
-    let std_root_module = std_crate.root_module(db);
-    std_root_module
-        .children(db)
-        .find(|module| module.name(db).map_or(false, |module| module.to_string() == name))
+    let std_root_module = std_crate.root_module();
+    std_root_module.children(db).find(|module| {
+        module.name(db).map_or(false, |module| module.display(db).to_string() == name)
+    })
 }
 
-fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
-    let ty = it.ty(db);
-    let ty = ty.display_truncated(db, None);
-    let is_mut = if it.is_mut(db) { "mut " } else { "" };
-    let desc = match it.source(db).value {
-        Either::Left(ident) => {
-            let name = it.name(db);
-            let let_kw = if ident
-                .syntax()
-                .parent()
-                .map_or(false, |p| p.kind() == LET_STMT || p.kind() == LET_EXPR)
-            {
-                "let "
-            } else {
-                ""
-            };
-            format!("{let_kw}{is_mut}{name}: {ty}")
+fn render_memory_layout(
+    config: Option<MemoryLayoutHoverConfig>,
+    layout: impl FnOnce() -> Result<Layout, LayoutError>,
+    offset: impl FnOnce(&Layout) -> Option<u64>,
+    tag: impl FnOnce(&Layout) -> Option<usize>,
+) -> Option<String> {
+    let config = config?;
+    let layout = layout().ok()?;
+
+    let mut label = String::from("// ");
+
+    if let Some(render) = config.size {
+        let size = match tag(&layout) {
+            Some(tag) => layout.size() as usize - tag,
+            None => layout.size() as usize,
+        };
+        format_to!(label, "size = ");
+        match render {
+            MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{size}"),
+            MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{size:#X}"),
+            MemoryLayoutHoverRenderKind::Both if size >= 10 => {
+                format_to!(label, "{size} ({size:#X})")
+            }
+            MemoryLayoutHoverRenderKind::Both => format_to!(label, "{size}"),
         }
-        Either::Right(_) => format!("{is_mut}self: {ty}"),
-    };
-    markup(None, desc, None)
+        format_to!(label, ", ");
+    }
+
+    if let Some(render) = config.alignment {
+        let align = layout.align();
+        format_to!(label, "align = ");
+        match render {
+            MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{align}",),
+            MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{align:#X}",),
+            MemoryLayoutHoverRenderKind::Both if align >= 10 => {
+                format_to!(label, "{align} ({align:#X})")
+            }
+            MemoryLayoutHoverRenderKind::Both => {
+                format_to!(label, "{align}")
+            }
+        }
+        format_to!(label, ", ");
+    }
+
+    if let Some(render) = config.offset {
+        if let Some(offset) = offset(&layout) {
+            format_to!(label, "offset = ");
+            match render {
+                MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{offset}"),
+                MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{offset:#X}"),
+                MemoryLayoutHoverRenderKind::Both if offset >= 10 => {
+                    format_to!(label, "{offset} ({offset:#X})")
+                }
+                MemoryLayoutHoverRenderKind::Both => {
+                    format_to!(label, "{offset}")
+                }
+            }
+            format_to!(label, ", ");
+        }
+    }
+
+    if config.niches {
+        if let Some(niches) = layout.niches() {
+            format_to!(label, "niches = {niches}, ");
+        }
+    }
+    label.pop(); // ' '
+    label.pop(); // ','
+    Some(label)
 }
 
 struct KeywordHint {
@@ -677,11 +896,13 @@ fn keyword_hints(
                     KeywordHint {
                         description,
                         keyword_mod,
-                        actions: vec![HoverAction::goto_type_from_targets(sema.db, targets)],
+                        actions: HoverAction::goto_type_from_targets(sema.db, targets)
+                            .into_iter()
+                            .collect(),
                     }
                 }
                 _ => KeywordHint {
-                    description: token.text().to_string(),
+                    description: token.text().to_owned(),
                     keyword_mod,
                     actions: Vec::new(),
                 },
@@ -693,9 +914,9 @@ fn keyword_hints(
                 Some(_) => format!("prim_{}", token.text()),
                 None => format!("{}_keyword", token.text()),
             };
-            KeywordHint::new(token.text().to_string(), module)
+            KeywordHint::new(token.text().to_owned(), module)
         }
-        T![Self] => KeywordHint::new(token.text().to_string(), "self_upper_keyword".into()),
-        _ => KeywordHint::new(token.text().to_string(), format!("{}_keyword", token.text())),
+        T![Self] => KeywordHint::new(token.text().to_owned(), "self_upper_keyword".into()),
+        _ => KeywordHint::new(token.text().to_owned(), format!("{}_keyword", token.text())),
     }
 }

@@ -1,8 +1,8 @@
 // Regression test for #62988
 
-// check-pass
+//@ check-pass
 
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 trait MyTrait {
     type AssocType: Send;

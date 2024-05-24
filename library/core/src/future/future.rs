@@ -1,6 +1,5 @@
 #![stable(feature = "futures_api", since = "1.36.0")]
 
-use crate::marker::Unpin;
 use crate::ops;
 use crate::pin::Pin;
 use crate::task::{Context, Poll};
@@ -29,10 +28,9 @@ use crate::task::{Context, Poll};
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 #[stable(feature = "futures_api", since = "1.36.0")]
 #[lang = "future_trait"]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     label = "`{Self}` is not a future",
-    message = "`{Self}` is not a future",
-    note = "{Self} must be a future or must implement `IntoFuture` to be awaited"
+    message = "`{Self}` is not a future"
 )]
 pub trait Future {
     /// The type of value produced on completion.
@@ -83,7 +81,7 @@ pub trait Future {
     /// An implementation of `poll` should strive to return quickly, and should
     /// not block. Returning quickly prevents unnecessarily clogging up
     /// threads or event loops. If it is known ahead of time that a call to
-    /// `poll` may end up taking awhile, the work should be offloaded to a
+    /// `poll` may end up taking a while, the work should be offloaded to a
     /// thread pool (or something similar) to ensure that `poll` can return
     /// quickly.
     ///

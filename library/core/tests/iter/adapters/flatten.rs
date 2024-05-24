@@ -1,5 +1,7 @@
 use super::*;
+use core::assert_eq;
 use core::iter::*;
+use core::num::NonZero;
 
 #[test]
 fn test_iterator_flatten() {
@@ -61,19 +63,19 @@ fn test_flatten_try_folds() {
 fn test_flatten_advance_by() {
     let mut it = once(0..10).chain(once(10..30)).chain(once(30..40)).flatten();
 
-    it.advance_by(5).unwrap();
+    assert_eq!(it.advance_by(5), Ok(()));
     assert_eq!(it.next(), Some(5));
-    it.advance_by(9).unwrap();
+    assert_eq!(it.advance_by(9), Ok(()));
     assert_eq!(it.next(), Some(15));
-    it.advance_back_by(4).unwrap();
+    assert_eq!(it.advance_back_by(4), Ok(()));
     assert_eq!(it.next_back(), Some(35));
-    it.advance_back_by(9).unwrap();
+    assert_eq!(it.advance_back_by(9), Ok(()));
     assert_eq!(it.next_back(), Some(25));
 
-    assert_eq!(it.advance_by(usize::MAX), Err(9));
-    assert_eq!(it.advance_back_by(usize::MAX), Err(0));
-    it.advance_by(0).unwrap();
-    it.advance_back_by(0).unwrap();
+    assert_eq!(it.advance_by(usize::MAX), Err(NonZero::new(usize::MAX - 9).unwrap()));
+    assert_eq!(it.advance_back_by(usize::MAX), Err(NonZero::new(usize::MAX).unwrap()));
+    assert_eq!(it.advance_by(0), Ok(()));
+    assert_eq!(it.advance_back_by(0), Ok(()));
     assert_eq!(it.size_hint(), (0, Some(0)));
 }
 
@@ -174,19 +176,19 @@ fn test_flatten_count() {
     let mut it = once(0..10).chain(once(10..30)).chain(once(30..40)).flatten();
 
     assert_eq!(it.clone().count(), 40);
-    it.advance_by(5).unwrap();
+    assert_eq!(it.advance_by(5), Ok(()));
     assert_eq!(it.clone().count(), 35);
-    it.advance_back_by(5).unwrap();
+    assert_eq!(it.advance_back_by(5), Ok(()));
     assert_eq!(it.clone().count(), 30);
-    it.advance_by(10).unwrap();
+    assert_eq!(it.advance_by(10), Ok(()));
     assert_eq!(it.clone().count(), 20);
-    it.advance_back_by(8).unwrap();
+    assert_eq!(it.advance_back_by(8), Ok(()));
     assert_eq!(it.clone().count(), 12);
-    it.advance_by(4).unwrap();
+    assert_eq!(it.advance_by(4), Ok(()));
     assert_eq!(it.clone().count(), 8);
-    it.advance_back_by(5).unwrap();
+    assert_eq!(it.advance_back_by(5), Ok(()));
     assert_eq!(it.clone().count(), 3);
-    it.advance_by(3).unwrap();
+    assert_eq!(it.advance_by(3), Ok(()));
     assert_eq!(it.clone().count(), 0);
 }
 
@@ -195,18 +197,84 @@ fn test_flatten_last() {
     let mut it = once(0..10).chain(once(10..30)).chain(once(30..40)).flatten();
 
     assert_eq!(it.clone().last(), Some(39));
-    it.advance_by(5).unwrap(); // 5..40
+    assert_eq!(it.advance_by(5), Ok(())); // 5..40
     assert_eq!(it.clone().last(), Some(39));
-    it.advance_back_by(5).unwrap(); // 5..35
+    assert_eq!(it.advance_back_by(5), Ok(())); // 5..35
     assert_eq!(it.clone().last(), Some(34));
-    it.advance_by(10).unwrap(); // 15..35
+    assert_eq!(it.advance_by(10), Ok(())); // 15..35
     assert_eq!(it.clone().last(), Some(34));
-    it.advance_back_by(8).unwrap(); // 15..27
+    assert_eq!(it.advance_back_by(8), Ok(())); // 15..27
     assert_eq!(it.clone().last(), Some(26));
-    it.advance_by(4).unwrap(); // 19..27
+    assert_eq!(it.advance_by(4), Ok(())); // 19..27
     assert_eq!(it.clone().last(), Some(26));
-    it.advance_back_by(5).unwrap(); // 19..22
+    assert_eq!(it.advance_back_by(5), Ok(())); // 19..22
     assert_eq!(it.clone().last(), Some(21));
-    it.advance_by(3).unwrap(); // 22..22
+    assert_eq!(it.advance_by(3), Ok(())); // 22..22
     assert_eq!(it.clone().last(), None);
+}
+
+#[test]
+fn test_flatten_one_shot() {
+    // This could be `filter_map`, but people often do flatten options.
+    let mut it = (0i8..10).flat_map(|i| NonZero::new(i % 7));
+    assert_eq!(it.size_hint(), (0, Some(10)));
+    assert_eq!(it.clone().count(), 8);
+    assert_eq!(it.clone().last(), NonZero::new(2));
+
+    // sum -> fold
+    let sum: i8 = it.clone().map(|n| n.get()).sum();
+    assert_eq!(sum, 24);
+
+    // the product overflows at 6, remaining are 7,8,9 -> 1,2
+    let one = NonZero::new(1i8).unwrap();
+    let product = it.try_fold(one, |acc, x| acc.checked_mul(x));
+    assert_eq!(product, None);
+    assert_eq!(it.size_hint(), (0, Some(3)));
+    assert_eq!(it.clone().count(), 2);
+
+    assert_eq!(it.advance_by(0), Ok(()));
+    assert_eq!(it.clone().next(), NonZero::new(1));
+    assert_eq!(it.advance_by(1), Ok(()));
+    assert_eq!(it.clone().next(), NonZero::new(2));
+    assert_eq!(it.advance_by(100), Err(NonZero::new(99).unwrap()));
+    assert_eq!(it.next(), None);
+}
+
+#[test]
+fn test_flatten_one_shot_rev() {
+    let mut it = (0i8..10).flat_map(|i| NonZero::new(i % 7)).rev();
+    assert_eq!(it.size_hint(), (0, Some(10)));
+    assert_eq!(it.clone().count(), 8);
+    assert_eq!(it.clone().last(), NonZero::new(1));
+
+    // sum -> Rev fold -> rfold
+    let sum: i8 = it.clone().map(|n| n.get()).sum();
+    assert_eq!(sum, 24);
+
+    // Rev try_fold -> try_rfold
+    // the product overflows at 4, remaining are 3,2,1,0 -> 3,2,1
+    let one = NonZero::new(1i8).unwrap();
+    let product = it.try_fold(one, |acc, x| acc.checked_mul(x));
+    assert_eq!(product, None);
+    assert_eq!(it.size_hint(), (0, Some(4)));
+    assert_eq!(it.clone().count(), 3);
+
+    // Rev advance_by -> advance_back_by
+    assert_eq!(it.advance_by(0), Ok(()));
+    assert_eq!(it.clone().next(), NonZero::new(3));
+    assert_eq!(it.advance_by(1), Ok(()));
+    assert_eq!(it.clone().next(), NonZero::new(2));
+    assert_eq!(it.advance_by(100), Err(NonZero::new(98).unwrap()));
+    assert_eq!(it.next(), None);
+}
+
+#[test]
+fn test_flatten_one_shot_arrays() {
+    let it = (0..10).flat_map(|i| [i]);
+    assert_eq!(it.size_hint(), (10, Some(10)));
+    assert_eq!(it.sum::<i32>(), 45);
+
+    let mut it = (0..10).flat_map(|_| -> [i32; 0] { [] });
+    assert_eq!(it.size_hint(), (0, Some(0)));
+    assert_eq!(it.next(), None);
 }

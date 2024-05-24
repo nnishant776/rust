@@ -12,7 +12,6 @@ RUN yum upgrade -y && \
       automake \
       bzip2 \
       file \
-      cmake3 \
       gcc \
       gcc-c++ \
       git \
@@ -26,6 +25,7 @@ RUN yum upgrade -y && \
       openssl-devel \
       patch \
       perl \
+      perl-core \
       pkgconfig \
       python3 \
       unzip \
@@ -35,7 +35,7 @@ RUN yum upgrade -y && \
       zlib-devel.x86_64 \
       && yum clean all
 
-RUN mkdir -p /rustroot/bin && ln -s /usr/bin/cmake3 /rustroot/bin/cmake
+RUN mkdir -p /rustroot/bin
 
 ENV PATH=/rustroot/bin:$PATH
 ENV LD_LIBRARY_PATH=/rustroot/lib64:/rustroot/lib32:/rustroot/lib
@@ -48,18 +48,15 @@ COPY host-x86_64/dist-x86_64-linux/shared.sh /tmp/
 COPY host-x86_64/dist-x86_64-linux/build-gcc.sh /tmp/
 RUN ./build-gcc.sh && yum remove -y gcc gcc-c++
 
+# LLVM 17 needs cmake 3.20 or higher.
+COPY scripts/cmake.sh /tmp/
+RUN ./cmake.sh
+
 # Now build LLVM+Clang, afterwards configuring further compilations to use the
 # clang/clang++ compilers.
 COPY host-x86_64/dist-x86_64-linux/build-clang.sh /tmp/
 RUN ./build-clang.sh
 ENV CC=clang CXX=clang++
-
-# rustc-perf version from 2022-07-22
-ENV PERF_COMMIT 3c253134664fdcba862c539d37f0de18557a9a4c
-RUN curl -LS -o perf.zip https://github.com/rust-lang/rustc-perf/archive/$PERF_COMMIT.zip && \
-    unzip perf.zip && \
-    mv rustc-perf-$PERF_COMMIT rustc-perf && \
-    rm perf.zip
 
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
@@ -80,8 +77,11 @@ ENV RUST_CONFIGURE_ARGS \
       --set llvm.ninja=false \
       --set rust.jemalloc \
       --set rust.use-lld=true \
-      --set rust.lto=thin
-ENV SCRIPT python3 ../src/ci/stage-build.py python3 ../x.py dist \
+      --set rust.lto=thin \
+      --set rust.codegen-units=1
+
+ENV SCRIPT python3 ../x.py build --set rust.debug=true opt-dist && \
+    ./build/$HOSTS/stage0-tools-bin/opt-dist linux-ci -- python3 ../x.py dist \
     --host $HOSTS --target $HOSTS \
     --include-default-paths \
     build-manifest bootstrap

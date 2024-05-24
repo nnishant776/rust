@@ -22,59 +22,46 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::potential_query_instability)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
 #![feature(allocator_api)]
 #![feature(array_windows)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
+#![feature(closure_track_caller)]
+#![feature(const_option)]
+#![feature(const_type_name)]
 #![feature(core_intrinsics)]
+#![feature(coroutines)]
+#![feature(decl_macro)]
 #![feature(discriminant_kind)]
-#![feature(exhaustive_patterns)]
-#![feature(generators)]
-#![feature(get_mut_unchecked)]
+#![feature(extern_types)]
+#![feature(extract_if)]
 #![feature(if_let_guard)]
-#![feature(iter_from_generator)]
-#![feature(local_key_cell_methods)]
+#![feature(intra_doc_pointers)]
+#![feature(iter_from_coroutine)]
+#![feature(let_chains)]
+#![feature(macro_metavar_expr)]
+#![feature(min_exhaustive_patterns)]
+#![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(never_type)]
-#![feature(extern_types)]
 #![feature(new_uninit)]
-#![feature(once_cell)]
-#![feature(let_chains)]
-#![feature(min_specialization)]
-#![feature(trusted_len)]
-#![feature(type_alias_impl_trait)]
-#![feature(strict_provenance)]
-#![feature(associated_type_bounds)]
+#![feature(ptr_alignment_type)]
 #![feature(rustc_attrs)]
-#![feature(control_flow_enum)]
-#![feature(trusted_step)]
+#![feature(rustdoc_internals)]
+#![feature(strict_provenance)]
+#![feature(trait_upcasting)]
+#![feature(trusted_len)]
 #![feature(try_blocks)]
-#![feature(try_reserve_kind)]
-#![feature(nonzero_ops)]
-#![feature(decl_macro)]
-#![feature(drain_filter)]
-#![feature(intra_doc_pointers)]
+#![feature(type_alias_impl_trait)]
 #![feature(yeet_expr)]
-#![feature(result_option_inspect)]
-#![feature(const_option)]
-#![feature(trait_alias)]
-#![recursion_limit = "512"]
-#![allow(rustc::potential_query_instability)]
-
-#[macro_use]
-extern crate bitflags;
-#[macro_use]
-extern crate rustc_macros;
-#[macro_use]
-extern crate rustc_data_structures;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate smallvec;
-
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_macros::fluent_messages;
+// tidy-alphabetical-end
 
 #[cfg(test)]
 mod tests;
@@ -83,14 +70,10 @@ mod tests;
 mod macros;
 
 #[macro_use]
-pub mod query;
-
-#[macro_use]
 pub mod arena;
-#[macro_use]
-pub mod dep_graph;
-pub(crate) mod error;
+pub mod error;
 pub mod hir;
+pub mod hooks;
 pub mod infer;
 pub mod lint;
 pub mod metadata;
@@ -99,14 +82,15 @@ pub mod mir;
 pub mod thir;
 pub mod traits;
 pub mod ty;
+pub mod util;
 mod values;
 
-pub mod util {
-    pub mod bug;
-    pub mod common;
-}
+#[macro_use]
+pub mod query;
+#[macro_use]
+pub mod dep_graph;
 
 // Allows macros to refer to this crate as `::rustc_middle`
 extern crate self as rustc_middle;
 
-fluent_messages! { "../locales/en-US.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

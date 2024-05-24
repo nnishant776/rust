@@ -1,7 +1,9 @@
+// skip-filecheck
+//@ test-mir-pass: GVN
+//@ compile-flags: -Zmir-enable-passes=+RemoveZsts
 // Verify that we can pretty print invalid constants.
 
 #![feature(adt_const_params)]
-#![feature(inline_const)]
 #![allow(incomplete_features)]
 
 #[derive(Copy, Clone)]
@@ -11,7 +13,8 @@ enum E { A, B, C }
 #[derive(Copy, Clone)]
 enum Empty {}
 
-// EMIT_MIR invalid_constant.main.ConstProp.diff
+// EMIT_MIR invalid_constant.main.RemoveZsts.diff
+// EMIT_MIR invalid_constant.main.GVN.diff
 fn main() {
     // An invalid char.
     union InvalidChar {

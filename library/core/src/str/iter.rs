@@ -5,6 +5,7 @@ use crate::fmt::{self, Write};
 use crate::iter::{Chain, FlatMap, Flatten};
 use crate::iter::{Copied, Filter, FusedIterator, Map, TrustedLen};
 use crate::iter::{TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::num::NonZero;
 use crate::ops::Try;
 use crate::option;
 use crate::slice::{self, Split as SliceSplit};
@@ -13,7 +14,7 @@ use super::from_utf8_unchecked;
 use super::pattern::Pattern;
 use super::pattern::{DoubleEndedSearcher, ReverseSearcher, Searcher};
 use super::validations::{next_code_point, next_code_point_reverse};
-use super::LinesAnyMap;
+use super::LinesMap;
 use super::{BytesIsNotEmpty, UnsafeBytesToStr};
 use super::{CharEscapeDebugContinue, CharEscapeDefault, CharEscapeUnicode};
 use super::{IsAsciiWhitespace, IsNotEmpty, IsWhitespace};
@@ -47,6 +48,55 @@ impl<'a> Iterator for Chars<'a> {
     #[inline]
     fn count(self) -> usize {
         super::count::count_chars(self.as_str())
+    }
+
+    #[inline]
+    fn advance_by(&mut self, mut remainder: usize) -> Result<(), NonZero<usize>> {
+        const CHUNK_SIZE: usize = 32;
+
+        if remainder >= CHUNK_SIZE {
+            let mut chunks = self.iter.as_slice().array_chunks::<CHUNK_SIZE>();
+            let mut bytes_skipped: usize = 0;
+
+            while remainder > CHUNK_SIZE
+                && let Some(chunk) = chunks.next()
+            {
+                bytes_skipped += CHUNK_SIZE;
+
+                let mut start_bytes = [false; CHUNK_SIZE];
+
+                for i in 0..CHUNK_SIZE {
+                    start_bytes[i] = !super::validations::utf8_is_cont_byte(chunk[i]);
+                }
+
+                remainder -= start_bytes.into_iter().map(|i| i as u8).sum::<u8>() as usize;
+            }
+
+            // SAFETY: The amount of bytes exists since we just iterated over them,
+            // so advance_by will succeed.
+            unsafe { self.iter.advance_by(bytes_skipped).unwrap_unchecked() };
+
+            // skip trailing continuation bytes
+            while self.iter.len() > 0 {
+                let b = self.iter.as_slice()[0];
+                if !super::validations::utf8_is_cont_byte(b) {
+                    break;
+                }
+                // SAFETY: We just peeked at the byte, therefore it exists
+                unsafe { self.iter.advance_by(1).unwrap_unchecked() };
+            }
+        }
+
+        while (remainder > 0) && (self.iter.len() > 0) {
+            remainder -= 1;
+            let b = self.iter.as_slice()[0];
+            let slurp = super::validations::utf8_char_width(b);
+            // SAFETY: utf8 validity requires that the string must contain
+            // the continuation bytes (if any)
+            unsafe { self.iter.advance_by(slurp).unwrap_unchecked() };
+        }
+
+        NonZero::new(remainder).map_or(Ok(()), Err)
     }
 
     #[inline]
@@ -1104,7 +1154,7 @@ generate_pattern_iterators! {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[derive(Clone, Debug)]
-pub struct Lines<'a>(pub(super) Map<SplitTerminator<'a, char>, LinesAnyMap>);
+pub struct Lines<'a>(pub(super) Map<SplitInclusive<'a, char>, LinesMap>);
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> Iterator for Lines<'a> {
@@ -1136,6 +1186,31 @@ impl<'a> DoubleEndedIterator for Lines<'a> {
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl FusedIterator for Lines<'_> {}
+
+impl<'a> Lines<'a> {
+    /// Returns the remaining lines of the split string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(str_lines_remainder)]
+    ///
+    /// let mut lines = "a\nb\nc\nd".lines();
+    /// assert_eq!(lines.remainder(), Some("a\nb\nc\nd"));
+    ///
+    /// lines.next();
+    /// assert_eq!(lines.remainder(), Some("b\nc\nd"));
+    ///
+    /// lines.by_ref().for_each(drop);
+    /// assert_eq!(lines.remainder(), None);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "str_lines_remainder", issue = "77998")]
+    pub fn remainder(&self) -> Option<&'a str> {
+        self.0.iter.remainder()
+    }
+}
 
 /// Created with the method [`lines_any`].
 ///
@@ -1199,8 +1274,10 @@ pub struct SplitWhitespace<'a> {
 #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
 #[derive(Clone, Debug)]
 pub struct SplitAsciiWhitespace<'a> {
-    pub(super) inner:
-        Map<Filter<SliceSplit<'a, u8, IsAsciiWhitespace>, BytesIsNotEmpty>, UnsafeBytesToStr>,
+    pub(super) inner: Map<
+        Filter<SliceSplit<'a, u8, IsAsciiWhitespace>, BytesIsNotEmpty<'a>>,
+        UnsafeBytesToStr<'a>,
+    >,
 }
 
 /// An iterator over the substrings of a string,
@@ -1360,7 +1437,7 @@ impl<'a, P: Pattern<'a, Searcher: Clone>> Clone for SplitInclusive<'a, P> {
 }
 
 #[stable(feature = "split_inclusive", since = "1.51.0")]
-impl<'a, P: Pattern<'a, Searcher: ReverseSearcher<'a>>> DoubleEndedIterator
+impl<'a, P: Pattern<'a, Searcher: DoubleEndedSearcher<'a>>> DoubleEndedIterator
     for SplitInclusive<'a, P>
 {
     #[inline]
@@ -1439,11 +1516,22 @@ impl<'a> Iterator for EncodeUtf16<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (low, high) = self.chars.size_hint();
-        // every char gets either one u16 or two u16,
-        // so this iterator is between 1 or 2 times as
-        // long as the underlying iterator.
-        (low, high.and_then(|n| n.checked_mul(2)))
+        let len = self.chars.iter.len();
+        // The highest bytes:code units ratio occurs for 3-byte sequences,
+        // since a 4-byte sequence results in 2 code units. The lower bound
+        // is therefore determined by assuming the remaining bytes contain as
+        // many 3-byte sequences as possible. The highest bytes:code units
+        // ratio is for 1-byte sequences, so use this for the upper bound.
+        // `(len + 2)` can't overflow, because we know that the `slice::Iter`
+        // belongs to a slice in memory which has a maximum length of
+        // `isize::MAX` (that's well below `usize::MAX`)
+        if self.extra == 0 {
+            ((len + 2) / 3, Some(len))
+        } else {
+            // We're in the middle of a surrogate pair, so add the remaining
+            // surrogate to the bounds.
+            ((len + 2) / 3 + 1, Some(len + 1))
+        }
     }
 }
 

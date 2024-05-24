@@ -52,7 +52,9 @@ pub fn preorder_expr(start: &ast::Expr, cb: &mut dyn FnMut(WalkEvent<ast::Expr>)
             }
         };
         if let Some(let_stmt) = node.parent().and_then(ast::LetStmt::cast) {
-            if Some(node.clone()) != let_stmt.initializer().map(|it| it.syntax().clone()) {
+            if let_stmt.initializer().map(|it| it.syntax() != &node).unwrap_or(true)
+                && let_stmt.let_else().map(|it| it.syntax() != &node).unwrap_or(true)
+            {
                 // skipping potential const pat expressions in  let statements
                 preorder.skip_subtree();
                 continue;
@@ -310,7 +312,6 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
         ast::Expr::ArrayExpr(_)
         | ast::Expr::AwaitExpr(_)
         | ast::Expr::BinExpr(_)
-        | ast::Expr::BoxExpr(_)
         | ast::Expr::BreakExpr(_)
         | ast::Expr::CallExpr(_)
         | ast::Expr::CastExpr(_)
@@ -328,12 +329,16 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
         | ast::Expr::RecordExpr(_)
         | ast::Expr::RefExpr(_)
         | ast::Expr::ReturnExpr(_)
+        | ast::Expr::BecomeExpr(_)
         | ast::Expr::TryExpr(_)
         | ast::Expr::TupleExpr(_)
         | ast::Expr::LetExpr(_)
         | ast::Expr::UnderscoreExpr(_)
         | ast::Expr::YieldExpr(_)
-        | ast::Expr::YeetExpr(_) => cb(expr),
+        | ast::Expr::YeetExpr(_)
+        | ast::Expr::OffsetOfExpr(_)
+        | ast::Expr::FormatArgsExpr(_)
+        | ast::Expr::AsmExpr(_) => cb(expr),
     }
 }
 

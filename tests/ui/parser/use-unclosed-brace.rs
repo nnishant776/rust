@@ -1,6 +1,4 @@
-// error-pattern: expected one of `,`, `::`, `as`, or `}`, found `;`
-// error-pattern: this file contains an unclosed delimiter
-// error-pattern: expected item, found `}`
+//@ error-pattern: this file contains an unclosed delimiter
 use foo::{bar, baz;
 
 use std::fmt::Display;

@@ -1,6 +1,8 @@
 #![allow(unreachable_pub)]
 
-use crate::install::{ClientOpt, Malloc, ServerOpt};
+use std::str::FromStr;
+
+use crate::install::{ClientOpt, ServerOpt};
 
 xflags::xflags! {
     src "./src/flags.rs"
@@ -12,15 +14,17 @@ xflags::xflags! {
         cmd install {
             /// Install only VS Code plugin.
             optional --client
-            /// One of 'code', 'code-exploration', 'code-insiders', 'codium', or 'code-oss'.
+            /// One of `code`, `code-exploration`, `code-insiders`, `codium`, or `code-oss`.
             optional --code-bin name: String
 
             /// Install only the language server.
             optional --server
-            /// Use mimalloc allocator for server
+            /// Use mimalloc allocator for server.
             optional --mimalloc
-            /// Use jemalloc allocator for server
+            /// Use jemalloc allocator for server.
             optional --jemalloc
+            /// build in release with debug info set to 2.
+            optional --dev-rel
         }
 
         cmd fuzz-tests {}
@@ -28,10 +32,26 @@ xflags::xflags! {
         cmd release {
             optional --dry-run
         }
-        cmd promote {
-            optional --dry-run
+
+        cmd rustc-pull {
+            /// rustc commit to pull.
+            optional --commit refspec: String
         }
+
+        cmd rustc-push {
+            /// rust local path, e.g. `../rust-rust-analyzer`.
+            required --rust-path rust_path: String
+            /// rust fork name, e.g.  `matklad/rust`.
+            required --rust-fork rust_fork: String
+            /// branch name.
+            optional --branch branch: String
+        }
+
         cmd dist {
+            /// Use mimalloc allocator for server
+            optional --mimalloc
+            /// Use jemalloc allocator for server
+            optional --jemalloc
             optional --client-patch-version version: String
         }
         /// Read a changelog AsciiDoc file and update the GitHub Releases entry in Markdown.
@@ -42,11 +62,16 @@ xflags::xflags! {
             required changelog: String
         }
         cmd metrics {
-            optional --dry-run
+            optional measurement_type: MeasurementType
         }
         /// Builds a benchmark version of rust-analyzer and puts it into `./target`.
         cmd bb {
             required suffix: String
+        }
+
+        cmd codegen {
+            optional codegen_type: CodegenType
+            optional --check
         }
     }
 }
@@ -64,11 +89,13 @@ pub enum XtaskCmd {
     Install(Install),
     FuzzTests(FuzzTests),
     Release(Release),
-    Promote(Promote),
+    RustcPull(RustcPull),
+    RustcPush(RustcPush),
     Dist(Dist),
     PublishReleaseNotes(PublishReleaseNotes),
     Metrics(Metrics),
     Bb(Bb),
+    Codegen(Codegen),
 }
 
 #[derive(Debug)]
@@ -78,6 +105,7 @@ pub struct Install {
     pub server: bool,
     pub mimalloc: bool,
     pub jemalloc: bool,
+    pub dev_rel: bool,
 }
 
 #[derive(Debug)]
@@ -89,12 +117,21 @@ pub struct Release {
 }
 
 #[derive(Debug)]
-pub struct Promote {
-    pub dry_run: bool,
+pub struct RustcPull {
+    pub commit: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RustcPush {
+    pub rust_path: String,
+    pub rust_fork: String,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Dist {
+    pub mimalloc: bool,
+    pub jemalloc: bool,
     pub client_patch_version: Option<String>,
 }
 
@@ -107,12 +144,19 @@ pub struct PublishReleaseNotes {
 
 #[derive(Debug)]
 pub struct Metrics {
-    pub dry_run: bool,
+    pub measurement_type: Option<MeasurementType>,
 }
 
 #[derive(Debug)]
 pub struct Bb {
     pub suffix: String,
+}
+
+#[derive(Debug)]
+pub struct Codegen {
+    pub codegen_type: Option<CodegenType>,
+
+    pub check: bool,
 }
 
 impl Xtask {
@@ -133,6 +177,87 @@ impl Xtask {
 }
 // generated end
 
+#[derive(Debug, Default)]
+pub enum CodegenType {
+    #[default]
+    All,
+    Grammar,
+    AssistsDocTests,
+    DiagnosticsDocs,
+    LintDefinitions,
+}
+
+impl FromStr for CodegenType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "grammar" => Ok(Self::Grammar),
+            "assists-doc-tests" => Ok(Self::AssistsDocTests),
+            "diagnostics-docs" => Ok(Self::DiagnosticsDocs),
+            "lints-definitions" => Ok(Self::LintDefinitions),
+            _ => Err("Invalid option".to_owned()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MeasurementType {
+    Build,
+    RustcTests,
+    AnalyzeSelf,
+    AnalyzeRipgrep,
+    AnalyzeWebRender,
+    AnalyzeDiesel,
+    AnalyzeHyper,
+}
+
+impl FromStr for MeasurementType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "build" => Ok(Self::Build),
+            "rustc_tests" => Ok(Self::RustcTests),
+            "self" => Ok(Self::AnalyzeSelf),
+            "ripgrep-13.0.0" => Ok(Self::AnalyzeRipgrep),
+            "webrender-2022" => Ok(Self::AnalyzeWebRender),
+            "diesel-1.4.8" => Ok(Self::AnalyzeDiesel),
+            "hyper-0.14.18" => Ok(Self::AnalyzeHyper),
+            _ => Err("Invalid option".to_owned()),
+        }
+    }
+}
+impl AsRef<str> for MeasurementType {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Build => "build",
+            Self::RustcTests => "rustc_tests",
+            Self::AnalyzeSelf => "self",
+            Self::AnalyzeRipgrep => "ripgrep-13.0.0",
+            Self::AnalyzeWebRender => "webrender-2022",
+            Self::AnalyzeDiesel => "diesel-1.4.8",
+            Self::AnalyzeHyper => "hyper-0.14.18",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Malloc {
+    System,
+    Mimalloc,
+    Jemalloc,
+}
+
+impl Malloc {
+    pub(crate) fn to_features(self) -> &'static [&'static str] {
+        match self {
+            Malloc::System => &[][..],
+            Malloc::Mimalloc => &["--features", "mimalloc"],
+            Malloc::Jemalloc => &["--features", "jemalloc"],
+        }
+    }
+}
+
 impl Install {
     pub(crate) fn server(&self) -> Option<ServerOpt> {
         if self.client && !self.server {
@@ -145,12 +270,24 @@ impl Install {
         } else {
             Malloc::System
         };
-        Some(ServerOpt { malloc })
+        Some(ServerOpt { malloc, dev_rel: self.dev_rel })
     }
     pub(crate) fn client(&self) -> Option<ClientOpt> {
         if !self.client && self.server {
             return None;
         }
         Some(ClientOpt { code_bin: self.code_bin.clone() })
+    }
+}
+
+impl Dist {
+    pub(crate) fn allocator(&self) -> Malloc {
+        if self.mimalloc {
+            Malloc::Mimalloc
+        } else if self.jemalloc {
+            Malloc::Jemalloc
+        } else {
+            Malloc::System
+        }
     }
 }

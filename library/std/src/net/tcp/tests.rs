@@ -1,6 +1,7 @@
 use crate::fmt;
 use crate::io::prelude::*;
-use crate::io::{ErrorKind, IoSlice, IoSliceMut};
+use crate::io::{BorrowedBuf, IoSlice, IoSliceMut};
+use crate::mem::MaybeUninit;
 use crate::net::test::{next_test_ip4, next_test_ip6};
 use crate::net::*;
 use crate::sync::mpsc::channel;
@@ -43,6 +44,17 @@ fn connect_error() {
             e.kind()
         ),
     }
+}
+
+#[test]
+#[cfg_attr(target_env = "sgx", ignore)] // FIXME: https://github.com/fortanix/rust-sgx/issues/31
+fn connect_timeout_error() {
+    let socket_addr = next_test_ip4();
+    let result = TcpStream::connect_timeout(&socket_addr, Duration::MAX);
+    assert!(!matches!(result, Err(e) if e.kind() == ErrorKind::TimedOut));
+
+    let _listener = TcpListener::bind(&socket_addr).unwrap();
+    assert!(TcpStream::connect_timeout(&socket_addr, Duration::MAX).is_ok());
 }
 
 #[test]
@@ -280,6 +292,31 @@ fn partial_read() {
 }
 
 #[test]
+fn read_buf() {
+    each_ip(&mut |addr| {
+        let srv = t!(TcpListener::bind(&addr));
+        let t = thread::spawn(move || {
+            let mut s = t!(TcpStream::connect(&addr));
+            s.write_all(&[1, 2, 3, 4]).unwrap();
+        });
+
+        let mut s = t!(srv.accept()).0;
+        let mut buf: [MaybeUninit<u8>; 128] = MaybeUninit::uninit_array();
+        let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+        t!(s.read_buf(buf.unfilled()));
+        assert_eq!(buf.filled(), &[1, 2, 3, 4]);
+
+        // FIXME: sgx uses default_read_buf that initializes the buffer.
+        if cfg!(not(target_env = "sgx")) {
+            // TcpStream::read_buf should omit buffer initialization.
+            assert_eq!(buf.init_len(), 4);
+        }
+
+        t.join().ok().expect("thread panicked");
+    })
+}
+
+#[test]
 fn read_vectored() {
     each_ip(&mut |addr| {
         let srv = t!(TcpListener::bind(&addr));
@@ -507,30 +544,33 @@ fn close_readwrite_smoke() {
 }
 
 #[test]
+// FIXME: https://github.com/fortanix/rust-sgx/issues/110
 #[cfg_attr(target_env = "sgx", ignore)]
+// On windows, shutdown will not wake up blocking I/O operations.
+#[cfg_attr(windows, ignore)]
 fn close_read_wakes_up() {
     each_ip(&mut |addr| {
-        let a = t!(TcpListener::bind(&addr));
-        let (tx1, rx) = channel::<()>();
+        let listener = t!(TcpListener::bind(&addr));
         let _t = thread::spawn(move || {
-            let _s = t!(a.accept());
-            let _ = rx.recv();
+            let (stream, _) = t!(listener.accept());
+            stream
         });
 
-        let s = t!(TcpStream::connect(&addr));
-        let s2 = t!(s.try_clone());
-        let (tx, rx) = channel();
-        let _t = thread::spawn(move || {
-            let mut s2 = s2;
-            assert_eq!(t!(s2.read(&mut [0])), 0);
-            tx.send(()).unwrap();
-        });
-        // this should wake up the child thread
-        t!(s.shutdown(Shutdown::Read));
+        let mut stream = t!(TcpStream::connect(&addr));
+        let stream2 = t!(stream.try_clone());
 
-        // this test will never finish if the child doesn't wake up
-        rx.recv().unwrap();
-        drop(tx1);
+        let _t = thread::spawn(move || {
+            let stream2 = stream2;
+
+            // to make it more likely that `read` happens before `shutdown`
+            thread::sleep(Duration::from_millis(1000));
+
+            // this should wake up the reader up
+            t!(stream2.shutdown(Shutdown::Read));
+        });
+
+        // this `read` should get interrupted by `shutdown`
+        assert_eq!(t!(stream.read(&mut [0])), 0);
     })
 }
 
@@ -670,7 +710,10 @@ fn debug() {
 // FIXME: re-enabled openbsd tests once their socket timeout code
 //        no longer has rounding errors.
 // VxWorks ignores SO_SNDTIMEO.
-#[cfg_attr(any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks"), ignore)]
+#[cfg_attr(
+    any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks", target_os = "nto"),
+    ignore
+)]
 #[cfg_attr(target_env = "sgx", ignore)] // FIXME: https://github.com/fortanix/rust-sgx/issues/31
 #[test]
 fn timeouts() {

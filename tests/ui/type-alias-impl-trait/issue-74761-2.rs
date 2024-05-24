@@ -1,4 +1,4 @@
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 pub trait A {
     type B;
@@ -10,6 +10,7 @@ impl<'a, 'b> A for () {
     type B = impl core::fmt::Debug;
 
     fn f(&self) -> Self::B {}
+    //~^ ERROR expected generic lifetime parameter
 }
 
 fn main() {}

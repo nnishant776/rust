@@ -1,5 +1,9 @@
 #![allow(unused_braces, unused_variables, dead_code)]
-#![allow(clippy::collapsible_else_if, clippy::let_unit_value)]
+#![allow(
+    clippy::collapsible_else_if,
+    clippy::let_unit_value,
+    clippy::redundant_at_rest_pattern
+)]
 #![warn(clippy::manual_let_else)]
 // Ensure that we don't conflict with match -> if let lints
 #![warn(clippy::single_match_else, clippy::single_match)]
@@ -30,11 +34,14 @@ fn main() {}
 
 fn fire() {
     let v = match g() {
+        //~^ ERROR: this could be rewritten as `let...else`
+        //~| NOTE: `-D clippy::manual-let-else` implied by `-D warnings`
         Some(v_some) => v_some,
         None => return,
     };
 
     let v = match g() {
+        //~^ ERROR: this could be rewritten as `let...else`
         Some(v_some) => v_some,
         _ => return,
     };
@@ -42,25 +49,29 @@ fn fire() {
     loop {
         // More complex pattern for the identity arm and diverging arm
         let v = match h() {
-            (Some(_), Some(_)) | (None, None) => continue,
+            //~^ ERROR: this could be rewritten as `let...else`
             (Some(v), None) | (None, Some(v)) => v,
+            (Some(_), Some(_)) | (None, None) => continue,
         };
         // Custom enums are supported as long as the "else" arm is a simple _
         let v = match build_enum() {
-            _ => continue,
+            //~^ ERROR: this could be rewritten as `let...else`
             Variant::Bar(v) | Variant::Baz(v) => v,
+            _ => continue,
         };
     }
 
     // There is a _ in the diverging arm
     // TODO also support unused bindings aka _v
     let v = match f() {
+        //~^ ERROR: this could be rewritten as `let...else`
         Ok(v) => v,
         Err(_) => return,
     };
 
     // Err(()) is an allowed pattern
     let v = match f().map_err(|_| ()) {
+        //~^ ERROR: this could be rewritten as `let...else`
         Ok(v) => v,
         Err(()) => return,
     };
@@ -68,7 +79,21 @@ fn fire() {
     let f = Variant::Bar(1);
 
     let _value = match f {
-        Variant::Bar(_) | Variant::Baz(_) => (),
+        //~^ ERROR: this could be rewritten as `let...else`
+        Variant::Bar(v) | Variant::Baz(v) => v,
+        _ => return,
+    };
+
+    let _value = match Some(build_enum()) {
+        //~^ ERROR: this could be rewritten as `let...else`
+        Some(Variant::Bar(v) | Variant::Baz(v)) => v,
+        _ => return,
+    };
+
+    let data = [1_u8, 2, 3, 4, 0, 0, 0, 0];
+    let data = match data.as_slice() {
+        //~^ ERROR: this could be rewritten as `let...else`
+        [data @ .., 0, 0, 0, 0] | [data @ .., 0, 0] | [data @ .., 0] => data,
         _ => return,
     };
 }
@@ -124,5 +149,32 @@ fn not_fire() {
     let v = match Err(build_enum()) {
         Ok(v) | Err(Variant::Bar(v) | Variant::Baz(v)) => v,
         Err(Variant::Foo) => return,
+    };
+
+    // Issue 10241
+    // The non-divergent arm arrives in second position and
+    // may cover values already matched in the first arm.
+    let v = match h() {
+        (Some(_), Some(_)) | (None, None) => return,
+        (Some(v), _) | (None, Some(v)) => v,
+    };
+
+    let v = match build_enum() {
+        _ => return,
+        Variant::Bar(v) | Variant::Baz(v) => v,
+    };
+
+    let data = [1_u8, 2, 3, 4, 0, 0, 0, 0];
+    let data = match data.as_slice() {
+        [] | [0, 0] => return,
+        [data @ .., 0, 0, 0, 0] | [data @ .., 0, 0] | [data @ ..] => data,
+    };
+}
+
+fn issue11579() {
+    let msg = match Some("hi") {
+        //~^ ERROR: this could be rewritten as `let...else`
+        Some(m) => m,
+        _ => unreachable!("can't happen"),
     };
 }

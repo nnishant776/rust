@@ -2,26 +2,24 @@ use super::method::probe::ProbeScope;
 use super::method::MethodCallee;
 use super::{Expectation, FnCtxt, TupleArgumentsFlag};
 
-use crate::type_error_struct;
+use crate::errors;
 use rustc_ast::util::parser::PREC_POSTFIX;
-use rustc_errors::{struct_span_err, Applicability, Diagnostic, ErrorGuaranteed, StashKey};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, StashKey};
 use rustc_hir as hir;
 use rustc_hir::def::{self, CtorKind, Namespace, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir_analysis::autoderef::Autoderef;
+use rustc_infer::traits::ObligationCauseCode;
 use rustc_infer::{
     infer,
-    traits::{self, Obligation},
-};
-use rustc_infer::{
-    infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind},
-    traits::ObligationCause,
+    traits::{self, Obligation, ObligationCause},
 };
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
-use rustc_middle::ty::SubstsRef;
+use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
@@ -41,26 +39,22 @@ pub fn check_legal_trait_for_method_call(
     receiver: Option<Span>,
     expr_span: Span,
     trait_id: DefId,
-) {
-    if tcx.lang_items().drop_trait() == Some(trait_id) {
-        let mut err = struct_span_err!(tcx.sess, span, E0040, "explicit use of destructor method");
-        err.span_label(span, "explicit destructor calls not allowed");
-
-        let (sp, suggestion) = receiver
-            .and_then(|s| tcx.sess.source_map().span_to_snippet(s).ok())
-            .filter(|snippet| !snippet.is_empty())
-            .map(|snippet| (expr_span, format!("drop({snippet})")))
-            .unwrap_or_else(|| (span, "drop".to_string()));
-
-        err.span_suggestion(
-            sp,
-            "consider using `drop` function",
-            suggestion,
-            Applicability::MaybeIncorrect,
-        );
-
-        err.emit();
+    body_id: DefId,
+) -> Result<(), ErrorGuaranteed> {
+    if tcx.lang_items().drop_trait() == Some(trait_id)
+        && tcx.lang_items().fallback_surface_drop_fn() != Some(body_id)
+    {
+        let sugg = if let Some(receiver) = receiver.filter(|s| !s.is_empty()) {
+            errors::ExplicitDestructorCallSugg::Snippet {
+                lo: expr_span.shrink_to_lo(),
+                hi: receiver.shrink_to_hi().to(expr_span.shrink_to_hi()),
+            }
+        } else {
+            errors::ExplicitDestructorCallSugg::Empty(span)
+        };
+        return Err(tcx.dcx().emit_err(errors::ExplicitDestructorCall { span, sugg }));
     }
+    tcx.ensure().coherent_trait(trait_id)
 }
 
 #[derive(Debug)]
@@ -85,11 +79,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     callee_expr,
                     Expectation::NoExpectation,
                     arg_exprs,
+                    Some(call_expr),
                 ),
             _ => self.check_expr(callee_expr),
         };
 
-        let expr_ty = self.structurally_resolved_type(call_expr.span, original_callee_ty);
+        let expr_ty = self.structurally_resolve_type(call_expr.span, original_callee_ty);
 
         let mut autoderef = self.autoderef(callee_expr.span, expr_ty);
         let mut result = None;
@@ -124,7 +119,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         // we must check that return type of called functions is WF:
-        self.register_wf_obligation(output.into(), call_expr.span, traits::WellFormed(None));
+        self.register_wf_obligation(
+            output.into(),
+            call_expr.span,
+            ObligationCauseCode::WellFormed(None),
+        );
 
         output
     }
@@ -138,7 +137,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         autoderef: &Autoderef<'a, 'tcx>,
     ) -> Option<CallStep<'tcx>> {
         let adjusted_ty =
-            self.structurally_resolved_type(autoderef.span(), autoderef.final_ty(false));
+            self.structurally_resolve_type(autoderef.span(), autoderef.final_ty(false));
 
         // If the callee is a bare function or a closure, then we're all set.
         match *adjusted_ty.kind() {
@@ -148,33 +147,75 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 return Some(CallStep::Builtin(adjusted_ty));
             }
 
-            ty::Closure(def_id, substs) => {
+            // Check whether this is a call to a closure where we
+            // haven't yet decided on whether the closure is fn vs
+            // fnmut vs fnonce. If so, we have to defer further processing.
+            ty::Closure(def_id, args) if self.closure_kind(adjusted_ty).is_none() => {
                 let def_id = def_id.expect_local();
+                let closure_sig = args.as_closure().sig();
+                let closure_sig = self.instantiate_binder_with_fresh_vars(
+                    call_expr.span,
+                    infer::FnCall,
+                    closure_sig,
+                );
+                let adjustments = self.adjust_steps(autoderef);
+                self.record_deferred_call_resolution(
+                    def_id,
+                    DeferredCallResolution {
+                        call_expr,
+                        callee_expr,
+                        closure_ty: adjusted_ty,
+                        adjustments,
+                        fn_sig: closure_sig,
+                    },
+                );
+                return Some(CallStep::DeferredClosure(def_id, closure_sig));
+            }
 
-                // Check whether this is a call to a closure where we
-                // haven't yet decided on whether the closure is fn vs
-                // fnmut vs fnonce. If so, we have to defer further processing.
-                if self.closure_kind(substs).is_none() {
-                    let closure_sig = substs.as_closure().sig();
-                    let closure_sig = self.instantiate_binder_with_fresh_vars(
-                        call_expr.span,
-                        infer::FnCall,
-                        closure_sig,
-                    );
-                    let adjustments = self.adjust_steps(autoderef);
-                    self.record_deferred_call_resolution(
-                        def_id,
-                        DeferredCallResolution {
-                            call_expr,
-                            callee_expr,
-                            adjusted_ty,
-                            adjustments,
-                            fn_sig: closure_sig,
-                            closure_substs: substs,
-                        },
-                    );
-                    return Some(CallStep::DeferredClosure(def_id, closure_sig));
-                }
+            // When calling a `CoroutineClosure` that is local to the body, we will
+            // not know what its `closure_kind` is yet. Instead, just fill in the
+            // signature with an infer var for the `tupled_upvars_ty` of the coroutine,
+            // and record a deferred call resolution which will constrain that var
+            // as part of `AsyncFn*` trait confirmation.
+            ty::CoroutineClosure(def_id, args) if self.closure_kind(adjusted_ty).is_none() => {
+                let def_id = def_id.expect_local();
+                let closure_args = args.as_coroutine_closure();
+                let coroutine_closure_sig = self.instantiate_binder_with_fresh_vars(
+                    call_expr.span,
+                    infer::FnCall,
+                    closure_args.coroutine_closure_sig(),
+                );
+                let tupled_upvars_ty = self.next_ty_var(callee_expr.span);
+                // We may actually receive a coroutine back whose kind is different
+                // from the closure that this dispatched from. This is because when
+                // we have no captures, we automatically implement `FnOnce`. This
+                // impl forces the closure kind to `FnOnce` i.e. `u8`.
+                let kind_ty = self.next_ty_var(callee_expr.span);
+                let call_sig = self.tcx.mk_fn_sig(
+                    [coroutine_closure_sig.tupled_inputs_ty],
+                    coroutine_closure_sig.to_coroutine(
+                        self.tcx,
+                        closure_args.parent_args(),
+                        kind_ty,
+                        self.tcx.coroutine_for_closure(def_id),
+                        tupled_upvars_ty,
+                    ),
+                    coroutine_closure_sig.c_variadic,
+                    coroutine_closure_sig.safety,
+                    coroutine_closure_sig.abi,
+                );
+                let adjustments = self.adjust_steps(autoderef);
+                self.record_deferred_call_resolution(
+                    def_id,
+                    DeferredCallResolution {
+                        call_expr,
+                        callee_expr,
+                        closure_ty: adjusted_ty,
+                        adjustments,
+                        fn_sig: call_sig,
+                    },
+                );
+                return Some(CallStep::DeferredClosure(def_id, call_sig));
             }
 
             // Hack: we know that there are traits implementing Fn for &F
@@ -223,51 +264,60 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         adjusted_ty: Ty<'tcx>,
         opt_arg_exprs: Option<&'tcx [hir::Expr<'tcx>]>,
     ) -> Option<(Option<Adjustment<'tcx>>, MethodCallee<'tcx>)> {
+        // HACK(async_closures): For async closures, prefer `AsyncFn*`
+        // over `Fn*`, since all async closures implement `FnOnce`, but
+        // choosing that over `AsyncFn`/`AsyncFnMut` would be more restrictive.
+        // For other callables, just prefer `Fn*` for perf reasons.
+        //
+        // The order of trait choices here is not that big of a deal,
+        // since it just guides inference (and our choice of autoref).
+        // Though in the future, I'd like typeck to choose:
+        // `Fn > AsyncFn > FnMut > AsyncFnMut > FnOnce > AsyncFnOnce`
+        // ...or *ideally*, we just have `LendingFn`/`LendingFnMut`, which
+        // would naturally unify these two trait hierarchies in the most
+        // general way.
+        let call_trait_choices = if self.shallow_resolve(adjusted_ty).is_coroutine_closure() {
+            [
+                (self.tcx.lang_items().async_fn_trait(), sym::async_call, true),
+                (self.tcx.lang_items().async_fn_mut_trait(), sym::async_call_mut, true),
+                (self.tcx.lang_items().async_fn_once_trait(), sym::async_call_once, false),
+                (self.tcx.lang_items().fn_trait(), sym::call, true),
+                (self.tcx.lang_items().fn_mut_trait(), sym::call_mut, true),
+                (self.tcx.lang_items().fn_once_trait(), sym::call_once, false),
+            ]
+        } else {
+            [
+                (self.tcx.lang_items().fn_trait(), sym::call, true),
+                (self.tcx.lang_items().fn_mut_trait(), sym::call_mut, true),
+                (self.tcx.lang_items().fn_once_trait(), sym::call_once, false),
+                (self.tcx.lang_items().async_fn_trait(), sym::async_call, true),
+                (self.tcx.lang_items().async_fn_mut_trait(), sym::async_call_mut, true),
+                (self.tcx.lang_items().async_fn_once_trait(), sym::async_call_once, false),
+            ]
+        };
+
         // Try the options that are least restrictive on the caller first.
-        for (opt_trait_def_id, method_name, borrow) in [
-            (self.tcx.lang_items().fn_trait(), Ident::with_dummy_span(sym::call), true),
-            (self.tcx.lang_items().fn_mut_trait(), Ident::with_dummy_span(sym::call_mut), true),
-            (self.tcx.lang_items().fn_once_trait(), Ident::with_dummy_span(sym::call_once), false),
-        ] {
+        for (opt_trait_def_id, method_name, borrow) in call_trait_choices {
             let Some(trait_def_id) = opt_trait_def_id else { continue };
 
             let opt_input_type = opt_arg_exprs.map(|arg_exprs| {
-                self.tcx.mk_tup_from_iter(arg_exprs.iter().map(|e| {
-                    self.next_ty_var(TypeVariableOrigin {
-                        kind: TypeVariableOriginKind::TypeInference,
-                        span: e.span,
-                    })
-                }))
+                Ty::new_tup_from_iter(self.tcx, arg_exprs.iter().map(|e| self.next_ty_var(e.span)))
             });
 
             if let Some(ok) = self.lookup_method_in_trait(
                 self.misc(call_expr.span),
-                method_name,
+                Ident::with_dummy_span(method_name),
                 trait_def_id,
                 adjusted_ty,
                 opt_input_type.as_ref().map(slice::from_ref),
             ) {
-                // Check for `self` receiver on the method, otherwise we can't use this as a `Fn*` trait.
-                if !self.tcx.associated_item(ok.value.def_id).fn_has_self_parameter {
-                    self.tcx.sess.delay_span_bug(
-                        call_expr.span,
-                        "input to overloaded call fn is not a self receiver",
-                    );
-                    return None;
-                }
-
                 let method = self.register_infer_ok_obligations(ok);
                 let mut autoref = None;
                 if borrow {
                     // Check for &self vs &mut self in the method signature. Since this is either
                     // the Fn or FnMut trait, it should be one of those.
                     let ty::Ref(region, _, mutbl) = method.sig.inputs()[0].kind() else {
-                        // The `fn`/`fn_mut` lang item is ill-formed, which should have
-                        // caused an error elsewhere.
-                        self.tcx
-                            .sess
-                            .delay_span_bug(call_expr.span, "input to call/call_mut is not a ref");
-                        return None;
+                        bug!("Expected `FnMut`/`Fn` to take receiver by-ref/by-mut")
                     };
 
                     // For initial two-phase borrow
@@ -292,62 +342,74 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// likely intention is to call the closure, suggest `(||{})()`. (#55851)
     fn identify_bad_closure_def_and_call(
         &self,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         hir_id: hir::HirId,
         callee_node: &hir::ExprKind<'_>,
         callee_span: Span,
     ) {
+        let hir::ExprKind::Block(..) = callee_node else {
+            // Only calls on blocks suggested here.
+            return;
+        };
+
         let hir = self.tcx.hir();
-        let parent_hir_id = hir.parent_id(hir_id);
-        let parent_node = hir.get(parent_hir_id);
-        if let (
-            hir::Node::Expr(hir::Expr {
-                kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, body, .. }),
+        let fn_decl_span = if let hir::Node::Expr(hir::Expr {
+            kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
+            ..
+        }) = self.tcx.parent_hir_node(hir_id)
+        {
+            fn_decl_span
+        } else if let Some((
+            _,
+            hir::Node::Expr(&hir::Expr {
+                hir_id: parent_hir_id,
+                kind:
+                    hir::ExprKind::Closure(&hir::Closure {
+                        kind:
+                            hir::ClosureKind::Coroutine(hir::CoroutineKind::Desugared(
+                                hir::CoroutineDesugaring::Async,
+                                hir::CoroutineSource::Closure,
+                            )),
+                        ..
+                    }),
                 ..
             }),
-            hir::ExprKind::Block(..),
-        ) = (parent_node, callee_node)
+        )) = hir.parent_iter(hir_id).nth(3)
         {
-            let fn_decl_span = if hir.body(body).generator_kind
-                == Some(hir::GeneratorKind::Async(hir::AsyncGeneratorKind::Closure))
+            // Actually need to unwrap one more layer of HIR to get to
+            // the _real_ closure...
+            if let hir::Node::Expr(hir::Expr {
+                kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
+                ..
+            }) = self.tcx.parent_hir_node(parent_hir_id)
             {
-                // Actually need to unwrap a few more layers of HIR to get to
-                // the _real_ closure...
-                let async_closure = hir.parent_id(hir.parent_id(parent_hir_id));
-                if let hir::Node::Expr(hir::Expr {
-                    kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
-                    ..
-                }) = hir.get(async_closure)
-                {
-                    fn_decl_span
-                } else {
-                    return;
-                }
-            } else {
                 fn_decl_span
-            };
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
 
-            let start = fn_decl_span.shrink_to_lo();
-            let end = callee_span.shrink_to_hi();
-            err.multipart_suggestion(
-                "if you meant to create this closure and immediately call it, surround the \
+        let start = fn_decl_span.shrink_to_lo();
+        let end = callee_span.shrink_to_hi();
+        err.multipart_suggestion(
+            "if you meant to create this closure and immediately call it, surround the \
                 closure with parentheses",
-                vec![(start, "(".to_string()), (end, ")".to_string())],
-                Applicability::MaybeIncorrect,
-            );
-        }
+            vec![(start, "(".to_string()), (end, ")".to_string())],
+            Applicability::MaybeIncorrect,
+        );
     }
 
     /// Give appropriate suggestion when encountering `[("a", 0) ("b", 1)]`, where the
     /// likely intention is to create an array containing tuples.
     fn maybe_suggest_bad_array_definition(
         &self,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         call_expr: &'tcx hir::Expr<'tcx>,
         callee_expr: &'tcx hir::Expr<'tcx>,
     ) -> bool {
-        let hir_id = self.tcx.hir().parent_id(call_expr.hir_id);
-        let parent_node = self.tcx.hir().get(hir_id);
+        let parent_node = self.tcx.parent_hir_node(call_expr.hir_id);
         if let (
             hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Array(_), .. }),
             hir::ExprKind::Tup(exp),
@@ -376,15 +438,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let (fn_sig, def_id) = match *callee_ty.kind() {
-            ty::FnDef(def_id, subst) => {
-                let fn_sig = self.tcx.fn_sig(def_id).subst(self.tcx, subst);
+            ty::FnDef(def_id, args) => {
+                self.enforce_context_effects(call_expr.span, def_id, args);
+                let fn_sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args);
 
                 // Unit testing: function items annotated with
                 // `#[rustc_evaluate_where_clauses]` trigger special output
                 // to let us test the trait evaluation system.
+                // Untranslatable diagnostics are okay for rustc internals
+                #[allow(rustc::untranslatable_diagnostic)]
+                #[allow(rustc::diagnostic_outside_of_impl)]
                 if self.tcx.has_attr(def_id, sym::rustc_evaluate_where_clauses) {
                     let predicates = self.tcx.predicates_of(def_id);
-                    let predicates = predicates.instantiate(self.tcx, subst);
+                    let predicates = predicates.instantiate(self.tcx, args);
                     for (predicate, predicate_span) in predicates {
                         let obligation = Obligation::new(
                             self.tcx,
@@ -393,18 +459,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             predicate,
                         );
                         let result = self.evaluate_obligation(&obligation);
-                        self.tcx
-                            .sess
+                        self.dcx()
                             .struct_span_err(
                                 callee_expr.span,
-                                &format!("evaluate({:?}) = {:?}", predicate, result),
+                                format!("evaluate({predicate:?}) = {result:?}"),
                             )
-                            .span_label(predicate_span, "predicate")
+                            .with_span_label(predicate_span, "predicate")
                             .emit();
                     }
                 }
                 (fn_sig, Some(def_id))
             }
+            // FIXME(effects): these arms should error because we can't enforce them
             ty::FnPtr(sig) => (sig, None),
             _ => {
                 for arg in arg_exprs {
@@ -413,32 +479,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                 if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee_expr.kind
                     && let [segment] = path.segments
-                    && let Some(mut diag) = self
-                        .tcx
-                        .sess
-                        .diagnostic()
-                        .steal_diagnostic(segment.ident.span, StashKey::CallIntoMethod)
                 {
-                    // Try suggesting `foo(a)` -> `a.foo()` if possible.
-                    if let Some(ty) =
-                        self.suggest_call_as_method(
-                            &mut diag,
-                            segment,
-                            arg_exprs,
-                            call_expr,
-                            expected
-                        )
-                    {
-                        diag.emit();
-                        return ty;
-                    } else {
-                        diag.emit();
-                    }
+                    self.dcx().try_steal_modify_and_emit_err(
+                        segment.ident.span,
+                        StashKey::CallIntoMethod,
+                        |err| {
+                            // Try suggesting `foo(a)` -> `a.foo()` if possible.
+                            self.suggest_call_as_method(
+                                err, segment, arg_exprs, call_expr, expected,
+                            );
+                        },
+                    );
                 }
 
                 let err = self.report_invalid_callee(call_expr, callee_expr, callee_ty, arg_exprs);
 
-                return self.tcx.ty_error(err);
+                return Ty::new_error(self.tcx, err);
             }
         };
 
@@ -474,13 +530,67 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.register_bound(
                     ty,
                     self.tcx.require_lang_item(hir::LangItem::Tuple, Some(sp)),
-                    traits::ObligationCause::new(sp, self.body_id, traits::RustCall),
+                    traits::ObligationCause::new(sp, self.body_id, ObligationCauseCode::RustCall),
                 );
+                self.require_type_is_sized(ty, sp, ObligationCauseCode::RustCall);
             } else {
-                self.tcx.sess.span_err(
-                        sp,
-                        "functions with the \"rust-call\" ABI must take a single non-self tuple argument",
-                    );
+                self.dcx().emit_err(errors::RustCallIncorrectArgs { span: sp });
+            }
+        }
+
+        if let Some(def_id) = def_id
+            && self.tcx.def_kind(def_id) == hir::def::DefKind::Fn
+            && self.tcx.is_intrinsic(def_id, sym::const_eval_select)
+        {
+            let fn_sig = self.resolve_vars_if_possible(fn_sig);
+            for idx in 0..=1 {
+                let arg_ty = fn_sig.inputs()[idx + 1];
+                let span = arg_exprs.get(idx + 1).map_or(call_expr.span, |arg| arg.span);
+                // Check that second and third argument of `const_eval_select` must be `FnDef`, and additionally that
+                // the second argument must be `const fn`. The first argument must be a tuple, but this is already expressed
+                // in the function signature (`F: FnOnce<ARG>`), so I did not bother to add another check here.
+                //
+                // This check is here because there is currently no way to express a trait bound for `FnDef` types only.
+                if let ty::FnDef(def_id, _args) = *arg_ty.kind() {
+                    let fn_once_def_id =
+                        self.tcx.require_lang_item(hir::LangItem::FnOnce, Some(span));
+                    let fn_once_output_def_id =
+                        self.tcx.require_lang_item(hir::LangItem::FnOnceOutput, Some(span));
+                    if self.tcx.has_host_param(fn_once_def_id) {
+                        let const_param: ty::GenericArg<'tcx> =
+                            ([self.tcx.consts.false_, self.tcx.consts.true_])[idx].into();
+                        self.register_predicate(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(span),
+                            self.param_env,
+                            ty::TraitRef::new(
+                                self.tcx,
+                                fn_once_def_id,
+                                [arg_ty.into(), fn_sig.inputs()[0].into(), const_param],
+                            ),
+                        ));
+
+                        self.register_predicate(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(span),
+                            self.param_env,
+                            ty::ProjectionPredicate {
+                                projection_term: ty::AliasTerm::new(
+                                    self.tcx,
+                                    fn_once_output_def_id,
+                                    [arg_ty.into(), fn_sig.inputs()[0].into(), const_param],
+                                ),
+                                term: fn_sig.output().into(),
+                            },
+                        ));
+
+                        self.select_obligations_where_possible(|_| {});
+                    } else if idx == 0 && !self.tcx.is_const_fn_raw(def_id) {
+                        self.dcx().emit_err(errors::ConstSelectMustBeConst { span });
+                    }
+                } else {
+                    self.dcx().emit_err(errors::ConstSelectMustBeFn { span, ty: arg_ty });
+                }
             }
         }
 
@@ -491,20 +601,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// and suggesting the fix if the method probe is successful.
     fn suggest_call_as_method(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         segment: &'tcx hir::PathSegment<'tcx>,
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         call_expr: &'tcx hir::Expr<'tcx>,
         expected: Expectation<'tcx>,
-    ) -> Option<Ty<'tcx>> {
+    ) {
         if let [callee_expr, rest @ ..] = arg_exprs {
-            let callee_ty = self.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr)?;
+            let Some(callee_ty) = self.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr)
+            else {
+                return;
+            };
 
             // First, do a probe with `IsSuggestion(true)` to avoid emitting
             // any strange errors. If it's successful, then we'll do a true
             // method lookup.
-            let Ok(pick) = self
-            .lookup_probe_for_diagnostic(
+            let Ok(pick) = self.lookup_probe_for_diagnostic(
                 segment.ident,
                 callee_ty,
                 call_expr,
@@ -513,7 +625,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 ProbeScope::AllTraits,
                 expected.only_has_type(self),
             ) else {
-                return None;
+                return;
             };
 
             let pick = self.confirm_method(
@@ -525,11 +637,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 segment,
             );
             if pick.illegal_sized_bound.is_some() {
-                return None;
+                return;
             }
 
-            let up_to_rcvr_span = segment.ident.span.until(callee_expr.span);
-            let rest_span = callee_expr.span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
+            let Some(callee_expr_span) = callee_expr.span.find_ancestor_inside(call_expr.span)
+            else {
+                return;
+            };
+            let up_to_rcvr_span = segment.ident.span.until(callee_expr_span);
+            let rest_span = callee_expr_span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
             let rest_snippet = if let Some(first) = rest.first() {
                 self.tcx
                     .sess
@@ -567,22 +683,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     sugg,
                     Applicability::MaybeIncorrect,
                 );
-
-                // Let's check the method fully now
-                let return_ty = self.check_method_argument_types(
-                    segment.ident.span,
-                    call_expr,
-                    Ok(pick.callee),
-                    rest,
-                    TupleArgumentsFlag::DontTupleArguments,
-                    expected,
-                );
-
-                return Some(return_ty);
             }
         }
-
-        None
     }
 
     fn report_invalid_callee(
@@ -592,33 +694,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         callee_ty: Ty<'tcx>,
         arg_exprs: &'tcx [hir::Expr<'tcx>],
     ) -> ErrorGuaranteed {
+        // Callee probe fails when APIT references errors, so suppress those
+        // errors here.
+        if let Some((_, _, args)) = self.extract_callable_info(callee_ty)
+            && let Err(err) = args.error_reported()
+        {
+            return err;
+        }
+
         let mut unit_variant = None;
         if let hir::ExprKind::Path(qpath) = &callee_expr.kind
             && let Res::Def(def::DefKind::Ctor(kind, CtorKind::Const), _)
                 = self.typeck_results.borrow().qpath_res(qpath, callee_expr.hir_id)
             // Only suggest removing parens if there are no arguments
             && arg_exprs.is_empty()
+            && call_expr.span.contains(callee_expr.span)
         {
             let descr = match kind {
                 def::CtorOf::Struct => "struct",
                 def::CtorOf::Variant => "enum variant",
             };
             let removal_span = callee_expr.span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
-            unit_variant = Some((removal_span, descr, rustc_hir_pretty::qpath_to_string(qpath)));
+            unit_variant =
+                Some((removal_span, descr, rustc_hir_pretty::qpath_to_string(&self.tcx, qpath)));
         }
 
         let callee_ty = self.resolve_vars_if_possible(callee_ty);
-        let mut err = type_error_struct!(
-            self.tcx.sess,
-            callee_expr.span,
-            callee_ty,
-            E0618,
-            "expected function, found {}",
-            match &unit_variant {
+        let mut err = self.dcx().create_err(errors::InvalidCallee {
+            span: callee_expr.span,
+            ty: match &unit_variant {
                 Some((_, kind, path)) => format!("{kind} `{path}`"),
                 None => format!("`{callee_ty}`"),
-            }
-        );
+            },
+        });
+        if callee_ty.references_error() {
+            err.downgrade_to_delayed_bug();
+        }
 
         self.identify_bad_closure_def_and_call(
             &mut err,
@@ -630,7 +741,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if let Some((removal_span, kind, path)) = &unit_variant {
             err.span_suggestion_verbose(
                 *removal_span,
-                &format!(
+                format!(
                     "`{path}` is a unit {kind}, and does not take parentheses to be constructed",
                 ),
                 "",
@@ -638,24 +749,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             );
         }
 
+        if let hir::ExprKind::Path(hir::QPath::Resolved(None, path)) = callee_expr.kind
+            && let Res::Local(_) = path.res
+            && let [segment] = &path.segments
+        {
+            for id in self.tcx.hir().items() {
+                if let Some(node) = self.tcx.hir().get_if_local(id.owner_id.into())
+                    && let hir::Node::Item(item) = node
+                    && let hir::ItemKind::Fn(..) = item.kind
+                    && item.ident.name == segment.ident.name
+                {
+                    err.span_label(
+                        self.tcx.def_span(id.owner_id),
+                        "this function of the same name is available here, but it's shadowed by \
+                         the local binding",
+                    );
+                }
+            }
+        }
+
         let mut inner_callee_path = None;
         let def = match callee_expr.kind {
             hir::ExprKind::Path(ref qpath) => {
                 self.typeck_results.borrow().qpath_res(qpath, callee_expr.hir_id)
             }
-            hir::ExprKind::Call(ref inner_callee, _) => {
-                // If the call spans more than one line and the callee kind is
-                // itself another `ExprCall`, that's a clue that we might just be
-                // missing a semicolon (Issue #51055)
-                let call_is_multiline = self.tcx.sess.source_map().is_multiline(call_expr.span);
-                if call_is_multiline {
-                    err.span_suggestion(
-                        callee_expr.span.shrink_to_hi(),
-                        "consider using a semicolon here",
-                        ";",
-                        Applicability::MaybeIncorrect,
-                    );
-                }
+            hir::ExprKind::Call(inner_callee, _) => {
                 if let hir::ExprKind::Path(ref inner_qpath) = inner_callee.kind {
                     inner_callee_path = Some(inner_qpath);
                     self.typeck_results.borrow().qpath_res(inner_qpath, inner_callee.hir_id)
@@ -667,8 +785,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         if !self.maybe_suggest_bad_array_definition(&mut err, call_expr, callee_expr) {
+            // If the call spans more than one line and the callee kind is
+            // itself another `ExprCall`, that's a clue that we might just be
+            // missing a semicolon (#51055, #106515).
+            let call_is_multiline = self
+                .tcx
+                .sess
+                .source_map()
+                .is_multiline(call_expr.span.with_lo(callee_expr.span.hi()))
+                && call_expr.span.eq_ctxt(callee_expr.span);
+            if call_is_multiline {
+                err.span_suggestion(
+                    callee_expr.span.shrink_to_hi(),
+                    "consider using a semicolon here to finish the statement",
+                    ";",
+                    Applicability::MaybeIncorrect,
+                );
+            }
             if let Some((maybe_def, output_ty, _)) = self.extract_callable_info(callee_ty)
-                && !self.type_is_sized_modulo_regions(self.param_env, output_ty, callee_expr.span)
+                && !self.type_is_sized_modulo_regions(self.param_env, output_ty)
             {
                 let descr = match maybe_def {
                     DefIdOrName::DefId(def_id) => self.tcx.def_descr(def_id),
@@ -756,6 +891,37 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         fn_sig.output()
     }
 
+    #[tracing::instrument(level = "debug", skip(self, span))]
+    pub(super) fn enforce_context_effects(
+        &self,
+        span: Span,
+        callee_did: DefId,
+        callee_args: GenericArgsRef<'tcx>,
+    ) {
+        let tcx = self.tcx;
+
+        // fast-reject if callee doesn't have the host effect param (non-const)
+        let generics = tcx.generics_of(callee_did);
+        let Some(host_effect_index) = generics.host_effect_index else { return };
+
+        let effect = tcx.expected_host_effect_param_for_body(self.body_id);
+
+        trace!(?effect, ?generics, ?callee_args);
+
+        let param = callee_args.const_at(host_effect_index);
+        let cause = self.misc(span);
+        // We know the type of `effect` to be `bool`, there will be no opaque type inference.
+        match self.at(&cause, self.param_env).eq(infer::DefineOpaqueTypes::Yes, effect, param) {
+            Ok(infer::InferOk { obligations, value: () }) => {
+                self.register_predicates(obligations);
+            }
+            Err(e) => {
+                // FIXME(effects): better diagnostic
+                self.err_ctxt().report_mismatched_consts(&cause, effect, param, e).emit();
+            }
+        }
+    }
+
     fn confirm_overloaded_call(
         &self,
         call_expr: &'tcx hir::Expr<'tcx>,
@@ -772,7 +938,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             expected,
         );
 
-        self.write_method_call(call_expr.hir_id, method_callee);
+        self.write_method_call_and_enforce_effects(call_expr.hir_id, call_expr.span, method_callee);
         output_type
     }
 }
@@ -781,10 +947,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 pub struct DeferredCallResolution<'tcx> {
     call_expr: &'tcx hir::Expr<'tcx>,
     callee_expr: &'tcx hir::Expr<'tcx>,
-    adjusted_ty: Ty<'tcx>,
+    closure_ty: Ty<'tcx>,
     adjustments: Vec<Adjustment<'tcx>>,
     fn_sig: ty::FnSig<'tcx>,
-    closure_substs: SubstsRef<'tcx>,
 }
 
 impl<'a, 'tcx> DeferredCallResolution<'tcx> {
@@ -793,10 +958,10 @@ impl<'a, 'tcx> DeferredCallResolution<'tcx> {
 
         // we should not be invoked until the closure kind has been
         // determined by upvar inference
-        assert!(fcx.closure_kind(self.closure_substs).is_some());
+        assert!(fcx.closure_kind(self.closure_ty).is_some());
 
         // We may now know enough to figure out fn vs fnmut etc.
-        match fcx.try_overloaded_call_traits(self.call_expr, self.adjusted_ty, None) {
+        match fcx.try_overloaded_call_traits(self.call_expr, self.closure_ty, None) {
             Some((autoref, method_callee)) => {
                 // One problem is that when we get here, we are going
                 // to have a newly instantiated function signature
@@ -822,20 +987,18 @@ impl<'a, 'tcx> DeferredCallResolution<'tcx> {
                 adjustments.extend(autoref);
                 fcx.apply_adjustments(self.callee_expr, adjustments);
 
-                fcx.write_method_call(self.call_expr.hir_id, method_callee);
+                fcx.write_method_call_and_enforce_effects(
+                    self.call_expr.hir_id,
+                    self.call_expr.span,
+                    method_callee,
+                );
             }
             None => {
-                // This can happen if `#![no_core]` is used and the `fn/fn_mut/fn_once`
-                // lang items are not defined (issue #86238).
-                let mut err = fcx.inh.tcx.sess.struct_span_err(
+                span_bug!(
                     self.call_expr.span,
-                    "failed to find an overloaded call trait for closure call",
-                );
-                err.help(
-                    "make sure the `fn`/`fn_mut`/`fn_once` lang items are defined \
-                     and have correctly defined `call`/`call_mut`/`call_once` methods",
-                );
-                err.emit();
+                    "Expected to find a suitable `Fn`/`FnMut`/`FnOnce` implementation for `{}`",
+                    self.closure_ty
+                )
             }
         }
     }

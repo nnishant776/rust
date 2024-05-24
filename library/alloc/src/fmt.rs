@@ -177,8 +177,8 @@
 //! These are all flags altering the behavior of the formatter.
 //!
 //! * `+` - This is intended for numeric types and indicates that the sign
-//!         should always be printed. Positive signs are never printed by
-//!         default, and the negative sign is only printed by default for signed values.
+//!         should always be printed. By default only the negative sign of signed values
+//!         is printed, and the sign of positive or unsigned values is omitted.
 //!         This flag indicates that the correct sign (`+` or `-`) should always be printed.
 //! * `-` - Currently not used
 //! * `#` - This flag indicates that the "alternate" form of printing should
@@ -188,6 +188,10 @@
 //!     * `#X` - precedes the argument with a `0x`
 //!     * `#b` - precedes the argument with a `0b`
 //!     * `#o` - precedes the argument with a `0o`
+//!
+//!   See [Formatting traits](#formatting-traits) for a description of what the `?`, `x`, `X`,
+//!   `b`, and `o` flags do.
+//!
 //! * `0` - This is used to indicate for integer formats that the padding to `width` should
 //!         both be done with a `0` character as well as be sign-aware. A format
 //!         like `{:08}` would yield `00000001` for the integer `1`, while the
@@ -197,6 +201,7 @@
 //!         and before the digits. When used together with the `#` flag, a similar
 //!         rule applies: padding zeros are inserted after the prefix but before
 //!         the digits. The prefix is included in the total width.
+//!         This flag overrides the [fill character and alignment flag](#fillalignment).
 //!
 //! ## Precision
 //!
@@ -271,6 +276,22 @@
 //! Hello, `1234.560` has 3 fractional digits
 //! Hello, `123` has 3 characters
 //! Hello, `     123` has 3 right-aligned characters
+//! ```
+//!
+//! When truncating these values, Rust uses [round half-to-even](https://en.wikipedia.org/wiki/Rounding#Rounding_half_to_even),
+//! which is the default rounding mode in IEEE 754.
+//! For example,
+//!
+//! ```
+//! print!("{0:.1$e}", 12345, 3);
+//! print!("{0:.1$e}", 12355, 3);
+//! ```
+//!
+//! Would return:
+//!
+//! ```text
+//! 1.234e4
+//! 1.236e4
 //! ```
 //!
 //! ## Localization
@@ -363,7 +384,7 @@
 //! # use std::fmt;
 //! # struct Foo; // our custom type
 //! # impl fmt::Display for Foo {
-//! fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//! fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 //! # write!(f, "testing, testing")
 //! # } }
 //! ```
@@ -382,7 +403,7 @@
 //! is, a formatting implementation must and may only return an error if the
 //! passed-in [`Formatter`] returns an error. This is because, contrary to what
 //! the function signature might suggest, string formatting is an infallible
-//! operation. This function only returns a result because writing to the
+//! operation. This function only returns a [`Result`] because writing to the
 //! underlying stream might fail and it must provide a way to propagate the fact
 //! that an error has occurred back up the stack.
 //!
@@ -399,7 +420,7 @@
 //! }
 //!
 //! impl fmt::Display for Vector2D {
-//!     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//!     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 //!         // The `f` value implements the `Write` trait, which is what the
 //!         // write! macro is expecting. Note that this formatting ignores the
 //!         // various flags provided to format strings.
@@ -410,7 +431,7 @@
 //! // Different traits allow different forms of output of a type. The meaning
 //! // of this format is to print the magnitude of a vector.
 //! impl fmt::Binary for Vector2D {
-//!     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//!     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 //!         let magnitude = (self.x * self.x + self.y * self.y) as f64;
 //!         let magnitude = magnitude.sqrt();
 //!
@@ -517,7 +538,7 @@
 //! let mut some_writer = io::stdout();
 //! write!(&mut some_writer, "{}", format_args!("print with a {}", "macro"));
 //!
-//! fn my_fmt_fn(args: fmt::Arguments) {
+//! fn my_fmt_fn(args: fmt::Arguments<'_>) {
 //!     write!(&mut io::stdout(), "{args}");
 //! }
 //! my_fmt_fn(format_args!(", or a {} too", "function"));
@@ -551,12 +572,12 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-#[unstable(feature = "fmt_internals", issue = "none")]
-pub use core::fmt::rt;
 #[stable(feature = "fmt_flags_align", since = "1.28.0")]
 pub use core::fmt::Alignment;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::fmt::Error;
+#[unstable(feature = "debug_closure_helpers", issue = "117729")]
+pub use core::fmt::FormatterFn;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::fmt::{write, Arguments};
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -609,7 +630,9 @@ pub fn format(args: Arguments<'_>) -> string::String {
     fn format_inner(args: Arguments<'_>) -> string::String {
         let capacity = args.estimated_capacity();
         let mut output = string::String::with_capacity(capacity);
-        output.write_fmt(args).expect("a formatting trait implementation returned an error");
+        output
+            .write_fmt(args)
+            .expect("a formatting trait implementation returned an error when the underlying stream did not");
         output
     }
 

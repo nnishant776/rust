@@ -1,4 +1,8 @@
-// run-rustfix
+//@ run-rustfix
+
+#![allow(dead_code)]
+#![allow(dropping_references)]
+
 struct Foo {
     x: isize
 }

@@ -1,11 +1,12 @@
-// check-fail
-// compile-flags: -Z tiny-const-eval-limit
+//@ check-fail
+//@ compile-flags: -Z tiny-const-eval-limit
 
 const fn labelled_loop(n: u32) -> u32 {
     let mut i = 0;
-    'mylabel: loop { //~ ERROR evaluation of constant value failed [E0080]
+    'mylabel: loop {
+        //~^ ERROR is taking a long time
         if i > n {
-            break 'mylabel
+            break 'mylabel;
         }
         i += 1;
     }

@@ -1,5 +1,8 @@
-// build-pass
-// only-x86-windows
+// ignore-tidy-linelength
+//@ build-pass
+//@ only-x86
+//@ only-windows
+//@ ignore-gnu - vectorcall is not supported by GCC: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89485
 #![crate_type = "cdylib"]
 #![feature(abi_vectorcall)]
 

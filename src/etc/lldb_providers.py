@@ -1,6 +1,6 @@
 import sys
 
-from lldb import SBValue, SBData, SBError, eBasicTypeLong, eBasicTypeUnsignedLong, \
+from lldb import SBData, SBError, eBasicTypeLong, eBasicTypeUnsignedLong, \
     eBasicTypeUnsignedChar
 
 # from lldb.formatters import Logger
@@ -31,7 +31,7 @@ from lldb import SBValue, SBData, SBError, eBasicTypeLong, eBasicTypeUnsignedLon
 #
 # You can find more information and examples here:
 #   1. https://lldb.llvm.org/varformats.html
-#   2. https://lldb.llvm.org/python-reference.html
+#   2. https://lldb.llvm.org/use/python-reference.html
 #   3. https://lldb.llvm.org/python_reference/lldb.formatters.cpp.libcxx-pysrc.html
 #   4. https://github.com/llvm-mirror/lldb/tree/master/examples/summaries/cocoa
 ####################################################################################################
@@ -69,9 +69,9 @@ def unwrap_unique_or_non_null(unique_or_nonnull):
     return ptr if ptr.TypeIsPointerType() else ptr.GetChildAtIndex(0)
 
 
-class DefaultSynthteticProvider:
+class DefaultSyntheticProvider:
     def __init__(self, valobj, dict):
-        # type: (SBValue, dict) -> DefaultSynthteticProvider
+        # type: (SBValue, dict) -> DefaultSyntheticProvider
         # logger = Logger.Logger()
         # logger >> "Default synthetic provider for " + str(valobj.GetName())
         self.valobj = valobj
@@ -159,6 +159,9 @@ def StdStrSummaryProvider(valobj, dict):
     # logger = Logger.Logger()
     # logger >> "[StdStrSummaryProvider] for " + str(valobj.GetName())
 
+    # the code below assumes non-synthetic value, this makes sure the assumption holds
+    valobj = valobj.GetNonSyntheticValue()
+
     length = valobj.GetChildMemberWithName("length").GetValueAsUnsigned()
     if length == 0:
         return '""'
@@ -170,6 +173,35 @@ def StdStrSummaryProvider(valobj, dict):
     process = data_ptr.GetProcess()
     data = process.ReadMemory(start, length, error)
     data = data.decode(encoding='UTF-8') if PY3 else data
+    return '"%s"' % data
+
+
+def StdPathBufSummaryProvider(valobj, dict):
+    # type: (SBValue, dict) -> str
+    # logger = Logger.Logger()
+    # logger >> "[StdPathBufSummaryProvider] for " + str(valobj.GetName())
+    return StdOsStringSummaryProvider(valobj.GetChildMemberWithName("inner"), dict)
+
+
+def StdPathSummaryProvider(valobj, dict):
+    # type: (SBValue, dict) -> str
+    # logger = Logger.Logger()
+    # logger >> "[StdPathSummaryProvider] for " + str(valobj.GetName())
+    length = valobj.GetChildMemberWithName("length").GetValueAsUnsigned()
+    if length == 0:
+        return '""'
+
+    data_ptr = valobj.GetChildMemberWithName("data_ptr")
+
+    start = data_ptr.GetValueAsUnsigned()
+    error = SBError()
+    process = data_ptr.GetProcess()
+    data = process.ReadMemory(start, length, error)
+    if PY3:
+        try:
+            data = data.decode(encoding='UTF-8')
+        except UnicodeDecodeError:
+            return '%r' % data
     return '"%s"' % data
 
 
@@ -218,6 +250,58 @@ class StructSyntheticProvider:
         # type: () -> bool
         return True
 
+class ClangEncodedEnumProvider:
+    """Pretty-printer for 'clang-encoded' enums support implemented in LLDB"""
+    DISCRIMINANT_MEMBER_NAME = "$discr$"
+    VALUE_MEMBER_NAME = "value"
+
+    def __init__(self, valobj, dict):
+        self.valobj = valobj
+        self.update()
+
+    def has_children(self):
+       return True
+
+    def num_children(self):
+        if self.is_default:
+            return 1
+        return 2
+
+    def get_child_index(self, name):
+        if name == ClangEncodedEnumProvider.VALUE_MEMBER_NAME:
+            return 0
+        if name == ClangEncodedEnumProvider.DISCRIMINANT_MEMBER_NAME:
+            return 1
+        return -1
+
+    def get_child_at_index(self, index):
+        if index == 0:
+            return self.variant.GetChildMemberWithName(ClangEncodedEnumProvider.VALUE_MEMBER_NAME)
+        if index == 1:
+            return self.variant.GetChildMemberWithName(
+                ClangEncodedEnumProvider.DISCRIMINANT_MEMBER_NAME)
+
+
+    def update(self):
+        all_variants = self.valobj.GetChildAtIndex(0)
+        index = self._getCurrentVariantIndex(all_variants)
+        self.variant = all_variants.GetChildAtIndex(index)
+        self.is_default = self.variant.GetIndexOfChildWithName(
+            ClangEncodedEnumProvider.DISCRIMINANT_MEMBER_NAME) == -1
+
+    def _getCurrentVariantIndex(self, all_variants):
+        default_index = 0
+        for i in range(all_variants.GetNumChildren()):
+            variant = all_variants.GetChildAtIndex(i)
+            discr = variant.GetChildMemberWithName(
+                ClangEncodedEnumProvider.DISCRIMINANT_MEMBER_NAME)
+            if discr.IsValid():
+                discr_unsigned_value = discr.GetValueAsUnsigned()
+                if variant.GetName() == f"$variant${discr_unsigned_value}":
+                    return i
+            else:
+                default_index = i
+        return default_index
 
 class TupleSyntheticProvider:
     """Pretty-printer for tuples and tuple enum variants"""
@@ -267,7 +351,8 @@ class StdVecSyntheticProvider:
     """Pretty-printer for alloc::vec::Vec<T>
 
     struct Vec<T> { buf: RawVec<T>, len: usize }
-    struct RawVec<T> { ptr: Unique<T>, cap: usize, ... }
+    rust 1.75: struct RawVec<T> { ptr: Unique<T>, cap: usize, ... }
+    rust 1.76: struct RawVec<T> { ptr: Unique<T>, cap: Cap(usize), ... }
     rust 1.31.1: struct Unique<T: ?Sized> { pointer: NonZero<*const T>, ... }
     rust 1.33.0: struct Unique<T: ?Sized> { pointer: *const T, ... }
     rust 1.62.0: struct Unique<T: ?Sized> { pointer: NonNull<T>, ... }
@@ -390,7 +475,10 @@ class StdVecDequeSyntheticProvider:
         self.head = self.valobj.GetChildMemberWithName("head").GetValueAsUnsigned()
         self.size = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
         self.buf = self.valobj.GetChildMemberWithName("buf")
-        self.cap = self.buf.GetChildMemberWithName("cap").GetValueAsUnsigned()
+        cap = self.buf.GetChildMemberWithName("cap")
+        if cap.GetType().num_fields == 1:
+            cap = cap.GetChildAtIndex(0)
+        self.cap = cap.GetValueAsUnsigned()
 
         self.data_ptr = unwrap_unique_or_non_null(self.buf.GetChildMemberWithName("ptr"))
 
@@ -739,7 +827,12 @@ class StdRefSyntheticProvider:
 
 def StdNonZeroNumberSummaryProvider(valobj, _dict):
     # type: (SBValue, dict) -> str
-    objtype = valobj.GetType()
-    field = objtype.GetFieldAtIndex(0)
-    element = valobj.GetChildMemberWithName(field.name)
-    return element.GetValue()
+    inner = valobj.GetChildAtIndex(0)
+    inner_inner = inner.GetChildAtIndex(0)
+
+    # FIXME: Avoid printing as character literal,
+    #        see https://github.com/llvm/llvm-project/issues/65076.
+    if inner_inner.GetTypeName() in ['char', 'unsigned char']:
+      return str(inner_inner.GetValueAsSigned())
+    else:
+      return inner_inner.GetValue()

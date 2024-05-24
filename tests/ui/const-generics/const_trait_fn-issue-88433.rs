@@ -1,6 +1,6 @@
-// build-pass
+//@ build-pass
 
-#![feature(const_trait_impl)]
+#![feature(const_trait_impl, effects)]
 
 #[const_trait]
 trait Func<T> {

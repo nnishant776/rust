@@ -2,19 +2,20 @@
 
 use std::iter;
 
-use hir::{db::DefDatabase, InFile, ModuleSource};
+use hir::{db::DefDatabase, DefMap, InFile, ModuleSource};
 use ide_db::{
-    base_db::{FileId, FileLoader, SourceDatabase, SourceDatabaseExt},
+    base_db::{FileId, FileLoader, FileRange, SourceDatabase, SourceDatabaseExt},
     source_change::SourceChange,
     RootDatabase,
 };
+use paths::Utf8Component;
 use syntax::{
     ast::{self, edit::IndentLevel, HasModuleItem, HasName},
-    AstNode, TextRange, TextSize,
+    AstNode, TextRange,
 };
 use text_edit::TextEdit;
 
-use crate::{fix, Assist, Diagnostic, DiagnosticsContext, Severity};
+use crate::{fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
 
 // Diagnostic: unlinked-file
 //
@@ -27,14 +28,31 @@ pub(crate) fn unlinked_file(
 ) {
     // Limit diagnostic to the first few characters in the file. This matches how VS Code
     // renders it with the full span, but on other editors, and is less invasive.
+    let fixes = fixes(ctx, file_id);
+    // FIXME: This is a hack for the vscode extension to notice whether there is an autofix or not before having to resolve diagnostics.
+    // This is to prevent project linking popups from appearing when there is an autofix. https://github.com/rust-lang/rust-analyzer/issues/14523
+    let message = if fixes.is_none() {
+        "file not included in crate hierarchy"
+    } else {
+        "file not included in module tree"
+    };
+
     let range = ctx.sema.db.parse(file_id).syntax_node().text_range();
-    // FIXME: This is wrong if one of the first three characters is not ascii: `//Ы`.
-    let range = range.intersect(TextRange::up_to(TextSize::of("..."))).unwrap_or(range);
+    let range = FileLoader::file_text(ctx.sema.db, file_id)
+        .char_indices()
+        .take(3)
+        .last()
+        .map(|(i, _)| i)
+        .map(|i| TextRange::up_to(i.try_into().unwrap()))
+        .unwrap_or(range);
 
     acc.push(
-        Diagnostic::new("unlinked-file", "file not included in module tree", range)
-            .severity(Severity::WeakWarning)
-            .with_fixes(fixes(ctx, file_id)),
+        Diagnostic::new(
+            DiagnosticCode::Ra("unlinked-file", Severity::WeakWarning),
+            message,
+            FileRange { file_id, range },
+        )
+        .with_fixes(fixes),
     );
 }
 
@@ -60,17 +78,17 @@ fn fixes(ctx: &DiagnosticsContext<'_>, file_id: FileId) -> Option<Vec<Assist>> {
     'crates: for &krate in &*ctx.sema.db.relevant_crates(file_id) {
         let crate_def_map = ctx.sema.db.crate_def_map(krate);
 
-        let root_module = &crate_def_map[crate_def_map.root()];
+        let root_module = &crate_def_map[DefMap::ROOT];
         let Some(root_file_id) = root_module.origin.file_id() else { continue };
         let Some(crate_root_path) = source_root.path_for_file(&root_file_id) else { continue };
         let Some(rel) = parent.strip_prefix(&crate_root_path.parent()?) else { continue };
 
         // try resolving the relative difference of the paths as inline modules
         let mut current = root_module;
-        for ele in rel.as_ref().components() {
+        for ele in rel.as_utf8_path().components() {
             let seg = match ele {
-                std::path::Component::Normal(seg) => seg.to_str()?,
-                std::path::Component::RootDir => continue,
+                Utf8Component::Normal(seg) => seg,
+                Utf8Component::RootDir => continue,
                 // shouldn't occur
                 _ => continue 'crates,
             };
@@ -92,7 +110,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, file_id: FileId) -> Option<Vec<Assist>> {
     // if we aren't adding to a crate root, walk backwards such that we support `#[path = ...]` overrides if possible
 
     // build all parent paths of the form `../module_name/mod.rs` and `../module_name.rs`
-    let paths = iter::successors(Some(parent.clone()), |prev| prev.parent()).filter_map(|path| {
+    let paths = iter::successors(Some(parent), |prev| prev.parent()).filter_map(|path| {
         let parent = path.parent()?;
         let (name, _) = path.name_and_extension()?;
         Some(([parent.join(&format!("{name}.rs"))?, path.join("mod.rs")?], name.to_owned()))
@@ -105,10 +123,11 @@ fn fixes(ctx: &DiagnosticsContext<'_>, file_id: FileId) -> Option<Vec<Assist>> {
     stack.pop();
     'crates: for &krate in ctx.sema.db.relevant_crates(parent_id).iter() {
         let crate_def_map = ctx.sema.db.crate_def_map(krate);
-        let Some((_, module)) =
-            crate_def_map.modules()
-            .find(|(_, module)| module.origin.file_id() == Some(parent_id) && !module.origin.is_inline())
-        else { continue };
+        let Some((_, module)) = crate_def_map.modules().find(|(_, module)| {
+            module.origin.file_id() == Some(parent_id) && !module.origin.is_inline()
+        }) else {
+            continue;
+        };
 
         if stack.is_empty() {
             return make_fixes(

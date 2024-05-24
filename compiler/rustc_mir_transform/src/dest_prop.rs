@@ -37,6 +37,10 @@
 //!   if they do not consistently refer to the same place in memory. This is satisfied if they do
 //!   not contain any indirection through a pointer or any indexing projections.
 //!
+//! * `p` and `q` must have the **same type**. If we replace a local with a subtype or supertype,
+//!   we may end up with a differnet vtable for that local. See the `subtyping-impacts-selection`
+//!   tests for an example where that causes issues.
+//!
 //! * We need to make sure that the goal of "merging the memory" is actually structurally possible
 //!   in MIR. For example, even if all the other conditions are satisfied, there is no way to
 //!   "merge" `_5.foo` and `_6.bar`. For now, we ensure this by requiring that both `p` and `q` are
@@ -69,7 +73,7 @@
 //!   of this is that such liveness analysis can report more accurate results about whole locals at
 //!   a time. For example, consider:
 //!
-//!   ```ignore (syntax-highliting-only)
+//!   ```ignore (syntax-highlighting-only)
 //!   _1 = u;
 //!   // unrelated code
 //!   _1.f1 = v;
@@ -83,7 +87,7 @@
 //!   that ever have their address taken. Of course that requires actually having alias analysis
 //!   (and a model to build it on), so this might be a bit of a ways off.
 //!
-//! * Various perf improvents. There are a bunch of comments in here marked `PERF` with ideas for
+//! * Various perf improvements. There are a bunch of comments in here marked `PERF` with ideas for
 //!   how to do things more efficiently. However, the complexity of the pass as a whole should be
 //!   kept in mind.
 //!
@@ -110,7 +114,7 @@
 //! approach that only works for some classes of CFGs:
 //! - rustc now has a powerful dataflow analysis framework that can handle forwards and backwards
 //!   analyses efficiently.
-//! - Layout optimizations for generators have been added to improve code generation for
+//! - Layout optimizations for coroutines have been added to improve code generation for
 //!   async/await, which are very similar in spirit to what this optimization does.
 //!
 //! Also, rustc now has a simple NRVO pass (see `nrvo.rs`), which handles a subset of the cases that
@@ -127,13 +131,13 @@
 //! [attempt 2]: https://github.com/rust-lang/rust/pull/71003
 //! [attempt 3]: https://github.com/rust-lang/rust/pull/72632
 
-use std::collections::hash_map::{Entry, OccupiedEntry};
-
-use crate::simplify::remove_dead_blocks;
 use crate::MirPass;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxIndexMap, IndexEntry, IndexOccupiedEntry};
 use rustc_index::bit_set::BitSet;
+use rustc_index::interval::SparseIntervalMatrix;
+use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
+use rustc_middle::mir::HasLocalDecls;
 use rustc_middle::mir::{dump_mir, PassWhere};
 use rustc_middle::mir::{
     traversal, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place, Rvalue,
@@ -141,7 +145,8 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::MaybeLiveLocals;
-use rustc_mir_dataflow::{Analysis, ResultsCursor};
+use rustc_mir_dataflow::points::{save_as_intervals, DenseLocationMap, PointIndex};
+use rustc_mir_dataflow::Analysis;
 
 pub struct DestinationPropagation;
 
@@ -164,6 +169,13 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
         trace!(func = ?tcx.def_path_str(def_id));
 
         let borrowed = rustc_mir_dataflow::impls::borrowed_locals(body);
+
+        let live = MaybeLiveLocals
+            .into_engine(tcx, body)
+            .pass_name("MaybeLiveLocals-DestinationPropagation")
+            .iterate_to_fixpoint();
+        let points = DenseLocationMap::new(body);
+        let mut live = save_as_intervals(&points, body, live);
 
         // In order to avoid having to collect data for every single pair of locals in the body, we
         // do not allow doing more than one merge for places that are derived from the same local at
@@ -188,43 +200,46 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
                 &mut allocations.candidates_reverse,
             );
             trace!(?candidates);
-            let mut live = MaybeLiveLocals
-                .into_engine(tcx, body)
-                .iterate_to_fixpoint()
-                .into_results_cursor(body);
-            dest_prop_mir_dump(tcx, body, &mut live, round_count);
+            dest_prop_mir_dump(tcx, body, &points, &live, round_count);
 
             FilterInformation::filter_liveness(
                 &mut candidates,
-                &mut live,
+                &points,
+                &live,
                 &mut allocations.write_info,
                 body,
             );
 
-            // Because we do not update liveness information, it is unsound to use a local for more
-            // than one merge operation within a single round of optimizations. We store here which
-            // ones we have already used.
+            // Because we only filter once per round, it is unsound to use a local for more than
+            // one merge operation within a single round of optimizations. We store here which ones
+            // we have already used.
             let mut merged_locals: BitSet<Local> = BitSet::new_empty(body.local_decls.len());
 
             // This is the set of merges we will apply this round. It is a subset of the candidates.
-            let mut merges = FxHashMap::default();
+            let mut merges = FxIndexMap::default();
 
             for (src, candidates) in candidates.c.iter() {
                 if merged_locals.contains(*src) {
                     continue;
                 }
-                let Some(dest) =
-                    candidates.iter().find(|dest| !merged_locals.contains(**dest)) else {
-                        continue;
+                let Some(dest) = candidates.iter().find(|dest| !merged_locals.contains(**dest))
+                else {
+                    continue;
                 };
                 if !tcx.consider_optimizing(|| {
                     format!("{} round {}", tcx.def_path_str(def_id), round_count)
                 }) {
                     break;
                 }
+
+                // Replace `src` by `dest` everywhere.
                 merges.insert(*src, *dest);
                 merged_locals.insert(*src);
                 merged_locals.insert(*dest);
+
+                // Update liveness information based on the merge we just performed.
+                // Every location where `src` was live, `dest` will be live.
+                live.union_rows(*src, *dest);
             }
             trace!(merging = ?merges);
 
@@ -234,12 +249,6 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
             round_count += 1;
 
             apply_merges(body, tcx, &merges, &merged_locals);
-        }
-
-        if round_count != 0 {
-            // Merging can introduce overlap between moved arguments and/or call destination in an
-            // unreachable code, which validator considers to be ill-formed.
-            remove_dead_blocks(tcx, body);
         }
 
         trace!(round_count);
@@ -252,8 +261,8 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
 /// frequently. Everything with a `&'alloc` lifetime points into here.
 #[derive(Default)]
 struct Allocations {
-    candidates: FxHashMap<Local, Vec<Local>>,
-    candidates_reverse: FxHashMap<Local, Vec<Local>>,
+    candidates: FxIndexMap<Local, Vec<Local>>,
+    candidates_reverse: FxIndexMap<Local, Vec<Local>>,
     write_info: WriteInfo,
     // PERF: Do this for `MaybeLiveLocals` allocations too.
 }
@@ -274,11 +283,11 @@ struct Candidates<'alloc> {
     ///
     /// We will still report that we would like to merge `_1` and `_2` in an attempt to allow us to
     /// remove that assignment.
-    c: &'alloc mut FxHashMap<Local, Vec<Local>>,
+    c: &'alloc mut FxIndexMap<Local, Vec<Local>>,
     /// A reverse index of the `c` set; if the `c` set contains `a => Place { local: b, proj }`,
     /// then this contains `b => a`.
     // PERF: Possibly these should be `SmallVec`s?
-    reverse: &'alloc mut FxHashMap<Local, Vec<Local>>,
+    reverse: &'alloc mut FxIndexMap<Local, Vec<Local>>,
 }
 
 //////////////////////////////////////////////////////////
@@ -289,7 +298,7 @@ struct Candidates<'alloc> {
 fn apply_merges<'tcx>(
     body: &mut Body<'tcx>,
     tcx: TyCtxt<'tcx>,
-    merges: &FxHashMap<Local, Local>,
+    merges: &FxIndexMap<Local, Local>,
     merged_locals: &BitSet<Local>,
 ) {
     let mut merger = Merger { tcx, merges, merged_locals };
@@ -298,7 +307,7 @@ fn apply_merges<'tcx>(
 
 struct Merger<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    merges: &'a FxHashMap<Local, Local>,
+    merges: &'a FxIndexMap<Local, Local>,
     merged_locals: &'a BitSet<Local>,
 }
 
@@ -353,14 +362,15 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Merger<'a, 'tcx> {
 
 struct FilterInformation<'a, 'body, 'alloc, 'tcx> {
     body: &'body Body<'tcx>,
-    live: &'a mut ResultsCursor<'body, 'tcx, MaybeLiveLocals>,
+    points: &'a DenseLocationMap,
+    live: &'a SparseIntervalMatrix<Local, PointIndex>,
     candidates: &'a mut Candidates<'alloc>,
     write_info: &'alloc mut WriteInfo,
     at: Location,
 }
 
 // We first implement some utility functions which we will expose removing candidates according to
-// different needs. Throughout the livenss filtering, the `candidates` are only ever accessed
+// different needs. Throughout the liveness filtering, the `candidates` are only ever accessed
 // through these methods, and not directly.
 impl<'alloc> Candidates<'alloc> {
     /// Just `Vec::retain`, but the condition is inverted and we add debugging output
@@ -381,7 +391,7 @@ impl<'alloc> Candidates<'alloc> {
 
     /// `vec_filter_candidates` but for an `Entry`
     fn entry_filter_candidates(
-        mut entry: OccupiedEntry<'_, Local, Vec<Local>>,
+        mut entry: IndexOccupiedEntry<'_, Local, Vec<Local>>,
         p: Local,
         f: impl FnMut(Local) -> CandidateFilter,
         at: Location,
@@ -389,7 +399,8 @@ impl<'alloc> Candidates<'alloc> {
         let candidates = entry.get_mut();
         Self::vec_filter_candidates(p, candidates, f, at);
         if candidates.len() == 0 {
-            entry.remove();
+            // FIXME(#120456) - is `swap_remove` correct?
+            entry.swap_remove();
         }
     }
 
@@ -401,7 +412,7 @@ impl<'alloc> Candidates<'alloc> {
         at: Location,
     ) {
         // Cover the cases where `p` appears as a `src`
-        if let Entry::Occupied(entry) = self.c.entry(p) {
+        if let IndexEntry::Occupied(entry) = self.c.entry(p) {
             Self::entry_filter_candidates(entry, p, &mut f, at);
         }
         // And the cases where `p` appears as a `dest`
@@ -414,7 +425,7 @@ impl<'alloc> Candidates<'alloc> {
             if f(*src) == CandidateFilter::Keep {
                 return true;
             }
-            let Entry::Occupied(entry) = self.c.entry(*src) else {
+            let IndexEntry::Occupied(entry) = self.c.entry(*src) else {
                 return false;
             };
             Self::entry_filter_candidates(
@@ -456,12 +467,14 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
     /// locals as also being read from.
     fn filter_liveness<'b>(
         candidates: &mut Candidates<'alloc>,
-        live: &mut ResultsCursor<'b, 'tcx, MaybeLiveLocals>,
+        points: &DenseLocationMap,
+        live: &SparseIntervalMatrix<Local, PointIndex>,
         write_info_alloc: &'alloc mut WriteInfo,
         body: &'b Body<'tcx>,
     ) {
         let mut this = FilterInformation {
             body,
+            points,
             live,
             candidates,
             // We don't actually store anything at this scope, we just keep things here to be able
@@ -476,13 +489,11 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
     fn internal_filter_liveness(&mut self) {
         for (block, data) in traversal::preorder(self.body) {
             self.at = Location { block, statement_index: data.statements.len() };
-            self.live.seek_after_primary_effect(self.at);
             self.write_info.for_terminator(&data.terminator().kind);
             self.apply_conflicts();
 
             for (i, statement) in data.statements.iter().enumerate().rev() {
                 self.at = Location { block, statement_index: i };
-                self.live.seek_after_primary_effect(self.at);
                 self.write_info.for_statement(&statement.kind, self.body);
                 self.apply_conflicts();
             }
@@ -501,6 +512,7 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
                     None
                 }
             });
+            let at = self.points.point_from_location(self.at);
             self.candidates.filter_candidates_by(
                 *p,
                 |q| {
@@ -512,7 +524,7 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
                     // calls or inline asm. Because of this, we also mark locals as
                     // conflicting when both of them are written to in the same
                     // statement.
-                    if self.live.contains(q) || writes.contains(&q) {
+                    if self.live.contains(q, at) || writes.contains(&q) {
                         CandidateFilter::Remove
                     } else {
                         CandidateFilter::Keep
@@ -552,7 +564,7 @@ impl WriteInfo {
                     | Rvalue::ShallowInitBox(op, _) => {
                         self.add_operand(op);
                     }
-                    Rvalue::BinaryOp(_, ops) | Rvalue::CheckedBinaryOp(_, ops) => {
+                    Rvalue::BinaryOp(_, ops) => {
                         for op in [&ops.0, &ops.1] {
                             self.add_operand(op);
                         }
@@ -582,7 +594,8 @@ impl WriteInfo {
             | StatementKind::Nop
             | StatementKind::Coverage(_)
             | StatementKind::StorageLive(_)
-            | StatementKind::StorageDead(_) => (),
+            | StatementKind::StorageDead(_)
+            | StatementKind::PlaceMention(_) => (),
             StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
                 bug!("{:?} not found in this MIR phase", statement)
             }
@@ -595,9 +608,7 @@ impl WriteInfo {
         rhs: &Operand<'tcx>,
         body: &Body<'tcx>,
     ) {
-        let Some(rhs) = rhs.place() else {
-            return
-        };
+        let Some(rhs) = rhs.place() else { return };
         if let Some(pair) = places_to_candidate_pair(lhs, rhs, body) {
             self.skip_pair = Some(pair);
         }
@@ -614,7 +625,7 @@ impl WriteInfo {
                 self.add_place(*destination);
                 self.add_operand(func);
                 for arg in args {
-                    self.add_operand(arg);
+                    self.add_operand(&arg.node);
                 }
             }
             TerminatorKind::InlineAsm { operands, .. } => {
@@ -638,21 +649,21 @@ impl WriteInfo {
                         }
                         InlineAsmOperand::Const { .. }
                         | InlineAsmOperand::SymFn { .. }
-                        | InlineAsmOperand::SymStatic { .. } => (),
+                        | InlineAsmOperand::SymStatic { .. }
+                        | InlineAsmOperand::Label { .. } => {}
                     }
                 }
             }
             TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume { .. }
-            | TerminatorKind::Abort { .. }
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable { .. } => (),
             TerminatorKind::Drop { .. } => {
                 // `Drop`s create a `&mut` and so are not considered
             }
-            TerminatorKind::DropAndReplace { .. }
-            | TerminatorKind::Yield { .. }
-            | TerminatorKind::GeneratorDrop
+            TerminatorKind::Yield { .. }
+            | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {
                 bug!("{:?} not found in this MIR phase", terminator)
@@ -725,8 +736,8 @@ fn places_to_candidate_pair<'tcx>(
 fn find_candidates<'alloc, 'tcx>(
     body: &Body<'tcx>,
     borrowed: &BitSet<Local>,
-    candidates: &'alloc mut FxHashMap<Local, Vec<Local>>,
-    candidates_reverse: &'alloc mut FxHashMap<Local, Vec<Local>>,
+    candidates: &'alloc mut FxIndexMap<Local, Vec<Local>>,
+    candidates_reverse: &'alloc mut FxIndexMap<Local, Vec<Local>>,
 ) -> Candidates<'alloc> {
     candidates.clear();
     candidates_reverse.clear();
@@ -748,7 +759,7 @@ fn find_candidates<'alloc, 'tcx>(
 
 struct FindAssignments<'a, 'alloc, 'tcx> {
     body: &'a Body<'tcx>,
-    candidates: &'alloc mut FxHashMap<Local, Vec<Local>>,
+    candidates: &'alloc mut FxIndexMap<Local, Vec<Local>>,
     borrowed: &'a BitSet<Local>,
 }
 
@@ -763,9 +774,19 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
                 return;
             };
 
-            // As described at the top of the file, we do not go near things that have their address
-            // taken.
+            // As described at the top of the file, we do not go near things that have
+            // their address taken.
             if self.borrowed.contains(src) || self.borrowed.contains(dest) {
+                return;
+            }
+
+            // As described at the top of this file, we do not touch locals which have
+            // different types.
+            let src_ty = self.body.local_decls()[src].ty;
+            let dest_ty = self.body.local_decls()[dest].ty;
+            if src_ty != dest_ty {
+                // FIXME(#112651): This can be removed afterwards. Also update the module description.
+                trace!("skipped `{src:?} = {dest:?}` due to subtyping: {src_ty} != {dest_ty}");
                 return;
             }
 
@@ -787,7 +808,7 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
 fn is_local_required(local: Local, body: &Body<'_>) -> bool {
     match body.local_kind(local) {
         LocalKind::Arg | LocalKind::ReturnPointer => true,
-        LocalKind::Var | LocalKind::Temp => false,
+        LocalKind::Temp => false,
     }
 }
 
@@ -797,38 +818,17 @@ fn is_local_required(local: Local, body: &Body<'_>) -> bool {
 fn dest_prop_mir_dump<'body, 'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &'body Body<'tcx>,
-    live: &mut ResultsCursor<'body, 'tcx, MaybeLiveLocals>,
+    points: &DenseLocationMap,
+    live: &SparseIntervalMatrix<Local, PointIndex>,
     round: usize,
 ) {
-    let mut reachable = None;
+    let locals_live_at = |location| {
+        let location = points.point_from_location(location);
+        live.rows().filter(|&r| live.contains(r, location)).collect::<Vec<_>>()
+    };
     dump_mir(tcx, false, "DestinationPropagation-dataflow", &round, body, |pass_where, w| {
-        let reachable = reachable.get_or_insert_with(|| traversal::reachable_as_bitset(body));
-
-        match pass_where {
-            PassWhere::BeforeLocation(loc) if reachable.contains(loc.block) => {
-                live.seek_after_primary_effect(loc);
-                writeln!(w, "        // live: {:?}", live.get())?;
-            }
-            PassWhere::AfterTerminator(bb) if reachable.contains(bb) => {
-                let loc = body.terminator_loc(bb);
-                live.seek_before_primary_effect(loc);
-                writeln!(w, "        // live: {:?}", live.get())?;
-            }
-
-            PassWhere::BeforeBlock(bb) if reachable.contains(bb) => {
-                live.seek_to_block_start(bb);
-                writeln!(w, "    // live: {:?}", live.get())?;
-            }
-
-            PassWhere::BeforeCFG | PassWhere::AfterCFG | PassWhere::AfterLocation(_) => {}
-
-            PassWhere::BeforeLocation(_) | PassWhere::AfterTerminator(_) => {
-                writeln!(w, "        // live: <unreachable>")?;
-            }
-
-            PassWhere::BeforeBlock(_) => {
-                writeln!(w, "    // live: <unreachable>")?;
-            }
+        if let PassWhere::BeforeLocation(loc) = pass_where {
+            writeln!(w, "        // live: {:?}", locals_live_at(loc))?;
         }
 
         Ok(())

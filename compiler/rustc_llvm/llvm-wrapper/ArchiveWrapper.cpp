@@ -39,6 +39,7 @@ enum class LLVMRustArchiveKind {
   BSD,
   DARWIN,
   COFF,
+  AIX_BIG,
 };
 
 static Archive::Kind fromRust(LLVMRustArchiveKind Kind) {
@@ -51,6 +52,8 @@ static Archive::Kind fromRust(LLVMRustArchiveKind Kind) {
     return Archive::K_DARWIN;
   case LLVMRustArchiveKind::COFF:
     return Archive::K_COFF;
+  case LLVMRustArchiveKind::AIX_BIG:
+    return Archive::K_AIXBIG;
   default:
     report_fatal_error("Bad ArchiveKind.");
   }
@@ -64,7 +67,7 @@ typedef RustArchiveIterator *LLVMRustArchiveIteratorRef;
 
 extern "C" LLVMRustArchiveRef LLVMRustOpenArchive(char *Path) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> BufOr =
-      MemoryBuffer::getFile(Path, -1, false);
+      MemoryBuffer::getFile(Path, /*IsText*/false, /*RequiresNullTerminator=*/false);
   if (!BufOr) {
     LLVMRustSetLastError(BufOr.getError().message().c_str());
     return nullptr;
@@ -144,7 +147,7 @@ LLVMRustArchiveChildName(LLVMRustArchiveChildConstRef Child, size_t *Size) {
   Expected<StringRef> NameOrErr = Child->getName();
   if (!NameOrErr) {
     // rustc_codegen_llvm currently doesn't use this error string, but it might be
-    // useful in the future, and in the mean time this tells LLVM that the
+    // useful in the future, and in the meantime this tells LLVM that the
     // error was not ignored and that it shouldn't abort the process.
     LLVMRustSetLastError(toString(NameOrErr.takeError()).c_str());
     return nullptr;
@@ -172,7 +175,7 @@ extern "C" void LLVMRustArchiveMemberFree(LLVMRustArchiveMemberRef Member) {
 extern "C" LLVMRustResult
 LLVMRustWriteArchive(char *Dst, size_t NumMembers,
                      const LLVMRustArchiveMemberRef *NewMembers,
-                     bool WriteSymbtab, LLVMRustArchiveKind RustKind) {
+                     bool WriteSymbtab, LLVMRustArchiveKind RustKind, bool isEC) {
 
   std::vector<NewArchiveMember> Members;
   auto Kind = fromRust(RustKind);
@@ -200,7 +203,12 @@ LLVMRustWriteArchive(char *Dst, size_t NumMembers,
     }
   }
 
+#if LLVM_VERSION_LT(18, 0)
   auto Result = writeArchive(Dst, Members, WriteSymbtab, Kind, true, false);
+#else
+  auto SymtabMode = WriteSymbtab ? SymtabWritingMode::NormalSymtab : SymtabWritingMode::NoSymtab;
+  auto Result = writeArchive(Dst, Members, SymtabMode, Kind, true, false, nullptr, isEC);
+#endif
   if (!Result)
     return LLVMRustResult::Success;
   LLVMRustSetLastError(toString(std::move(Result)).c_str());

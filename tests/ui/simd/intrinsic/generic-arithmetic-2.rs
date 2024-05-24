@@ -1,6 +1,6 @@
-// build-fail
+//@ build-fail
 
-#![feature(repr_simd, platform_intrinsics)]
+#![feature(repr_simd, intrinsics)]
 #![allow(non_camel_case_types)]
 #[repr(simd)]
 #[derive(Copy, Clone)]
@@ -14,7 +14,7 @@ pub struct u32x4(pub u32, pub u32, pub u32, pub u32);
 #[derive(Copy, Clone)]
 pub struct f32x4(pub f32, pub f32, pub f32, pub f32);
 
-extern "platform-intrinsic" {
+extern "rust-intrinsic" {
     fn simd_add<T>(x: T, y: T) -> T;
     fn simd_sub<T>(x: T, y: T) -> T;
     fn simd_mul<T>(x: T, y: T) -> T;
@@ -27,6 +27,11 @@ extern "platform-intrinsic" {
     fn simd_xor<T>(x: T, y: T) -> T;
 
     fn simd_neg<T>(x: T) -> T;
+    fn simd_bswap<T>(x: T) -> T;
+    fn simd_bitreverse<T>(x: T) -> T;
+    fn simd_ctlz<T>(x: T) -> T;
+    fn simd_ctpop<T>(x: T) -> T;
+    fn simd_cttz<T>(x: T) -> T;
 }
 
 fn main() {
@@ -64,7 +69,14 @@ fn main() {
 
         simd_neg(x);
         simd_neg(z);
-
+        simd_bswap(x);
+        simd_bswap(y);
+        simd_bitreverse(x);
+        simd_bitreverse(y);
+        simd_ctlz(x);
+        simd_ctlz(y);
+        simd_cttz(x);
+        simd_cttz(y);
 
         simd_add(0, 0);
         //~^ ERROR expected SIMD input type, found non-SIMD `i32`
@@ -87,17 +99,34 @@ fn main() {
 
         simd_neg(0);
         //~^ ERROR expected SIMD input type, found non-SIMD `i32`
-
+        simd_bswap(0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
+        simd_bitreverse(0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
+        simd_ctlz(0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
+        simd_cttz(0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
 
         simd_shl(z, z);
-//~^ ERROR unsupported operation on `f32x4` with element `f32`
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_shr(z, z);
-//~^ ERROR unsupported operation on `f32x4` with element `f32`
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_and(z, z);
-//~^ ERROR unsupported operation on `f32x4` with element `f32`
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_or(z, z);
-//~^ ERROR unsupported operation on `f32x4` with element `f32`
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_xor(z, z);
-//~^ ERROR unsupported operation on `f32x4` with element `f32`
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_bswap(z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_bitreverse(z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_ctlz(z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_ctpop(z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_cttz(z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
     }
 }

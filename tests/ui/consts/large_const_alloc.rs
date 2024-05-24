@@ -1,4 +1,4 @@
-// only-64bit
+//@ only-64bit
 // on 32bit and 16bit platforms it is plausible that the maximum allocation size will succeed
 
 const FOO: () = {
@@ -13,6 +13,6 @@ static FOO2: () = {
 };
 
 fn main() {
-    let _ = FOO;
-    let _ = FOO2;
+    FOO;
+    FOO2;
 }

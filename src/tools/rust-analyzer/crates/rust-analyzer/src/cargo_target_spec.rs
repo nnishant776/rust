@@ -3,8 +3,9 @@
 use std::mem;
 
 use cfg::{CfgAtom, CfgExpr};
-use ide::{Cancellable, FileId, RunnableKind, TestId};
-use project_model::{self, CargoFeatures, ManifestPath, TargetKind};
+use ide::{Cancellable, CrateId, FileId, RunnableKind, TestId};
+use project_model::{CargoFeatures, ManifestPath, TargetKind};
+use rustc_hash::FxHashSet;
 use vfs::AbsPathBuf;
 
 use crate::global_state::GlobalStateSnapshot;
@@ -20,7 +21,9 @@ pub(crate) struct CargoTargetSpec {
     pub(crate) package: String,
     pub(crate) target: String,
     pub(crate) target_kind: TargetKind,
+    pub(crate) crate_id: CrateId,
     pub(crate) required_features: Vec<String>,
+    pub(crate) features: FxHashSet<String>,
 }
 
 impl CargoTargetSpec {
@@ -30,65 +33,68 @@ impl CargoTargetSpec {
         kind: &RunnableKind,
         cfg: &Option<CfgExpr>,
     ) -> (Vec<String>, Vec<String>) {
-        let mut args = Vec::new();
-        let mut extra_args = Vec::new();
+        let extra_test_binary_args = snap.config.runnables().extra_test_binary_args;
+
+        let mut cargo_args = Vec::new();
+        let mut executable_args = Vec::new();
 
         match kind {
             RunnableKind::Test { test_id, attr } => {
-                args.push("test".to_owned());
-                extra_args.push(test_id.to_string());
+                cargo_args.push("test".to_owned());
+                executable_args.push(test_id.to_string());
                 if let TestId::Path(_) = test_id {
-                    extra_args.push("--exact".to_owned());
+                    executable_args.push("--exact".to_owned());
                 }
-                extra_args.push("--nocapture".to_owned());
+                executable_args.extend(extra_test_binary_args);
                 if attr.ignore {
-                    extra_args.push("--ignored".to_owned());
+                    executable_args.push("--ignored".to_owned());
                 }
             }
             RunnableKind::TestMod { path } => {
-                args.push("test".to_owned());
-                extra_args.push(path.clone());
-                extra_args.push("--nocapture".to_owned());
+                cargo_args.push("test".to_owned());
+                executable_args.push(path.clone());
+                executable_args.extend(extra_test_binary_args);
             }
             RunnableKind::Bench { test_id } => {
-                args.push("bench".to_owned());
-                extra_args.push(test_id.to_string());
+                cargo_args.push("bench".to_owned());
+                executable_args.push(test_id.to_string());
                 if let TestId::Path(_) = test_id {
-                    extra_args.push("--exact".to_owned());
+                    executable_args.push("--exact".to_owned());
                 }
-                extra_args.push("--nocapture".to_owned());
+                executable_args.extend(extra_test_binary_args);
             }
             RunnableKind::DocTest { test_id } => {
-                args.push("test".to_owned());
-                args.push("--doc".to_owned());
-                extra_args.push(test_id.to_string());
-                extra_args.push("--nocapture".to_owned());
+                cargo_args.push("test".to_owned());
+                cargo_args.push("--doc".to_owned());
+                executable_args.push(test_id.to_string());
+                executable_args.extend(extra_test_binary_args);
             }
             RunnableKind::Bin => {
                 let subcommand = match spec {
                     Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => "test",
                     _ => "run",
                 };
-                args.push(subcommand.to_owned());
+                cargo_args.push(subcommand.to_owned());
             }
         }
 
-        let target_required_features = if let Some(mut spec) = spec {
+        let (allowed_features, target_required_features) = if let Some(mut spec) = spec {
+            let allowed_features = mem::take(&mut spec.features);
             let required_features = mem::take(&mut spec.required_features);
-            spec.push_to(&mut args, kind);
-            required_features
+            spec.push_to(&mut cargo_args, kind);
+            (allowed_features, required_features)
         } else {
-            Vec::new()
+            (Default::default(), Default::default())
         };
 
         let cargo_config = snap.config.cargo();
 
         match &cargo_config.features {
             CargoFeatures::All => {
-                args.push("--all-features".to_owned());
+                cargo_args.push("--all-features".to_owned());
                 for feature in target_required_features {
-                    args.push("--features".to_owned());
-                    args.push(feature);
+                    cargo_args.push("--features".to_owned());
+                    cargo_args.push(feature);
                 }
             }
             CargoFeatures::Selected { features, no_default_features } => {
@@ -97,21 +103,23 @@ impl CargoTargetSpec {
                     required_features(cfg, &mut feats);
                 }
 
-                feats.extend(features.iter().cloned());
+                feats.extend(
+                    features.iter().filter(|&feat| allowed_features.contains(feat)).cloned(),
+                );
                 feats.extend(target_required_features);
 
                 feats.dedup();
                 for feature in feats {
-                    args.push("--features".to_owned());
-                    args.push(feature);
+                    cargo_args.push("--features".to_owned());
+                    cargo_args.push(feature);
                 }
 
                 if *no_default_features {
-                    args.push("--no-default-features".to_owned());
+                    cargo_args.push("--no-default-features".to_owned());
                 }
             }
         }
-        (args, extra_args)
+        (cargo_args, executable_args)
     }
 
     pub(crate) fn for_file(
@@ -136,6 +144,8 @@ impl CargoTargetSpec {
             target: target_data.name.clone(),
             target_kind: target_data.kind,
             required_features: target_data.required_features.clone(),
+            features: package_data.features.keys().cloned().collect(),
+            crate_id,
         };
 
         Ok(Some(res))
@@ -166,7 +176,7 @@ impl CargoTargetSpec {
                 buf.push("--example".to_owned());
                 buf.push(self.target);
             }
-            TargetKind::Lib => {
+            TargetKind::Lib { is_proc_macro: _ } => {
                 buf.push("--lib".to_owned());
             }
             TargetKind::Other | TargetKind::BuildScript => (),
@@ -200,8 +210,8 @@ fn required_features(cfg_expr: &CfgExpr, features: &mut Vec<String>) {
 mod tests {
     use super::*;
 
-    use cfg::CfgExpr;
-    use mbe::syntax_node_to_token_tree;
+    use ide::Edition;
+    use mbe::{syntax_node_to_token_tree, DocCommentDesugarMode, DummyTestSpanMap, DUMMY};
     use syntax::{
         ast::{self, AstNode},
         SmolStr,
@@ -209,9 +219,14 @@ mod tests {
 
     fn check(cfg: &str, expected_features: &[&str]) {
         let cfg_expr = {
-            let source_file = ast::SourceFile::parse(cfg).ok().unwrap();
+            let source_file = ast::SourceFile::parse(cfg, Edition::CURRENT).ok().unwrap();
             let tt = source_file.syntax().descendants().find_map(ast::TokenTree::cast).unwrap();
-            let (tt, _) = syntax_node_to_token_tree(tt.syntax());
+            let tt = syntax_node_to_token_tree(
+                tt.syntax(),
+                &DummyTestSpanMap,
+                DUMMY,
+                DocCommentDesugarMode::Mbe,
+            );
             CfgExpr::parse(&tt)
         };
 

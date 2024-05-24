@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 // Test that static methods can be invoked on `type` aliases
 
 #![allow(unused_variables)]
@@ -18,8 +18,8 @@ pub mod foo {
 fn main() {
 
     type Ham = foo::bar::baz::Qux;
-    let foo = foo::bar::baz::Qux::new();  // invoke directly
-    let bar = Ham::new();                 // invoke via type alias
+    let foo: () = foo::bar::baz::Qux::new();  // invoke directly
+    let bar: () = Ham::new();                 // invoke via type alias
 
     type StringVec = Vec<String>;
     let sv = StringVec::new();

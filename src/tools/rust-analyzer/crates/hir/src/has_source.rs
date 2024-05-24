@@ -1,17 +1,20 @@
 //! Provides set of implementation for hir's objects that allows get back location in file.
 
+use base_db::FileId;
 use either::Either;
 use hir_def::{
     nameres::{ModuleOrigin, ModuleSource},
     src::{HasChildSource, HasSource as _},
     Lookup, MacroId, VariantId,
 };
-use hir_expand::InFile;
+use hir_expand::{HirFileId, InFile};
 use syntax::ast;
+use tt::TextRange;
 
 use crate::{
-    db::HirDatabase, Adt, Const, Enum, Field, FieldSource, Function, Impl, LifetimeParam, Macro,
-    Module, Static, Struct, Trait, TypeAlias, TypeOrConstParam, Union, Variant,
+    db::HirDatabase, Adt, Const, Enum, ExternCrateDecl, Field, FieldSource, Function, Impl,
+    LifetimeParam, LocalSource, Macro, Module, Static, Struct, Trait, TraitAlias, TypeAlias,
+    TypeOrConstParam, Union, Variant,
 };
 
 pub trait HasSource {
@@ -19,6 +22,10 @@ pub trait HasSource {
     /// Fetches the definition's source node.
     /// Using [`crate::Semantics::source`] is preferred when working with [`crate::Semantics`],
     /// as that caches the parsed file in the semantics' cache.
+    ///
+    /// The current some implementations can return `InFile` instead of `Option<InFile>`.
+    /// But we made this method `Option` to support rlib in the future
+    /// by https://github.com/rust-lang/rust-analyzer/issues/6913
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>>;
 }
 
@@ -31,11 +38,32 @@ impl Module {
         def_map[self.id.local_id].definition_source(db.upcast())
     }
 
+    /// Returns a node which defines this module. That is, a file or a `mod foo {}` with items.
+    pub fn definition_source_range(self, db: &dyn HirDatabase) -> InFile<TextRange> {
+        let def_map = self.id.def_map(db.upcast());
+        def_map[self.id.local_id].definition_source_range(db.upcast())
+    }
+
+    pub fn definition_source_file_id(self, db: &dyn HirDatabase) -> HirFileId {
+        let def_map = self.id.def_map(db.upcast());
+        def_map[self.id.local_id].definition_source_file_id()
+    }
+
     pub fn is_mod_rs(self, db: &dyn HirDatabase) -> bool {
         let def_map = self.id.def_map(db.upcast());
         match def_map[self.id.local_id].origin {
             ModuleOrigin::File { is_mod_rs, .. } => is_mod_rs,
             _ => false,
+        }
+    }
+
+    pub fn as_source_file_id(self, db: &dyn HirDatabase) -> Option<FileId> {
+        let def_map = self.id.def_map(db.upcast());
+        match def_map[self.id.local_id].origin {
+            ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition, .. } => {
+                Some(definition)
+            }
+            _ => None,
         }
     }
 
@@ -49,6 +77,13 @@ impl Module {
     pub fn declaration_source(self, db: &dyn HirDatabase) -> Option<InFile<ast::Module>> {
         let def_map = self.id.def_map(db.upcast());
         def_map[self.id.local_id].declaration_source(db.upcast())
+    }
+
+    /// Returns a text range which declares this module, either a `mod foo;` or a `mod foo {}`.
+    /// `None` for the crate root.
+    pub fn declaration_source_range(self, db: &dyn HirDatabase) -> Option<InFile<TextRange>> {
+        let def_map = self.id.def_map(db.upcast());
+        def_map[self.id.local_id].declaration_source_range(db.upcast())
     }
 }
 
@@ -95,7 +130,7 @@ impl HasSource for Enum {
 impl HasSource for Variant {
     type Ast = ast::Variant;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<ast::Variant>> {
-        Some(self.parent.id.child_source(db.upcast()).map(|map| map[self.id].clone()))
+        Some(self.id.lookup(db.upcast()).source(db.upcast()))
     }
 }
 impl HasSource for Function {
@@ -118,6 +153,12 @@ impl HasSource for Static {
 }
 impl HasSource for Trait {
     type Ast = ast::Trait;
+    fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
+        Some(self.id.lookup(db.upcast()).source(db.upcast()))
+    }
+}
+impl HasSource for TraitAlias {
+    type Ast = ast::TraitAlias;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         Some(self.id.lookup(db.upcast()).source(db.upcast()))
     }
@@ -158,7 +199,7 @@ impl HasSource for Impl {
 }
 
 impl HasSource for TypeOrConstParam {
-    type Ast = Either<ast::TypeOrConstParam, ast::Trait>;
+    type Ast = Either<ast::TypeOrConstParam, ast::TraitOrAlias>;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         let child_source = self.id.parent.child_source(db.upcast());
         Some(child_source.map(|it| it[self.id.local_id].clone()))
@@ -170,5 +211,21 @@ impl HasSource for LifetimeParam {
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         let child_source = self.id.parent.child_source(db.upcast());
         Some(child_source.map(|it| it[self.id.local_id].clone()))
+    }
+}
+
+impl HasSource for LocalSource {
+    type Ast = Either<ast::IdentPat, ast::SelfParam>;
+
+    fn source(self, _: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
+        Some(self.source)
+    }
+}
+
+impl HasSource for ExternCrateDecl {
+    type Ast = ast::ExternCrate;
+
+    fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
+        Some(self.id.lookup(db.upcast()).source(db.upcast()))
     }
 }

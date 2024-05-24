@@ -1,4 +1,4 @@
-// revisions: full min
+//@ revisions: full min
 #![cfg_attr(full, feature(adt_const_params))]
 #![cfg_attr(full, allow(incomplete_features))]
 
@@ -7,7 +7,7 @@ struct B;
 impl A for B {}
 
 fn test<const T: &'static dyn A>() {
-    //[full]~^ ERROR must be annotated with `#[derive(PartialEq, Eq)]` to be used
+    //[full]~^ ERROR `&'static (dyn A + 'static)` can't be used as a const parameter type
     //[min]~^^ ERROR `&'static (dyn A + 'static)` is forbidden
     unimplemented!()
 }

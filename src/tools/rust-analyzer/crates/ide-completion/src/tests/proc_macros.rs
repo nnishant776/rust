@@ -29,11 +29,13 @@ fn main() {
             sn call   function(expr)
             sn dbg    dbg!(expr)
             sn dbgr   dbg!(&expr)
+            sn deref  *expr
             sn let    let
             sn letm   let mut
             sn match  match expr {}
             sn ref    &expr
             sn refm   &mut expr
+            sn return return expr
             sn unsafe unsafe {}
         "#]],
     )
@@ -60,11 +62,13 @@ fn main() {
             sn call   function(expr)
             sn dbg    dbg!(expr)
             sn dbgr   dbg!(&expr)
+            sn deref  *expr
             sn let    let
             sn letm   let mut
             sn match  match expr {}
             sn ref    &expr
             sn refm   &mut expr
+            sn return return expr
             sn unsafe unsafe {}
         "#]],
     )
@@ -81,7 +85,7 @@ impl Foo {
 }
 
 #[proc_macros::input_replace(
-    fn suprise() {
+    fn surprise() {
         Foo.$0
     }
 )]
@@ -93,11 +97,13 @@ fn main() {}
             sn call   function(expr)
             sn dbg    dbg!(expr)
             sn dbgr   dbg!(&expr)
+            sn deref  *expr
             sn let    let
             sn letm   let mut
             sn match  match expr {}
             sn ref    &expr
             sn refm   &mut expr
+            sn return return expr
             sn unsafe unsafe {}
         "#]],
     )
@@ -114,7 +120,7 @@ impl Foo {
 }
 
 #[proc_macros::input_replace(
-    fn suprise() {
+    fn surprise() {
         Foo.f$0
     }
 )]
@@ -126,11 +132,13 @@ fn main() {}
             sn call   function(expr)
             sn dbg    dbg!(expr)
             sn dbgr   dbg!(&expr)
+            sn deref  *expr
             sn let    let
             sn letm   let mut
             sn match  match expr {}
             sn ref    &expr
             sn refm   &mut expr
+            sn return return expr
             sn unsafe unsafe {}
         "#]],
     )

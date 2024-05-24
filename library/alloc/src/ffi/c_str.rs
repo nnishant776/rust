@@ -1,3 +1,5 @@
+//! [`CString`] and its related types.
+
 #[cfg(test)]
 mod tests;
 
@@ -11,7 +13,7 @@ use core::borrow::Borrow;
 use core::ffi::{c_char, CStr};
 use core::fmt;
 use core::mem;
-use core::num::NonZeroU8;
+use core::num::NonZero;
 use core::ops;
 use core::ptr;
 use core::slice;
@@ -39,6 +41,7 @@ use crate::sync::Arc;
 /// or anything that implements <code>[Into]<[Vec]<[u8]>></code> (for
 /// example, you can build a `CString` straight out of a [`String`] or
 /// a <code>&[str]</code>, since both implement that trait).
+/// You can create a `CString` from a literal with `CString::from(c"Text")`.
 ///
 /// The [`CString::new`] method will actually check that the provided <code>&[[u8]]</code>
 /// does not have 0 bytes in the middle, and return an error if it
@@ -406,7 +409,7 @@ impl CString {
                 fn strlen(s: *const c_char) -> usize;
             }
             let len = strlen(ptr) + 1; // Including the NUL byte
-            let slice = slice::from_raw_parts_mut(ptr, len as usize);
+            let slice = slice::from_raw_parts_mut(ptr, len);
             CString { inner: Box::from_raw(slice as *mut [c_char] as *mut [u8]) }
         }
     }
@@ -421,7 +424,7 @@ impl CString {
     /// Failure to call [`CString::from_raw`] will lead to a memory leak.
     ///
     /// The C side must **not** modify the length of the string (by writing a
-    /// `null` somewhere inside the string or removing the final one) before
+    /// nul byte somewhere inside the string or removing the final one) before
     /// it makes it back into Rust using [`CString::from_raw`]. See the safety section
     /// in [`CString::from_raw`].
     ///
@@ -795,22 +798,22 @@ impl From<Box<CStr>> for CString {
 }
 
 #[stable(feature = "cstring_from_vec_of_nonzerou8", since = "1.43.0")]
-impl From<Vec<NonZeroU8>> for CString {
-    /// Converts a <code>[Vec]<[NonZeroU8]></code> into a [`CString`] without
-    /// copying nor checking for inner null bytes.
+impl From<Vec<NonZero<u8>>> for CString {
+    /// Converts a <code>[Vec]<[NonZero]<[u8]>></code> into a [`CString`] without
+    /// copying nor checking for inner nul bytes.
     #[inline]
-    fn from(v: Vec<NonZeroU8>) -> CString {
+    fn from(v: Vec<NonZero<u8>>) -> CString {
         unsafe {
-            // Transmute `Vec<NonZeroU8>` to `Vec<u8>`.
+            // Transmute `Vec<NonZero<u8>>` to `Vec<u8>`.
             let v: Vec<u8> = {
                 // SAFETY:
-                //   - transmuting between `NonZeroU8` and `u8` is sound;
-                //   - `alloc::Layout<NonZeroU8> == alloc::Layout<u8>`.
-                let (ptr, len, cap): (*mut NonZeroU8, _, _) = Vec::into_raw_parts(v);
+                //   - transmuting between `NonZero<u8>` and `u8` is sound;
+                //   - `alloc::Layout<NonZero<u8>> == alloc::Layout<u8>`.
+                let (ptr, len, cap): (*mut NonZero<u8>, _, _) = Vec::into_raw_parts(v);
                 Vec::from_raw_parts(ptr.cast::<u8>(), len, cap)
             };
-            // SAFETY: `v` cannot contain null bytes, given the type-level
-            // invariant of `NonZeroU8`.
+            // SAFETY: `v` cannot contain nul bytes, given the type-level
+            // invariant of `NonZero<u8>`.
             Self::_from_vec_unchecked(v)
         }
     }
@@ -888,7 +891,7 @@ impl From<&CStr> for Arc<CStr> {
 #[stable(feature = "shared_from_slice2", since = "1.24.0")]
 impl From<CString> for Rc<CStr> {
     /// Converts a [`CString`] into an <code>[Rc]<[CStr]></code> by moving the [`CString`]
-    /// data into a new [`Arc`] buffer.
+    /// data into a new [`Rc`] buffer.
     #[inline]
     fn from(s: CString) -> Rc<CStr> {
         let rc: Rc<[u8]> = Rc::from(s.into_inner());
@@ -904,6 +907,19 @@ impl From<&CStr> for Rc<CStr> {
     fn from(s: &CStr) -> Rc<CStr> {
         let rc: Rc<[u8]> = Rc::from(s.to_bytes_with_nul());
         unsafe { Rc::from_raw(Rc::into_raw(rc) as *const CStr) }
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "more_rc_default_impls", since = "CURRENT_RUSTC_VERSION")]
+impl Default for Rc<CStr> {
+    /// Creates an empty CStr inside an Rc
+    ///
+    /// This may or may not share an allocation with other Rcs on the same thread.
+    #[inline]
+    fn default() -> Self {
+        let c_str: &CStr = Default::default();
+        Rc::from(c_str)
     }
 }
 
@@ -1024,6 +1040,8 @@ impl ToOwned for CStr {
 
 #[stable(feature = "cstring_asref", since = "1.7.0")]
 impl From<&CStr> for CString {
+    /// Converts a <code>&[CStr]</code> into a [`CString`]
+    /// by copying the contents into a new allocation.
     fn from(s: &CStr) -> CString {
         s.to_owned()
     }
@@ -1065,27 +1083,22 @@ impl CStr {
     ///
     /// # Examples
     ///
-    /// Calling `to_string_lossy` on a `CStr` containing valid UTF-8:
+    /// Calling `to_string_lossy` on a `CStr` containing valid UTF-8. The leading
+    /// `c` on the string literal denotes a `CStr`.
     ///
     /// ```
     /// use std::borrow::Cow;
-    /// use std::ffi::CStr;
     ///
-    /// let cstr = CStr::from_bytes_with_nul(b"Hello World\0")
-    ///                  .expect("CStr::from_bytes_with_nul failed");
-    /// assert_eq!(cstr.to_string_lossy(), Cow::Borrowed("Hello World"));
+    /// assert_eq!(c"Hello World".to_string_lossy(), Cow::Borrowed("Hello World"));
     /// ```
     ///
     /// Calling `to_string_lossy` on a `CStr` containing invalid UTF-8:
     ///
     /// ```
     /// use std::borrow::Cow;
-    /// use std::ffi::CStr;
     ///
-    /// let cstr = CStr::from_bytes_with_nul(b"Hello \xF0\x90\x80World\0")
-    ///                  .expect("CStr::from_bytes_with_nul failed");
     /// assert_eq!(
-    ///     cstr.to_string_lossy(),
+    ///     c"Hello \xF0\x90\x80World".to_string_lossy(),
     ///     Cow::Owned(String::from("Hello �World")) as Cow<'_, str>
     /// );
     /// ```

@@ -1,5 +1,4 @@
-// run-pass
-// ignore-pretty issue #37195
+//@ run-pass
 
 // Testing that the parser for each file tracks its modules
 // and paths independently. The load_another_mod module should

@@ -12,7 +12,6 @@ The [Fuchsia team]:
 - Tyler Mandry ([@tmandry](https://github.com/tmandry))
 - Dan Johnson ([@computerdruid](https://github.com/computerdruid))
 - David Koloski ([@djkoloski](https://github.com/djkoloski))
-- Andrew Pollack ([@andrewpollack](https://github.com/andrewpollack))
 - Joseph Ryan ([@P1n3appl3](https://github.com/P1n3appl3))
 
 As the team evolves over time, the specific members listed here may differ from
@@ -388,7 +387,7 @@ meta/hello_fuchsia.cm=pkg/meta/hello_fuchsia.cm
 ```
 
 *Note: Relative manifest paths are resolved starting from the working directory
-of `pm`. Make sure to fill out `<SDK_PATH>` with the path to the downloaded
+of `ffx`. Make sure to fill out `<SDK_PATH>` with the path to the downloaded
 SDK.*
 
 The `.manifest` file will be used to describe the contents of the package by
@@ -460,12 +459,10 @@ hello_fuchsia/
 Next, we'll build a package manifest as defined by our manifest:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm \
-    -api-level $(${SDK_PATH}/tools/${ARCH}/ffx version -v | grep "api-level" | head -1 |  awk -F ' ' '{print $2}') \
-    -o pkg/hello_fuchsia_manifest \
-    -m pkg/hello_fuchsia.manifest \
-    build \
-    -output-package-manifest pkg/hello_fuchsia_package_manifest
+${SDK_PATH}/tools/${ARCH}/ffx package build \
+    --api-level $(${SDK_PATH}/tools/${ARCH}/ffx --machine json version | jq .tool_version.api_level) \
+    --out pkg/hello_fuchsia_manifest \
+    pkg/hello_fuchsia.manifest
 ```
 
 This will produce `pkg/hello_fuchsia_manifest/` which is a package manifest we can
@@ -499,8 +496,7 @@ to.
 We can set up our repository with:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm newrepo \
-    -repo pkg/repo
+${SDK_PATH}/tools/${ARCH}/ffx repository create pkg/repo
 ```
 
 **Current directory structure**
@@ -524,17 +520,17 @@ hello_fuchsia/
 We can publish our new package to that repository with:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm publish \
-    -repo pkg/repo \
-    -lp -f <(echo "pkg/hello_fuchsia_package_manifest")
+${SDK_PATH}/tools/${ARCH}/ffx repository publish \
+    --package pkg/hello_fuchsia_package_manifest \
+    pkg/repo
 ```
 
 Then we can add the repository to `ffx`'s package server as `hello-fuchsia` using:
 
 ```sh
 ${SDK_PATH}/tools/${ARCH}/ffx repository add-from-pm \
-    pkg/repo \
-    -r hello-fuchsia
+    --repository hello-fuchsia \
+    pkg/repo
 ```
 
 ## Running a Fuchsia component on an emulator
@@ -682,28 +678,39 @@ local Rust source checkout:
 cd ${RUST_SRC_PATH}
 ```
 
-To run the Rust test suite on an emulated Fuchsia device, you must install the
-Rust compiler locally. See "[Targeting Fuchsia with a compiler built from source](#targeting-fuchsia-with-a-compiler-built-from-source)"
-for the steps to build locally.
+To run the Rust test suite on an emulated Fuchsia device, you'll also need to
+download a copy of the Fuchsia SDK. The current minimum supported SDK version is
+[20.20240412.3.1][minimum_supported_sdk_version].
 
-You'll also need to download a copy of the Fuchsia SDK. The current minimum
-supported SDK version is [10.20221207.2.89][minimum_supported_sdk_version].
-
-[minimum_supported_sdk_version]: https://chrome-infra-packages.appspot.com/p/fuchsia/sdk/core/linux-amd64/+/version:10.20221207.2.89
+[minimum_supported_sdk_version]: https://chrome-infra-packages.appspot.com/p/fuchsia/sdk/core/linux-amd64/+/version:20.20240412.3.1
 
 Fuchsia's test runner interacts with the Fuchsia emulator and is located at
-`src/ci/docker/scripts/fuchsia-test-runner.py`. We can use it to start our
-test environment with:
+`src/ci/docker/scripts/fuchsia-test-runner.py`. First, add the following
+variables to your existing `config-env.sh`:
 
 ```sh
-src/ci/docker/scripts/fuchsia-test-runner.py start
-    --rust ${RUST_SRC_PATH}/install
-    --sdk ${SDK_PATH}
-    --target {x86_64-unknown-fuchsia|aarch64-unknown-fuchsia}
+# TEST_TOOLCHAIN_TMP_DIR can point anywhere, but it:
+#  - must be less than 108 characters, otherwise qemu can't handle the path
+#  - must be consistent across calls to this file (don't use `mktemp -d` here)
+export TEST_TOOLCHAIN_TMP_DIR="/tmp/rust-tmp"
+
+# Keep existing contents of `config-env.sh` from earlier, including SDK_PATH
 ```
 
-Where `${RUST_SRC_PATH}/install` is the `prefix` set in `config.toml` and
-`${SDK_PATH}` is the path to the downloaded and unzipped SDK.
+We can then use the script to start our test environment with:
+
+```sh
+( \
+    source config-env.sh &&                                                   \
+    src/ci/docker/scripts/fuchsia-test-runner.py start                        \
+    --rust-build ${RUST_SRC_PATH}/build                                       \
+    --sdk ${SDK_PATH}                                                         \
+    --target {x86_64-unknown-fuchsia|aarch64-unknown-fuchsia}                 \
+    --verbose                                                                 \
+)
+```
+
+Where `${RUST_SRC_PATH}/build` is the `build-dir` set in `config.toml`.
 
 Once our environment is started, we can run our tests using `x.py` as usual. The
 test runner script will run the compiled tests on an emulated Fuchsia device. To
@@ -717,7 +724,7 @@ run the full `tests/ui` test suite:
     --stage=2                                                                 \
     test tests/ui                                                             \
     --target x86_64-unknown-fuchsia                                           \
-    --run=always --jobs 1                                                     \
+    --run=always                                                              \
     --test-args --target-rustcflags                                           \
     --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/sysroot/lib             \
     --test-args --target-rustcflags                                           \
@@ -728,9 +735,6 @@ run the full `tests/ui` test suite:
     --test-args src/ci/docker/scripts/fuchsia-test-runner.py                  \
 )
 ```
-
-*Note: The test suite cannot be run in parallel at the moment, so `x.py`
-must be run with `--jobs 1` to ensure only one test runs at a time.*
 
 By default, `x.py` compiles test binaries with `panic=unwind`. If you built your
 Rust toolchain with `-Cpanic=abort`, you need to tell `x.py` to compile test
@@ -908,7 +912,7 @@ through our `x.py` invocation. The full invocation is:
     --stage=2                                                                 \
     test tests/${TEST}                                                        \
     --target x86_64-unknown-fuchsia                                           \
-    --run=always --jobs 1                                                     \
+    --run=always                                                              \
     --test-args --target-rustcflags                                           \
     --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/sysroot/lib             \
     --test-args --target-rustcflags                                           \

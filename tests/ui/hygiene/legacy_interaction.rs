@@ -1,8 +1,7 @@
-// check-pass
+//@ check-pass
 #![allow(dead_code)]
-// ignore-pretty pretty-printing is unhygienic
 
-// aux-build:legacy_interaction.rs
+//@ aux-build:legacy_interaction.rs
 
 #![feature(decl_macro)]
 #[allow(unused)]

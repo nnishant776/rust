@@ -1,10 +1,10 @@
 //
 
-// compile-flags: -C no-prepopulate-passes
+//@ compile-flags: -C no-prepopulate-passes
 
 #![crate_type = "lib"]
 
-#![feature(repr_simd, platform_intrinsics)]
+#![feature(repr_simd, intrinsics)]
 #![allow(non_camel_case_types)]
 
 #[repr(simd)]
@@ -15,7 +15,7 @@ pub struct Vec2<T>(pub T, pub T);
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Vec4<T>(pub T, pub T, pub T, pub T);
 
-extern "platform-intrinsic" {
+extern "rust-intrinsic" {
     fn simd_gather<T, P, M>(value: T, pointers: P, mask: M) -> T;
 }
 
@@ -23,7 +23,7 @@ extern "platform-intrinsic" {
 #[no_mangle]
 pub unsafe fn gather_f32x2(pointers: Vec2<*const f32>, mask: Vec2<i32>,
                            values: Vec2<f32>) -> Vec2<f32> {
-    // CHECK: call <2 x float> @llvm.masked.gather.v2f32.{{.+}}(<2 x {{float\*|ptr}}> {{.*}}, i32 {{.*}}, <2 x i1> {{.*}}, <2 x float> {{.*}})
+    // CHECK: call <2 x float> @llvm.masked.gather.v2f32.v2p0(<2 x ptr> {{.*}}, i32 {{.*}}, <2 x i1> {{.*}}, <2 x float> {{.*}})
     simd_gather(values, pointers, mask)
 }
 
@@ -31,6 +31,6 @@ pub unsafe fn gather_f32x2(pointers: Vec2<*const f32>, mask: Vec2<i32>,
 #[no_mangle]
 pub unsafe fn gather_pf32x2(pointers: Vec2<*const *const f32>, mask: Vec2<i32>,
                            values: Vec2<*const f32>) -> Vec2<*const f32> {
-    // CHECK: call <2 x {{float\*|ptr}}> @llvm.masked.gather.{{.+}}(<2 x {{float\*\*|ptr}}> {{.*}}, i32 {{.*}}, <2 x i1> {{.*}}, <2 x {{float\*|ptr}}> {{.*}})
+    // CHECK: call <2 x ptr> @llvm.masked.gather.v2p0.v2p0(<2 x ptr> {{.*}}, i32 {{.*}}, <2 x i1> {{.*}}, <2 x ptr> {{.*}})
     simd_gather(values, pointers, mask)
 }

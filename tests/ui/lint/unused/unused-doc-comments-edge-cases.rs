@@ -20,10 +20,36 @@ fn doc_comment_between_if_else(num: u8) -> bool {
 }
 
 fn doc_comment_on_expr(num: u8) -> bool {
-    /// useless doc comment
+    (/// useless doc comment
     //~^ ERROR: attributes on expressions are experimental
     //~| ERROR: unused doc comment
-    num == 3
+    num) == 3
+}
+
+fn doc_comment_on_expr_field() -> bool {
+    struct S { foo: i32 }
+
+    let x = S {
+        /// useless doc comment
+        //~^ ERROR: unused doc comment
+        foo: 3
+    };
+
+    true
+}
+
+fn doc_comment_on_pat_field() -> bool {
+    struct S { foo: i32 }
+
+    let S {
+        /// useless doc comment
+        //~^ ERROR: unused doc comment
+        foo
+    } = S {
+        foo: 3
+    };
+
+    true
 }
 
 fn doc_comment_on_generic<#[doc = "x"] T>(val: T) {}

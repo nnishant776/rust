@@ -1,6 +1,6 @@
-// run-pass
+//@ run-pass
 #![allow(unreachable_code)]
-// compile-flags: --edition 2018
+//@ compile-flags: --edition 2018
 
 #![feature(try_blocks)]
 
@@ -8,7 +8,7 @@ fn main() {
     let mut a = 0;
     let () = {
         let _: Result<(), ()> = try {
-            let _ = Err(())?;
+            let () = Err(())?;
             return
         };
         a += 1;

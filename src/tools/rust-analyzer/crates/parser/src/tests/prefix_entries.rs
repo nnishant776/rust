@@ -6,7 +6,6 @@ fn vis() {
     check(PrefixEntryPoint::Vis, "fn foo() {}", "");
     check(PrefixEntryPoint::Vis, "pub(fn foo() {}", "pub");
     check(PrefixEntryPoint::Vis, "pub(crate fn foo() {}", "pub(crate");
-    check(PrefixEntryPoint::Vis, "crate fn foo() {}", "crate");
 }
 
 #[test]
@@ -33,8 +32,7 @@ fn stmt() {
 fn pat() {
     check(PrefixEntryPoint::Pat, "x y", "x");
     check(PrefixEntryPoint::Pat, "fn f() {}", "fn");
-    // FIXME: This one is wrong, we should consume only one pattern.
-    check(PrefixEntryPoint::Pat, ".. ..", ".. ..");
+    check(PrefixEntryPoint::Pat, ".. ..", "..");
 }
 
 #[test]
@@ -88,7 +86,7 @@ fn check(entry: PrefixEntryPoint, input: &str, prefix: &str) {
     let input = lexed.to_input();
 
     let mut n_tokens = 0;
-    for step in entry.parse(&input).iter() {
+    for step in entry.parse(&input, crate::Edition::CURRENT).iter() {
         match step {
             Step::Token { n_input_tokens, .. } => n_tokens += n_input_tokens as usize,
             Step::FloatSplit { .. } => n_tokens += 1,

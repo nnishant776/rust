@@ -3,6 +3,8 @@ use super::OverlapError;
 use crate::traits;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
+use rustc_macros::extension;
+use rustc_middle::bug;
 use rustc_middle::ty::fast_reject::{self, SimplifiedType, TreatParams};
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 
@@ -10,7 +12,7 @@ pub use rustc_middle::traits::specialization_graph::*;
 
 #[derive(Copy, Clone, Debug)]
 pub enum FutureCompatOverlapErrorKind {
-    Issue33140,
+    OrderDepTraitObjects,
     LeakCheck,
 }
 
@@ -21,6 +23,7 @@ pub struct FutureCompatOverlapError<'tcx> {
 }
 
 /// The result of attempting to insert an impl into a group of children.
+#[derive(Debug)]
 enum Inserted<'tcx> {
     /// The impl was inserted as a new child in this group of children.
     BecameNewSibling(Option<FutureCompatOverlapError<'tcx>>),
@@ -32,24 +35,13 @@ enum Inserted<'tcx> {
     ShouldRecurseOn(DefId),
 }
 
-trait ChildrenExt<'tcx> {
-    fn insert_blindly(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId);
-    fn remove_existing(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId);
-
-    fn insert(
-        &mut self,
-        tcx: TyCtxt<'tcx>,
-        impl_def_id: DefId,
-        simplified_self: Option<SimplifiedType>,
-        overlap_mode: OverlapMode,
-    ) -> Result<Inserted<'tcx>, OverlapError<'tcx>>;
-}
-
-impl<'tcx> ChildrenExt<'tcx> for Children {
+#[extension(trait ChildrenExt<'tcx>)]
+impl<'tcx> Children {
     /// Insert an impl into this set of children without comparing to any existing impls.
     fn insert_blindly(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().skip_binder();
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer)
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey)
         {
             debug!("insert_blindly: impl_def_id={:?} st={:?}", impl_def_id, st);
             self.non_blanket_impls.entry(st).or_default().push(impl_def_id)
@@ -65,7 +57,8 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
     fn remove_existing(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().skip_binder();
         let vec: &mut Vec<DefId>;
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer)
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey)
         {
             debug!("remove_existing: impl_def_id={:?} st={:?}", impl_def_id, st);
             vec = self.non_blanket_impls.get_mut(&st).unwrap();
@@ -80,6 +73,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
 
     /// Attempt to insert an impl into this set of children, while comparing for
     /// specialization relationships.
+    #[instrument(level = "debug", skip(self, tcx), ret)]
     fn insert(
         &mut self,
         tcx: TyCtxt<'tcx>,
@@ -90,18 +84,13 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
         let mut last_lint = None;
         let mut replace_children = Vec::new();
 
-        debug!("insert(impl_def_id={:?}, simplified_self={:?})", impl_def_id, simplified_self,);
-
         let possible_siblings = match simplified_self {
             Some(st) => PotentialSiblings::Filtered(filtered_children(self, st)),
             None => PotentialSiblings::Unfiltered(iter_children(self)),
         };
 
         for possible_sibling in possible_siblings {
-            debug!(
-                "insert: impl_def_id={:?}, simplified_self={:?}, possible_sibling={:?}",
-                impl_def_id, simplified_self, possible_sibling,
-            );
+            debug!(?possible_sibling);
 
             let create_overlap_error = |overlap: traits::coherence::OverlapResult<'tcx>| {
                 let trait_ref = overlap.impl_header.trait_ref.unwrap();
@@ -116,6 +105,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
                     self_ty: self_ty.has_concrete_skeleton().then_some(self_ty),
                     intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
                     involves_placeholder: overlap.involves_placeholder,
+                    overflowing_predicates: overlap.overflowing_predicates,
                 }
             };
 
@@ -161,10 +151,10 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
                 {
                     match overlap_kind {
                         ty::ImplOverlapKind::Permitted { marker: _ } => {}
-                        ty::ImplOverlapKind::Issue33140 => {
+                        ty::ImplOverlapKind::FutureCompatOrderDepTraitObjects => {
                             *last_lint_mut = Some(FutureCompatOverlapError {
                                 error: create_overlap_error(overlap),
-                                kind: FutureCompatOverlapErrorKind::Issue33140,
+                                kind: FutureCompatOverlapErrorKind::OrderDepTraitObjects,
                             });
                         }
                     }
@@ -181,7 +171,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
             if le && !ge {
                 debug!(
                     "descending as child of TraitRef {:?}",
-                    tcx.impl_trait_ref(possible_sibling).unwrap().subst_identity()
+                    tcx.impl_trait_ref(possible_sibling).unwrap().instantiate_identity()
                 );
 
                 // The impl specializes `possible_sibling`.
@@ -189,7 +179,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
             } else if ge && !le {
                 debug!(
                     "placing as parent of TraitRef {:?}",
-                    tcx.impl_trait_ref(possible_sibling).unwrap().subst_identity()
+                    tcx.impl_trait_ref(possible_sibling).unwrap().instantiate_identity()
                 );
 
                 replace_children.push(possible_sibling);
@@ -210,7 +200,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
     }
 }
 
-fn iter_children(children: &mut Children) -> impl Iterator<Item = DefId> + '_ {
+fn iter_children(children: &Children) -> impl Iterator<Item = DefId> + '_ {
     let nonblanket = children.non_blanket_impls.iter().flat_map(|(_, v)| v.iter());
     children.blanket_impls.iter().chain(nonblanket).cloned()
 }
@@ -248,22 +238,8 @@ where
     }
 }
 
-pub trait GraphExt<'tcx> {
-    /// Insert a local impl into the specialization graph. If an existing impl
-    /// conflicts with it (has overlap, but neither specializes the other),
-    /// information about the area of overlap is returned in the `Err`.
-    fn insert(
-        &mut self,
-        tcx: TyCtxt<'tcx>,
-        impl_def_id: DefId,
-        overlap_mode: OverlapMode,
-    ) -> Result<Option<FutureCompatOverlapError<'tcx>>, OverlapError<'tcx>>;
-
-    /// Insert cached metadata mapping from a child impl back to its parent.
-    fn record_impl_from_cstore(&mut self, tcx: TyCtxt<'tcx>, parent: DefId, child: DefId);
-}
-
-impl<'tcx> GraphExt<'tcx> for Graph {
+#[extension(pub trait GraphExt<'tcx>)]
+impl<'tcx> Graph {
     /// Insert a local impl into the specialization graph. If an existing impl
     /// conflicts with it (has overlap, but neither specializes the other),
     /// information about the area of overlap is returned in the `Err`.
@@ -302,7 +278,8 @@ impl<'tcx> GraphExt<'tcx> for Graph {
 
         let mut parent = trait_def_id;
         let mut last_lint = None;
-        let simplified = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer);
+        let simplified =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey);
 
         // Descend the specialization tree, where `parent` is the current parent node.
         loop {
@@ -421,7 +398,7 @@ pub(crate) fn assoc_def(
         // associated type. Normally this situation
         // could only arise through a compiler bug --
         // if the user wrote a bad item name, it
-        // should have failed in astconv.
+        // should have failed during HIR ty lowering.
         bug!(
             "No associated type `{}` for {}",
             tcx.item_name(assoc_def_id),

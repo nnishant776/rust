@@ -1,18 +1,21 @@
-// ignore-arm
-// ignore-aarch64
-// ignore-wasm
-// ignore-emscripten
-// ignore-mips
-// ignore-mips64
-// ignore-powerpc
-// ignore-powerpc64
-// ignore-powerpc64le
-// ignore-riscv64
-// ignore-s390x
-// ignore-sparc
-// ignore-sparc64
+//@ only-x86_64
 
 #![warn(unused_attributes)]
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+extern crate alloc;
+//~^ NOTE not a function
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+use alloc::alloc::alloc;
+//~^ NOTE not a function
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+extern "Rust" {}
+//~^ NOTE not a function
 
 #[target_feature = "+sse2"]
 //~^ ERROR malformed `target_feature` attribute
@@ -28,6 +31,7 @@ unsafe fn foo() {}
 #[target_feature(enable = "sse2")]
 //~^ ERROR `#[target_feature(..)]` can only be applied to `unsafe` functions
 //~| NOTE see issue #69098
+//~| NOTE: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
 fn bar() {}
 //~^ NOTE not an `unsafe` function
 
@@ -61,6 +65,11 @@ union Qux {
 
 #[target_feature(enable = "sse2")]
 //~^ ERROR attribute should be applied to a function
+type Uwu = ();
+//~^ NOTE not a function
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
 trait Baz {}
 //~^ NOTE not a function
 
@@ -69,14 +78,32 @@ trait Baz {}
 #[target_feature(enable = "sse2")]
 unsafe fn test() {}
 
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+static A: () = ();
+//~^ NOTE not a function
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+impl Quux for u8 {}
+//~^ NOTE not a function
+//~| NOTE missing `foo` in implementation
+//~| ERROR missing: `foo`
+
+#[target_feature(enable = "sse2")]
+//~^ ERROR attribute should be applied to a function
+impl Foo {}
+//~^ NOTE not a function
+
 trait Quux {
-    fn foo();
+    fn foo(); //~ NOTE `foo` from trait
 }
 
 impl Quux for Foo {
     #[target_feature(enable = "sse2")]
     //~^ ERROR `#[target_feature(..)]` can only be applied to `unsafe` functions
     //~| NOTE see issue #69098
+    //~| NOTE: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
     fn foo() {}
     //~^ NOTE not an `unsafe` function
 }

@@ -1,3 +1,4 @@
+use rustc_errors::codes::*;
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_session::Limit;
 use rustc_span::{Span, Symbol};
@@ -15,6 +16,7 @@ pub enum HandleCycleError {
     Error,
     Fatal,
     DelayBug,
+    Stash,
 }
 
 #[derive(Subdiagnostic)]
@@ -44,7 +46,7 @@ pub struct CycleUsage {
 }
 
 #[derive(Diagnostic)]
-#[diag(query_system_cycle, code = "E0391")]
+#[diag(query_system_cycle, code = E0391)]
 pub struct Cycle {
     #[primary_span]
     pub span: Span,
@@ -57,6 +59,8 @@ pub struct Cycle {
     pub alias: Option<Alias>,
     #[subdiagnostic]
     pub cycle_usage: Option<CycleUsage>,
+    #[note]
+    pub note_span: (),
 }
 
 #[derive(Diagnostic)]

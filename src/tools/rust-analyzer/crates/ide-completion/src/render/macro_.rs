@@ -1,8 +1,8 @@
 //! Renderer for macro invocations.
 
-use hir::{Documentation, HirDisplay};
-use ide_db::SymbolKind;
-use syntax::SmolStr;
+use hir::HirDisplay;
+use ide_db::{documentation::Documentation, SymbolKind};
+use syntax::{format_smolstr, SmolStr};
 
 use crate::{
     context::{PathCompletionCtx, PathKind, PatternContext},
@@ -17,7 +17,7 @@ pub(crate) fn render_macro(
     name: hir::Name,
     macro_: hir::Macro,
 ) -> Builder {
-    let _p = profile::span("render_macro");
+    let _p = tracing::span!(tracing::Level::INFO, "render_macro").entered();
     render(ctx, *kind == PathKind::Use, *has_macro_bang, *has_call_parens, name, macro_)
 }
 
@@ -27,7 +27,7 @@ pub(crate) fn render_macro_pat(
     name: hir::Name,
     macro_: hir::Macro,
 ) -> Builder {
-    let _p = profile::span("render_macro");
+    let _p = tracing::span!(tracing::Level::INFO, "render_macro_pat").entered();
     render(ctx, false, false, false, name, macro_)
 }
 
@@ -74,7 +74,7 @@ fn render(
             item.insert_text(banged_name(&escaped_name)).lookup_by(banged_name(&name));
         }
         _ => {
-            cov_mark::hit!(dont_insert_macro_call_parens_unncessary);
+            cov_mark::hit!(dont_insert_macro_call_parens_unnecessary);
             item.insert_text(escaped_name);
         }
     };
@@ -94,7 +94,7 @@ fn label(
 ) -> SmolStr {
     if needs_bang {
         if ctx.snippet_cap().is_some() {
-            SmolStr::from_iter([&*name, "!", bra, "…", ket])
+            format_smolstr!("{name}!{bra}…{ket}",)
         } else {
             banged_name(name)
         }
@@ -140,8 +140,8 @@ mod tests {
     use crate::tests::check_edit;
 
     #[test]
-    fn dont_insert_macro_call_parens_unncessary() {
-        cov_mark::check!(dont_insert_macro_call_parens_unncessary);
+    fn dont_insert_macro_call_parens_unnecessary() {
+        cov_mark::check!(dont_insert_macro_call_parens_unnecessary);
         check_edit(
             "frobnicate",
             r#"
@@ -263,6 +263,65 @@ macro_rules! foo {
 
 fn main() {
     foo!($0)
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn complete_missing_macro_arg() {
+        // Regression test for https://github.com/rust-lang/rust-analyzer/issues/14246
+        check_edit(
+            "BAR",
+            r#"
+macro_rules! foo {
+    ($val:ident,  $val2: ident) => {
+        $val $val2
+    };
+}
+
+const BAR: u32 = 9;
+fn main() {
+    foo!(BAR, $0)
+}
+"#,
+            r#"
+macro_rules! foo {
+    ($val:ident,  $val2: ident) => {
+        $val $val2
+    };
+}
+
+const BAR: u32 = 9;
+fn main() {
+    foo!(BAR, BAR)
+}
+"#,
+        );
+        check_edit(
+            "BAR",
+            r#"
+macro_rules! foo {
+    ($val:ident,  $val2: ident) => {
+        $val $val2
+    };
+}
+
+const BAR: u32 = 9;
+fn main() {
+    foo!($0)
+}
+"#,
+            r#"
+macro_rules! foo {
+    ($val:ident,  $val2: ident) => {
+        $val $val2
+    };
+}
+
+const BAR: u32 = 9;
+fn main() {
+    foo!(BAR)
 }
 "#,
         );

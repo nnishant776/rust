@@ -1,5 +1,7 @@
+//@ known-bug: #103507
+
 #![allow(unused)]
-#![feature(const_trait_impl, inline_const, negative_impls)]
+#![feature(const_trait_impl, negative_impls)]
 
 use std::marker::Destruct;
 
@@ -11,15 +13,9 @@ impl Drop for UnconstDrop {
     fn drop(&mut self) {}
 }
 
-struct NonDrop;
-
-impl !Drop for NonDrop {}
-
 fn main() {
     const {
         f(UnconstDrop);
-        //~^ ERROR can't drop
-        f(NonDrop);
-        //~^ ERROR can't drop
+        //FIXME ~^ ERROR can't drop
     }
 }

@@ -2,7 +2,6 @@
 // But we fixed an ICE anyways.
 
 #![feature(specialization)]
-#![feature(return_position_impl_trait_in_trait)]
 #![allow(incomplete_features)]
 
 trait Foo {
@@ -15,6 +14,7 @@ where
 {
     fn bar(&self) -> U {
         //~^ ERROR method `bar` has an incompatible type for trait
+        //~| ERROR method with return-position `impl Trait` in trait cannot be specialized
         *self
     }
 }

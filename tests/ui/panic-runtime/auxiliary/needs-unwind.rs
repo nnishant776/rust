@@ -1,9 +1,8 @@
-// compile-flags:-C panic=unwind
-// no-prefer-dynamic
+//@ compile-flags:-C panic=unwind
+//@ no-prefer-dynamic
 
 #![crate_type = "rlib"]
 #![no_std]
-#![feature(c_unwind)]
 
 extern "C-unwind" fn foo() {}
 

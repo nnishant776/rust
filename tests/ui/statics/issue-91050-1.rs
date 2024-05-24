@@ -1,5 +1,5 @@
-// build-pass
-// compile-flags: --crate-type=rlib --emit=llvm-ir -Cno-prepopulate-passes
+//@ build-pass
+//@ compile-flags: --crate-type=rlib --emit=llvm-ir -Cno-prepopulate-passes
 
 // This test declares globals by the same name with different types, which
 // caused problems because Module::getOrInsertGlobal would return a Constant*
@@ -11,6 +11,8 @@
 // Assertion `isa<X>(Val) && "cast<Ty>() argument of incompatible type!"' failed.
 //
 // In regular builds, the bad cast was UB, like "Invalid LLVMRustVisibility value!"
+
+#![allow(dropping_copy_types)]
 
 pub mod before {
     #[no_mangle]

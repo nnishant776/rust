@@ -1,6 +1,6 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
-// pretty-expanded FIXME #23616
+//@ pretty-expanded FIXME #23616
 
 enum Foo {
     Bar,
@@ -10,9 +10,9 @@ enum Foo {
 fn foo(f: Foo) {
     match f {
         Foo::Bar => {},
-        #[cfg(not(asdfa))]
+        #[cfg(not(FALSE))]
         Foo::Baz => {},
-        #[cfg(afsd)]
+        #[cfg(FALSE)]
         Basdfwe => {}
     }
 }

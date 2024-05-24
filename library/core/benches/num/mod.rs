@@ -1,9 +1,10 @@
 mod dec2flt;
 mod flt2dec;
 mod int_log;
+mod int_pow;
 
 use std::str::FromStr;
-use test::Bencher;
+use test::{black_box, Bencher};
 
 const ASCII_NUMBERS: [&str; 19] = [
     "0",
@@ -36,7 +37,7 @@ macro_rules! from_str_bench {
                     .iter()
                     .cycle()
                     .take(5_000)
-                    .filter_map(|s| <$t>::from_str(s).ok())
+                    .filter_map(|s| <$t>::from_str(black_box(s)).ok())
                     .max()
             })
         }
@@ -52,7 +53,7 @@ macro_rules! from_str_radix_bench {
                     .iter()
                     .cycle()
                     .take(5_000)
-                    .filter_map(|s| <$t>::from_str_radix(s, $radix).ok())
+                    .filter_map(|s| <$t>::from_str_radix(black_box(s), $radix).ok())
                     .max()
             })
         }

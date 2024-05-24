@@ -5,13 +5,13 @@ use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self, HirId};
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
 pub fn provide(providers: &mut Providers) {
     providers.upvars_mentioned = |tcx, def_id| {
-        if !tcx.is_closure(def_id) {
+        if !tcx.is_closure_like(def_id) {
             return None;
         }
 
@@ -66,7 +66,7 @@ impl CaptureCollector<'_, '_> {
 }
 
 impl<'tcx> Visitor<'tcx> for CaptureCollector<'_, 'tcx> {
-    fn visit_path(&mut self, path: &hir::Path<'tcx>, _: hir::HirId) {
+    fn visit_path(&mut self, path: &hir::Path<'tcx>, _: HirId) {
         if let Res::Local(var_id) = path.res {
             self.visit_local_use(var_id, path.span);
         }

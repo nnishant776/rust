@@ -1,10 +1,11 @@
 //! An iterator over the type substructure.
 //! WARNING: this does not keep track of the region depth.
 
-use crate::ty::subst::{GenericArg, GenericArgKind};
 use crate::ty::{self, Ty};
+use crate::ty::{GenericArg, GenericArgKind};
 use rustc_data_structures::sso::SsoHashSet;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
+use tracing::debug;
 
 // The TypeWalker's stack is hot enough that it's worth going to some effort to
 // avoid heap allocations.
@@ -151,6 +152,15 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
             | ty::Bound(..)
             | ty::Foreign(..) => {}
 
+            ty::Pat(ty, pat) => {
+                match *pat {
+                    ty::PatternKind::Range { start, end, include_end: _ } => {
+                        stack.extend(end.map(Into::into));
+                        stack.extend(start.map(Into::into));
+                    }
+                }
+                stack.push(ty.into());
+            }
             ty::Array(ty, len) => {
                 stack.push(len.into());
                 stack.push(ty.into());
@@ -158,46 +168,44 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
             ty::Slice(ty) => {
                 stack.push(ty.into());
             }
-            ty::RawPtr(mt) => {
-                stack.push(mt.ty.into());
+            ty::RawPtr(ty, _) => {
+                stack.push(ty.into());
             }
             ty::Ref(lt, ty, _) => {
                 stack.push(ty.into());
                 stack.push(lt.into());
             }
             ty::Alias(_, data) => {
-                stack.extend(data.substs.iter().rev());
+                stack.extend(data.args.iter().rev());
             }
             ty::Dynamic(obj, lt, _) => {
                 stack.push(lt.into());
                 stack.extend(obj.iter().rev().flat_map(|predicate| {
-                    let (substs, opt_ty) = match predicate.skip_binder() {
-                        ty::ExistentialPredicate::Trait(tr) => (tr.substs, None),
-                        ty::ExistentialPredicate::Projection(p) => (p.substs, Some(p.term)),
+                    let (args, opt_ty) = match predicate.skip_binder() {
+                        ty::ExistentialPredicate::Trait(tr) => (tr.args, None),
+                        ty::ExistentialPredicate::Projection(p) => (p.args, Some(p.term)),
                         ty::ExistentialPredicate::AutoTrait(_) =>
                         // Empty iterator
                         {
-                            (ty::InternalSubsts::empty(), None)
+                            (ty::GenericArgs::empty(), None)
                         }
                     };
 
-                    substs.iter().rev().chain(opt_ty.map(|term| match term.unpack() {
+                    args.iter().rev().chain(opt_ty.map(|term| match term.unpack() {
                         ty::TermKind::Ty(ty) => ty.into(),
                         ty::TermKind::Const(ct) => ct.into(),
                     }))
                 }));
             }
-            ty::Adt(_, substs)
-            | ty::Closure(_, substs)
-            | ty::Generator(_, substs, _)
-            | ty::GeneratorWitnessMIR(_, substs)
-            | ty::FnDef(_, substs) => {
-                stack.extend(substs.iter().rev());
+            ty::Adt(_, args)
+            | ty::Closure(_, args)
+            | ty::CoroutineClosure(_, args)
+            | ty::Coroutine(_, args)
+            | ty::CoroutineWitness(_, args)
+            | ty::FnDef(_, args) => {
+                stack.extend(args.iter().rev());
             }
-            ty::Tuple(ts) => stack.extend(ts.as_substs().iter().rev()),
-            ty::GeneratorWitness(ts) => {
-                stack.extend(ts.skip_binder().iter().rev().map(|ty| ty.into()));
-            }
+            ty::Tuple(ts) => stack.extend(ts.iter().rev().map(GenericArg::from)),
             ty::FnPtr(sig) => {
                 stack.push(sig.skip_binder().output().into());
                 stack.extend(sig.skip_binder().inputs().iter().copied().rev().map(|ty| ty.into()));
@@ -233,7 +241,7 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
                 },
 
                 ty::ConstKind::Unevaluated(ct) => {
-                    stack.extend(ct.substs.iter().rev());
+                    stack.extend(ct.args.iter().rev());
                 }
             }
         }

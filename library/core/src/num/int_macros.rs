@@ -3,21 +3,26 @@ macro_rules! int_impl {
         Self = $SelfT:ty,
         ActualT = $ActualT:ident,
         UnsignedT = $UnsignedT:ty,
-        BITS = $BITS:expr,
-        BITS_MINUS_ONE = $BITS_MINUS_ONE:expr,
-        Min = $Min:expr,
-        Max = $Max:expr,
-        rot = $rot:expr,
-        rot_op = $rot_op:expr,
-        rot_result = $rot_result:expr,
-        swap_op = $swap_op:expr,
-        swapped = $swapped:expr,
-        reversed = $reversed:expr,
-        le_bytes = $le_bytes:expr,
-        be_bytes = $be_bytes:expr,
+
+        // There are all for use *only* in doc comments.
+        // As such, they're all passed as literals -- passing them as a string
+        // literal is fine if they need to be multiple code tokens.
+        // In non-comments, use the associated constants rather than these.
+        BITS = $BITS:literal,
+        BITS_MINUS_ONE = $BITS_MINUS_ONE:literal,
+        Min = $Min:literal,
+        Max = $Max:literal,
+        rot = $rot:literal,
+        rot_op = $rot_op:literal,
+        rot_result = $rot_result:literal,
+        swap_op = $swap_op:literal,
+        swapped = $swapped:literal,
+        reversed = $reversed:literal,
+        le_bytes = $le_bytes:literal,
+        be_bytes = $be_bytes:literal,
         to_xe_bytes_doc = $to_xe_bytes_doc:expr,
         from_xe_bytes_doc = $from_xe_bytes_doc:expr,
-        bound_condition = $bound_condition:expr,
+        bound_condition = $bound_condition:literal,
     ) => {
         /// The smallest value that can be represented by this integer type
         #[doc = concat!("(&minus;2<sup>", $BITS_MINUS_ONE, "</sup>", $bound_condition, ").")]
@@ -30,7 +35,7 @@ macro_rules! int_impl {
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MIN, ", stringify!($Min), ");")]
         /// ```
         #[stable(feature = "assoc_int_consts", since = "1.43.0")]
-        pub const MIN: Self = !0 ^ ((!0 as $UnsignedT) >> 1) as Self;
+        pub const MIN: Self = !Self::MAX;
 
         /// The largest value that can be represented by this integer type
         #[doc = concat!("(2<sup>", $BITS_MINUS_ONE, "</sup> &minus; 1", $bound_condition, ").")]
@@ -43,7 +48,7 @@ macro_rules! int_impl {
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX, ", stringify!($Max), ");")]
         /// ```
         #[stable(feature = "assoc_int_consts", since = "1.43.0")]
-        pub const MAX: Self = !Self::MIN;
+        pub const MAX: Self = (<$UnsignedT>::MAX >> 1) as Self;
 
         /// The size of this integer type in bits.
         ///
@@ -53,33 +58,7 @@ macro_rules! int_impl {
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::BITS, ", stringify!($BITS), ");")]
         /// ```
         #[stable(feature = "int_bits_const", since = "1.53.0")]
-        pub const BITS: u32 = $BITS;
-
-        /// Converts a string slice in a given base to an integer.
-        ///
-        /// The string is expected to be an optional `+` or `-` sign followed by digits.
-        /// Leading and trailing whitespace represent an error. Digits are a subset of these characters,
-        /// depending on `radix`:
-        ///
-        ///  * `0-9`
-        ///  * `a-z`
-        ///  * `A-Z`
-        ///
-        /// # Panics
-        ///
-        /// This function panics if `radix` is not in the range from 2 to 36.
-        ///
-        /// # Examples
-        ///
-        /// Basic usage:
-        ///
-        /// ```
-        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::from_str_radix(\"A\", 16), Ok(10));")]
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        pub fn from_str_radix(src: &str, radix: u32) -> Result<Self, ParseIntError> {
-            from_str_radix(src, radix)
-        }
+        pub const BITS: u32 = <$UnsignedT>::BITS;
 
         /// Returns the number of ones in the binary representation of `self`.
         ///
@@ -446,11 +425,52 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_add(self, rhs: Self) -> Option<Self> {
             let (a, b) = self.overflowing_add(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Strict integer addition. Computes `self + rhs`, panicking
+        /// if overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!((", stringify!($SelfT), "::MAX - 2).strict_add(1), ", stringify!($SelfT), "::MAX - 1);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (", stringify!($SelfT), "::MAX - 2).strict_add(3);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_add(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_add(rhs);
+            if unlikely!(b) { overflow_panic::add() } else { a }
         }
 
         /// Unchecked integer addition. Computes `self + rhs`, assuming overflow
         /// cannot occur.
+        ///
+        /// Calling `x.unchecked_add(y)` is semantically equivalent to calling
+        /// `x.`[`checked_add`]`(y).`[`unwrap_unchecked`]`()`.
+        ///
+        /// If you're just trying to avoid the panic in debug mode, then **do not**
+        /// use this.  Instead, you're looking for [`wrapping_add`].
         ///
         /// # Safety
         ///
@@ -458,15 +478,13 @@ macro_rules! int_impl {
         #[doc = concat!("`self + rhs > ", stringify!($SelfT), "::MAX` or `self + rhs < ", stringify!($SelfT), "::MIN`,")]
         /// i.e. when [`checked_add`] would return `None`.
         ///
+        /// [`unwrap_unchecked`]: option/enum.Option.html#method.unwrap_unchecked
         #[doc = concat!("[`checked_add`]: ", stringify!($SelfT), "::checked_add")]
-        #[unstable(
-            feature = "unchecked_math",
-            reason = "niche optimization path",
-            issue = "85122",
-        )]
+        #[doc = concat!("[`wrapping_add`]: ", stringify!($SelfT), "::wrapping_add")]
+        #[stable(feature = "unchecked_math", since = "1.79.0")]
+        #[rustc_const_stable(feature = "unchecked_math", since = "1.79.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_add(self, rhs: Self) -> Self {
@@ -493,7 +511,42 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_add_unsigned(self, rhs: $UnsignedT) -> Option<Self> {
             let (a, b) = self.overflowing_add_unsigned(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Strict addition with an unsigned integer. Computes `self + rhs`,
+        /// panicking if overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(1", stringify!($SelfT), ".strict_add_unsigned(2), 3);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (", stringify!($SelfT), "::MAX - 2).strict_add_unsigned(3);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_add_unsigned(self, rhs: $UnsignedT) -> Self {
+            let (a, b) = self.overflowing_add_unsigned(rhs);
+            if unlikely!(b) { overflow_panic::add() } else { a }
         }
 
         /// Checked integer subtraction. Computes `self - rhs`, returning `None` if
@@ -514,11 +567,52 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
             let (a, b) = self.overflowing_sub(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Strict integer subtraction. Computes `self - rhs`, panicking if
+        /// overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!((", stringify!($SelfT), "::MIN + 2).strict_sub(1), ", stringify!($SelfT), "::MIN + 1);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (", stringify!($SelfT), "::MIN + 2).strict_sub(3);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_sub(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_sub(rhs);
+            if unlikely!(b) { overflow_panic::sub() } else { a }
         }
 
         /// Unchecked integer subtraction. Computes `self - rhs`, assuming overflow
         /// cannot occur.
+        ///
+        /// Calling `x.unchecked_sub(y)` is semantically equivalent to calling
+        /// `x.`[`checked_sub`]`(y).`[`unwrap_unchecked`]`()`.
+        ///
+        /// If you're just trying to avoid the panic in debug mode, then **do not**
+        /// use this.  Instead, you're looking for [`wrapping_sub`].
         ///
         /// # Safety
         ///
@@ -526,15 +620,13 @@ macro_rules! int_impl {
         #[doc = concat!("`self - rhs > ", stringify!($SelfT), "::MAX` or `self - rhs < ", stringify!($SelfT), "::MIN`,")]
         /// i.e. when [`checked_sub`] would return `None`.
         ///
+        /// [`unwrap_unchecked`]: option/enum.Option.html#method.unwrap_unchecked
         #[doc = concat!("[`checked_sub`]: ", stringify!($SelfT), "::checked_sub")]
-        #[unstable(
-            feature = "unchecked_math",
-            reason = "niche optimization path",
-            issue = "85122",
-        )]
+        #[doc = concat!("[`wrapping_sub`]: ", stringify!($SelfT), "::wrapping_sub")]
+        #[stable(feature = "unchecked_math", since = "1.79.0")]
+        #[rustc_const_stable(feature = "unchecked_math", since = "1.79.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_sub(self, rhs: Self) -> Self {
@@ -561,7 +653,42 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_sub_unsigned(self, rhs: $UnsignedT) -> Option<Self> {
             let (a, b) = self.overflowing_sub_unsigned(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Strict subtraction with an unsigned integer. Computes `self - rhs`,
+        /// panicking if overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(1", stringify!($SelfT), ".strict_sub_unsigned(2), -1);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (", stringify!($SelfT), "::MIN + 2).strict_sub_unsigned(3);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_sub_unsigned(self, rhs: $UnsignedT) -> Self {
+            let (a, b) = self.overflowing_sub_unsigned(rhs);
+            if unlikely!(b) { overflow_panic::sub() } else { a }
         }
 
         /// Checked integer multiplication. Computes `self * rhs`, returning `None` if
@@ -582,11 +709,52 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_mul(self, rhs: Self) -> Option<Self> {
             let (a, b) = self.overflowing_mul(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Strict integer multiplication. Computes `self * rhs`, panicking if
+        /// overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.strict_mul(1), ", stringify!($SelfT), "::MAX);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ``` should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MAX.strict_mul(2);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_mul(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_mul(rhs);
+            if unlikely!(b) { overflow_panic::mul() } else { a }
         }
 
         /// Unchecked integer multiplication. Computes `self * rhs`, assuming overflow
         /// cannot occur.
+        ///
+        /// Calling `x.unchecked_mul(y)` is semantically equivalent to calling
+        /// `x.`[`checked_mul`]`(y).`[`unwrap_unchecked`]`()`.
+        ///
+        /// If you're just trying to avoid the panic in debug mode, then **do not**
+        /// use this.  Instead, you're looking for [`wrapping_mul`].
         ///
         /// # Safety
         ///
@@ -594,15 +762,13 @@ macro_rules! int_impl {
         #[doc = concat!("`self * rhs > ", stringify!($SelfT), "::MAX` or `self * rhs < ", stringify!($SelfT), "::MIN`,")]
         /// i.e. when [`checked_mul`] would return `None`.
         ///
+        /// [`unwrap_unchecked`]: option/enum.Option.html#method.unwrap_unchecked
         #[doc = concat!("[`checked_mul`]: ", stringify!($SelfT), "::checked_mul")]
-        #[unstable(
-            feature = "unchecked_math",
-            reason = "niche optimization path",
-            issue = "85122",
-        )]
+        #[doc = concat!("[`wrapping_mul`]: ", stringify!($SelfT), "::wrapping_mul")]
+        #[stable(feature = "unchecked_math", since = "1.79.0")]
+        #[rustc_const_stable(feature = "unchecked_math", since = "1.79.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_mul(self, rhs: Self) -> Self {
@@ -637,6 +803,54 @@ macro_rules! int_impl {
             }
         }
 
+        /// Strict integer division. Computes `self / rhs`, panicking
+        /// if overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is zero.
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// The only case where such an overflow can occur is when one divides `MIN / -1` on a signed type (where
+        /// `MIN` is the negative minimal value for the type); this is equivalent to `-MIN`, a positive value
+        /// that is too large to represent in the type.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!((", stringify!($SelfT), "::MIN + 1).strict_div(-1), ", stringify!($Max), ");")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_div(-1);")]
+        /// ```
+        ///
+        /// The following panics because of division by zero:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (1", stringify!($SelfT), ").strict_div(0);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_div(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_div(rhs);
+            if unlikely!(b) { overflow_panic::div() } else { a }
+        }
+
         /// Checked Euclidean division. Computes `self.div_euclid(rhs)`,
         /// returning `None` if `rhs == 0` or the division results in overflow.
         ///
@@ -661,6 +875,54 @@ macro_rules! int_impl {
             } else {
                 Some(self.div_euclid(rhs))
             }
+        }
+
+        /// Strict Euclidean division. Computes `self.div_euclid(rhs)`, panicking
+        /// if overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is zero.
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// The only case where such an overflow can occur is when one divides `MIN / -1` on a signed type (where
+        /// `MIN` is the negative minimal value for the type); this is equivalent to `-MIN`, a positive value
+        /// that is too large to represent in the type.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!((", stringify!($SelfT), "::MIN + 1).strict_div_euclid(-1), ", stringify!($Max), ");")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_div_euclid(-1);")]
+        /// ```
+        ///
+        /// The following panics because of division by zero:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = (1", stringify!($SelfT), ").strict_div_euclid(0);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_div_euclid(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_div_euclid(rhs);
+            if unlikely!(b) { overflow_panic::div() } else { a }
         }
 
         /// Checked integer remainder. Computes `self % rhs`, returning `None` if
@@ -689,6 +951,53 @@ macro_rules! int_impl {
             }
         }
 
+        /// Strict integer remainder. Computes `self % rhs`, panicking if
+        /// the division results in overflow.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is zero.
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// The only case where such an overflow can occur is `x % y` for `MIN / -1` on a
+        /// signed type (where `MIN` is the negative minimal value), which is invalid due to implementation artifacts.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(5", stringify!($SelfT), ".strict_rem(2), 1);")]
+        /// ```
+        ///
+        /// The following panics because of division by zero:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = 5", stringify!($SelfT), ".strict_rem(0);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_rem(-1);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_rem(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_rem(rhs);
+            if unlikely!(b) { overflow_panic::rem() } else { a }
+        }
+
         /// Checked Euclidean remainder. Computes `self.rem_euclid(rhs)`, returning `None`
         /// if `rhs == 0` or the division results in overflow.
         ///
@@ -715,6 +1024,53 @@ macro_rules! int_impl {
             }
         }
 
+        /// Strict Euclidean remainder. Computes `self.rem_euclid(rhs)`, panicking if
+        /// the division results in overflow.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is zero.
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// The only case where such an overflow can occur is `x % y` for `MIN / -1` on a
+        /// signed type (where `MIN` is the negative minimal value), which is invalid due to implementation artifacts.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(5", stringify!($SelfT), ".strict_rem_euclid(2), 1);")]
+        /// ```
+        ///
+        /// The following panics because of division by zero:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = 5", stringify!($SelfT), ".strict_rem_euclid(0);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_rem_euclid(-1);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_rem_euclid(self, rhs: Self) -> Self {
+            let (a, b) = self.overflowing_rem_euclid(rhs);
+            if unlikely!(b) { overflow_panic::rem() } else { a }
+        }
+
         /// Checked negation. Computes `-self`, returning `None` if `self == MIN`.
         ///
         /// # Examples
@@ -732,7 +1088,66 @@ macro_rules! int_impl {
         #[inline]
         pub const fn checked_neg(self) -> Option<Self> {
             let (a, b) = self.overflowing_neg();
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { None } else { Some(a) }
+        }
+
+        /// Unchecked negation. Computes `-self`, assuming overflow cannot occur.
+        ///
+        /// # Safety
+        ///
+        /// This results in undefined behavior when
+        #[doc = concat!("`self == ", stringify!($SelfT), "::MIN`,")]
+        /// i.e. when [`checked_neg`] would return `None`.
+        ///
+        #[doc = concat!("[`checked_neg`]: ", stringify!($SelfT), "::checked_neg")]
+        #[unstable(
+            feature = "unchecked_neg",
+            reason = "niche optimization path",
+            issue = "85122",
+        )]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[rustc_const_unstable(feature = "unchecked_neg", issue = "85122")]
+        #[inline(always)]
+        #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+        pub const unsafe fn unchecked_neg(self) -> Self {
+            // SAFETY: the caller must uphold the safety contract for
+            // `unchecked_neg`.
+            unsafe { intrinsics::unchecked_sub(0, self) }
+        }
+
+        /// Strict negation. Computes `-self`, panicking if `self == MIN`.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(5", stringify!($SelfT), ".strict_neg(), -5);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_neg();")]
+        ///
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_neg(self) -> Self {
+            let (a, b) = self.overflowing_neg();
+            if unlikely!(b) { overflow_panic::neg() } else { a }
         }
 
         /// Checked shift left. Computes `self << rhs`, returning `None` if `rhs` is larger
@@ -748,12 +1163,54 @@ macro_rules! int_impl {
         /// ```
         #[stable(feature = "wrapping", since = "1.7.0")]
         #[rustc_const_stable(feature = "const_checked_int_methods", since = "1.47.0")]
+        // We could always go back to wrapping
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         pub const fn checked_shl(self, rhs: u32) -> Option<Self> {
+            // Not using overflowing_shl as that's a wrapping shift
+            if rhs < Self::BITS {
+                // SAFETY: just checked the RHS is in-range
+                Some(unsafe { self.unchecked_shl(rhs) })
+            } else {
+                None
+            }
+        }
+
+        /// Strict shift left. Computes `self << rhs`, panicking if `rhs` is larger
+        /// than or equal to the number of bits in `self`.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(0x1", stringify!($SelfT), ".strict_shl(4), 0x10);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = 0x1", stringify!($SelfT), ".strict_shl(129);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_shl(self, rhs: u32) -> Self {
             let (a, b) = self.overflowing_shl(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { overflow_panic::shl() } else { a }
         }
 
         /// Unchecked shift left. Computes `self << rhs`, assuming that
@@ -767,20 +1224,19 @@ macro_rules! int_impl {
         ///
         #[doc = concat!("[`checked_shl`]: ", stringify!($SelfT), "::checked_shl")]
         #[unstable(
-            feature = "unchecked_math",
+            feature = "unchecked_shifts",
             reason = "niche optimization path",
             issue = "85122",
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_shifts", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shl(self, rhs: u32) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_shl`.
-            // Any legal shift amount is losslessly representable in the self type.
-            unsafe { intrinsics::unchecked_shl(self, rhs.try_into().ok().unwrap_unchecked()) }
+                // SAFETY: the caller must uphold the safety contract for
+                // `unchecked_shl`.
+                unsafe { intrinsics::unchecked_shl(self, rhs) }
         }
 
         /// Checked shift right. Computes `self >> rhs`, returning `None` if `rhs` is
@@ -796,12 +1252,54 @@ macro_rules! int_impl {
         /// ```
         #[stable(feature = "wrapping", since = "1.7.0")]
         #[rustc_const_stable(feature = "const_checked_int_methods", since = "1.47.0")]
+        // We could always go back to wrapping
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         pub const fn checked_shr(self, rhs: u32) -> Option<Self> {
+            // Not using overflowing_shr as that's a wrapping shift
+            if rhs < Self::BITS {
+                // SAFETY: just checked the RHS is in-range
+                Some(unsafe { self.unchecked_shr(rhs) })
+            } else {
+                None
+            }
+        }
+
+        /// Strict shift right. Computes `self >> rhs`, panicking `rhs` is
+        /// larger than or equal to the number of bits in `self`.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(0x10", stringify!($SelfT), ".strict_shr(4), 0x1);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = 0x10", stringify!($SelfT), ".strict_shr(128);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_shr(self, rhs: u32) -> Self {
             let (a, b) = self.overflowing_shr(rhs);
-            if unlikely!(b) {None} else {Some(a)}
+            if unlikely!(b) { overflow_panic::shr() } else { a }
         }
 
         /// Unchecked shift right. Computes `self >> rhs`, assuming that
@@ -815,20 +1313,19 @@ macro_rules! int_impl {
         ///
         #[doc = concat!("[`checked_shr`]: ", stringify!($SelfT), "::checked_shr")]
         #[unstable(
-            feature = "unchecked_math",
+            feature = "unchecked_shifts",
             reason = "niche optimization path",
             issue = "85122",
         )]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
-        #[rustc_const_unstable(feature = "const_inherent_unchecked_arith", issue = "85122")]
+        #[rustc_const_unstable(feature = "unchecked_shifts", issue = "85122")]
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shr(self, rhs: u32) -> Self {
             // SAFETY: the caller must uphold the safety contract for
             // `unchecked_shr`.
-            // Any legal shift amount is losslessly representable in the self type.
-            unsafe { intrinsics::unchecked_shr(self, rhs.try_into().ok().unwrap_unchecked()) }
+            unsafe { intrinsics::unchecked_shr(self, rhs) }
         }
 
         /// Checked absolute value. Computes `self.abs()`, returning `None` if
@@ -852,6 +1349,44 @@ macro_rules! int_impl {
                 self.checked_neg()
             } else {
                 Some(self)
+            }
+        }
+
+        /// Strict absolute value. Computes `self.abs()`, panicking if
+        /// `self == MIN`.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!((-5", stringify!($SelfT), ").strict_abs(), 5);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_abs();")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_abs(self) -> Self {
+            if self.is_negative() {
+                self.strict_neg()
+            } else {
+                self
             }
         }
 
@@ -891,6 +1426,81 @@ macro_rules! int_impl {
             // squaring the base afterwards is not necessary and may cause a
             // needless overflow.
             acc.checked_mul(base)
+        }
+
+        /// Strict exponentiation. Computes `self.pow(exp)`, panicking if
+        /// overflow occurred.
+        ///
+        /// # Panics
+        ///
+        /// ## Overflow behavior
+        ///
+        /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("assert_eq!(8", stringify!($SelfT), ".strict_pow(2), 64);")]
+        /// ```
+        ///
+        /// The following panics because of overflow:
+        ///
+        /// ```should_panic
+        /// #![feature(strict_overflow_ops)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MAX.strict_pow(2);")]
+        /// ```
+        #[unstable(feature = "strict_overflow_ops", issue = "118260")]
+        #[rustc_const_unstable(feature = "const_strict_overflow_ops", issue = "118260")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_pow(self, mut exp: u32) -> Self {
+            if exp == 0 {
+                return 1;
+            }
+            let mut base = self;
+            let mut acc: Self = 1;
+
+            while exp > 1 {
+                if (exp & 1) == 1 {
+                    acc = acc.strict_mul(base);
+                }
+                exp /= 2;
+                base = base.strict_mul(base);
+            }
+            // since exp!=0, finally the exp must be 1.
+            // Deal with the final bit of the exponent separately, since
+            // squaring the base afterwards is not necessary and may cause a
+            // needless overflow.
+            acc.strict_mul(base)
+        }
+
+        /// Returns the square root of the number, rounded down.
+        ///
+        /// Returns `None` if `self` is negative.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        /// ```
+        /// #![feature(isqrt)]
+        #[doc = concat!("assert_eq!(10", stringify!($SelfT), ".checked_isqrt(), Some(3));")]
+        /// ```
+        #[unstable(feature = "isqrt", issue = "116226")]
+        #[rustc_const_unstable(feature = "isqrt", issue = "116226")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn checked_isqrt(self) -> Option<Self> {
+            if self < 0 {
+                None
+            } else {
+                Some((self as $UnsignedT).isqrt() as Self)
+            }
         }
 
         /// Saturating integer addition. Computes `self + rhs`, saturating at the numeric
@@ -1067,6 +1677,10 @@ macro_rules! int_impl {
         /// Saturating integer division. Computes `self / rhs`, saturating at the
         /// numeric bounds instead of overflowing.
         ///
+        /// # Panics
+        ///
+        /// This function will panic if `rhs` is 0.
+        ///
         /// # Examples
         ///
         /// Basic usage:
@@ -1075,11 +1689,6 @@ macro_rules! int_impl {
         #[doc = concat!("assert_eq!(5", stringify!($SelfT), ".saturating_div(2), 2);")]
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.saturating_div(-1), ", stringify!($SelfT), "::MIN + 1);")]
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MIN.saturating_div(-1), ", stringify!($SelfT), "::MAX);")]
-        ///
-        /// ```
-        ///
-        /// ```should_panic
-        #[doc = concat!("let _ = 1", stringify!($SelfT), ".saturating_div(0);")]
         ///
         /// ```
         #[stable(feature = "saturating_div", since = "1.58.0")]
@@ -1375,12 +1984,12 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
-        #[rustc_allow_const_fn_unstable(const_inherent_unchecked_arith)]
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         pub const fn wrapping_shl(self, rhs: u32) -> Self {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
             unsafe {
-                self.unchecked_shl(rhs & ($BITS - 1))
+                self.unchecked_shl(rhs & (Self::BITS - 1))
             }
         }
 
@@ -1405,12 +2014,12 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
-        #[rustc_allow_const_fn_unstable(const_inherent_unchecked_arith)]
+        #[rustc_allow_const_fn_unstable(unchecked_shifts)]
         pub const fn wrapping_shr(self, rhs: u32) -> Self {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
             unsafe {
-                self.unchecked_shr(rhs & ($BITS - 1))
+                self.unchecked_shr(rhs & (Self::BITS - 1))
             }
         }
 
@@ -1859,6 +2468,7 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
+        #[track_caller]
         pub const fn overflowing_rem_euclid(self, rhs: Self) -> (Self, bool) {
             if unlikely!(rhs == -1) {
                 (0, self == Self::MIN)
@@ -1916,7 +2526,7 @@ macro_rules! int_impl {
                       without modifying the original"]
         #[inline]
         pub const fn overflowing_shl(self, rhs: u32) -> (Self, bool) {
-            (self.wrapping_shl(rhs), (rhs > ($BITS - 1)))
+            (self.wrapping_shl(rhs), rhs >= Self::BITS)
         }
 
         /// Shifts self right by `rhs` bits.
@@ -1939,7 +2549,7 @@ macro_rules! int_impl {
                       without modifying the original"]
         #[inline]
         pub const fn overflowing_shr(self, rhs: u32) -> (Self, bool) {
-            (self.wrapping_shr(rhs), (rhs > ($BITS - 1)))
+            (self.wrapping_shr(rhs), rhs >= Self::BITS)
         }
 
         /// Computes the absolute value of `self`.
@@ -2056,6 +2666,36 @@ macro_rules! int_impl {
             acc * base
         }
 
+        /// Returns the square root of the number, rounded down.
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `self` is negative.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        /// ```
+        /// #![feature(isqrt)]
+        #[doc = concat!("assert_eq!(10", stringify!($SelfT), ".isqrt(), 3);")]
+        /// ```
+        #[unstable(feature = "isqrt", issue = "116226")]
+        #[rustc_const_unstable(feature = "isqrt", issue = "116226")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn isqrt(self) -> Self {
+            // I would like to implement it as
+            // ```
+            // self.checked_isqrt().expect("argument of integer square root must be non-negative")
+            // ```
+            // but `expect` is not yet stable as a `const fn`.
+            match self.checked_isqrt() {
+                Some(sqrt) => sqrt,
+                None => panic!("argument of integer square root must be non-negative"),
+            }
+        }
+
         /// Calculates the quotient of Euclidean division of `self` by `rhs`.
         ///
         /// This computes the integer `q` such that `self = q * rhs + r`, with
@@ -2068,7 +2708,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or the division results in overflow.
+        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
+        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2088,7 +2729,7 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
-        #[rustc_inherit_overflow_checks]
+        #[track_caller]
         pub const fn div_euclid(self, rhs: Self) -> Self {
             let q = self / rhs;
             if self % rhs < 0 {
@@ -2106,7 +2747,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or the division results in overflow.
+        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
+        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2121,12 +2763,13 @@ macro_rules! int_impl {
         /// assert_eq!(a.rem_euclid(-b), 3);
         /// assert_eq!((-a).rem_euclid(-b), 1);
         /// ```
+        #[doc(alias = "modulo", alias = "mod")]
         #[stable(feature = "euclidean_division", since = "1.38.0")]
         #[rustc_const_stable(feature = "const_euclidean_int_methods", since = "1.52.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
-        #[rustc_inherit_overflow_checks]
+        #[track_caller]
         pub const fn rem_euclid(self, rhs: Self) -> Self {
             let r = self % rhs;
             if r < 0 {
@@ -2148,12 +2791,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is zero.
-        ///
-        /// ## Overflow behavior
-        ///
-        /// On overflow, this function will panic if overflow checks are enabled (default in debug
-        /// mode) and wrap if overflow checks are disabled (default in release mode).
+        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
+        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2173,7 +2812,7 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
-        #[rustc_inherit_overflow_checks]
+        #[track_caller]
         pub const fn div_floor(self, rhs: Self) -> Self {
             let d = self / rhs;
             let r = self % rhs;
@@ -2188,12 +2827,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is zero.
-        ///
-        /// ## Overflow behavior
-        ///
-        /// On overflow, this function will panic if overflow checks are enabled (default in debug
-        /// mode) and wrap if overflow checks are disabled (default in release mode).
+        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
+        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2213,7 +2848,7 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
-        #[rustc_inherit_overflow_checks]
+        #[track_caller]
         pub const fn div_ceil(self, rhs: Self) -> Self {
             let d = self / rhs;
             let r = self % rhs;
@@ -2327,6 +2962,44 @@ macro_rules! int_impl {
             }
         }
 
+        /// Calculates the middle point of `self` and `rhs`.
+        ///
+        /// `midpoint(a, b)` is `(a + b) >> 1` as if it were performed in a
+        /// sufficiently-large signed integral type. This implies that the result is
+        /// always rounded towards negative infinity and that no overflow will ever occur.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(num_midpoint)]
+        #[doc = concat!("assert_eq!(0", stringify!($SelfT), ".midpoint(4), 2);")]
+        #[doc = concat!("assert_eq!(0", stringify!($SelfT), ".midpoint(-1), -1);")]
+        #[doc = concat!("assert_eq!((-1", stringify!($SelfT), ").midpoint(0), -1);")]
+        /// ```
+        #[unstable(feature = "num_midpoint", issue = "110840")]
+        #[rustc_const_unstable(feature = "const_num_midpoint", issue = "110840")]
+        #[rustc_allow_const_fn_unstable(const_num_midpoint)]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn midpoint(self, rhs: Self) -> Self {
+            const U: $UnsignedT = <$SelfT>::MIN.unsigned_abs();
+
+            // Map an $SelfT to an $UnsignedT
+            // ex: i8 [-128; 127] to [0; 255]
+            const fn map(a: $SelfT) -> $UnsignedT {
+                (a as $UnsignedT) ^ U
+            }
+
+            // Map an $UnsignedT to an $SelfT
+            // ex: u8 [0; 255] to [-128; 127]
+            const fn demap(a: $UnsignedT) -> $SelfT {
+                (a ^ U) as $SelfT
+            }
+
+            demap(<$UnsignedT>::midpoint(map(self), map(rhs)))
+        }
+
         /// Returns the logarithm of the number with respect to an arbitrary base,
         /// rounded down.
         ///
@@ -2432,21 +3105,9 @@ macro_rules! int_impl {
             if self <= 0 || base <= 1 {
                 None
             } else {
-                let mut n = 0;
-                let mut r = self;
-
-                // Optimization for 128 bit wide integers.
-                if Self::BITS == 128 {
-                    let b = Self::ilog2(self) / (Self::ilog2(base) + 1);
-                    n += b;
-                    r /= base.pow(b as u32);
-                }
-
-                while r >= base {
-                    r /= base;
-                    n += 1;
-                }
-                Some(n)
+                // Delegate to the unsigned implementation.
+                // The condition makes sure that both casts are exact.
+                (self as $UnsignedT).checked_ilog(base as $UnsignedT)
             }
         }
 
@@ -2508,7 +3169,8 @@ macro_rules! int_impl {
         /// that code in debug mode will trigger a panic on this case and
         /// optimized code will return
         #[doc = concat!("`", stringify!($SelfT), "::MIN`")]
-        /// without a panic.
+        /// without a panic. If you do not want this behavior, consider
+        /// using [`unsigned_abs`](Self::unsigned_abs) instead.
         ///
         /// # Examples
         ///
@@ -2598,13 +3260,16 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
-        #[rustc_allow_const_fn_unstable(const_cmp)]
         pub const fn signum(self) -> Self {
             // Picking the right way to phrase this is complicated
             // (<https://graphics.stanford.edu/~seander/bithacks.html#CopyIntegerSign>)
             // so delegate it to `Ord` which is already producing -1/0/+1
             // exactly like we need and can be the place to deal with the complexity.
-            self.cmp(&0) as _
+
+            // FIXME(const-hack): replace with cmp
+            if self < 0 { -1 }
+            else if self == 0 { 0 }
+            else { 1 }
         }
 
         /// Returns `true` if `self` is positive and `false` if the number is zero or
@@ -2829,6 +3494,7 @@ macro_rules! int_impl {
         #[rustc_promotable]
         #[rustc_const_stable(feature = "const_min_value", since = "1.32.0")]
         #[deprecated(since = "TBD", note = "replaced by the `MIN` associated constant on this type")]
+        #[rustc_diagnostic_item = concat!(stringify!($SelfT), "_legacy_fn_min_value")]
         pub const fn min_value() -> Self {
             Self::MIN
         }
@@ -2842,6 +3508,7 @@ macro_rules! int_impl {
         #[rustc_promotable]
         #[rustc_const_stable(feature = "const_max_value", since = "1.32.0")]
         #[deprecated(since = "TBD", note = "replaced by the `MAX` associated constant on this type")]
+        #[rustc_diagnostic_item = concat!(stringify!($SelfT), "_legacy_fn_max_value")]
         pub const fn max_value() -> Self {
             Self::MAX
         }

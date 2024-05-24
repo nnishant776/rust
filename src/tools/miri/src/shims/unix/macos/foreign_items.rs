@@ -1,23 +1,25 @@
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
 
+use crate::shims::unix::*;
 use crate::*;
-use shims::foreign_items::EmulateByNameResult;
-use shims::unix::fs::EvalContextExt as _;
-use shims::unix::thread::EvalContextExt as _;
+
+pub fn is_dyn_sym(_name: &str) -> bool {
+    false
+}
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    fn emulate_foreign_item_by_name(
+    fn emulate_foreign_item_inner(
         &mut self,
         link_name: Symbol,
         abi: Abi,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
+        dest: &MPlaceTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
-        // See `fn emulate_foreign_item_by_name` in `shims/foreign_items.rs` for the general pattern.
+        // See `fn emulate_foreign_item_inner` in `shims/foreign_items.rs` for the general pattern.
 
         match link_name.as_str() {
             // errno
@@ -36,18 +38,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "stat" | "stat64" | "stat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_stat(path, buf)?;
+                let result = this.macos_fbsd_stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "lstat" | "lstat64" | "lstat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_lstat(path, buf)?;
+                let result = this.macos_fbsd_lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "fstat" | "fstat64" | "fstat$INODE64" => {
                 let [fd, buf] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fstat(fd, buf)?;
+                let result = this.macos_fbsd_fstat(fd, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "opendir$INODE64" => {
@@ -58,21 +60,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "readdir_r" | "readdir_r$INODE64" => {
                 let [dirp, entry, result] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_readdir_r(dirp, entry, result)?;
-                this.write_scalar(result, dest)?;
-            }
-            "lseek" => {
-                let [fd, offset, whence] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                // macOS is 64bit-only, so this is lseek64
-                let result = this.lseek64(fd, offset, whence)?;
-                this.write_scalar(result, dest)?;
-            }
-            "ftruncate" => {
-                let [fd, length] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                // macOS is 64bit-only, so this is ftruncate64
-                let result = this.ftruncate64(fd, length)?;
+                let result = this.macos_fbsd_readdir_r(dirp, entry, result)?;
                 this.write_scalar(result, dest)?;
             }
             "realpath$DARWIN_EXTSN" => {
@@ -85,10 +73,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Environment related shims
             "_NSGetEnviron" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.write_pointer(
-                    this.machine.env_vars.environ.expect("machine must be initialized").ptr,
-                    dest,
-                )?;
+                let environ = this.machine.env_vars.unix().environ();
+                this.write_pointer(environ, dest)?;
             }
 
             // Time related shims
@@ -107,17 +93,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Access to command-line arguments
             "_NSGetArgc" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.write_pointer(
-                    this.machine.argc.expect("machine must be initialized").ptr,
-                    dest,
-                )?;
+                this.write_pointer(this.machine.argc.expect("machine must be initialized"), dest)?;
             }
             "_NSGetArgv" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.write_pointer(
-                    this.machine.argv.expect("machine must be initialized").ptr,
-                    dest,
-                )?;
+                this.write_pointer(this.machine.argv.expect("machine must be initialized"), dest)?;
             }
             "_NSGetExecutablePath" => {
                 let [buf, bufsize] =
@@ -125,7 +105,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.check_no_isolation("`_NSGetExecutablePath`")?;
 
                 let buf_ptr = this.read_pointer(buf)?;
-                let bufsize = this.deref_operand(bufsize)?;
+                let bufsize = this.deref_pointer(bufsize)?;
 
                 // Using the host current_exe is a bit off, but consistent with Linux
                 // (where stdlib reads /proc/self/exe).
@@ -133,16 +113,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let (written, size_needed) = this.write_path_to_c_str(
                     &path,
                     buf_ptr,
-                    this.read_scalar(&bufsize.into())?.to_u32()?.into(),
+                    this.read_scalar(&bufsize)?.to_u32()?.into(),
                 )?;
 
                 if written {
                     this.write_null(dest)?;
                 } else {
-                    this.write_scalar(
-                        Scalar::from_u32(size_needed.try_into().unwrap()),
-                        &bufsize.into(),
-                    )?;
+                    this.write_scalar(Scalar::from_u32(size_needed.try_into().unwrap()), &bufsize)?;
                     this.write_int(-1, dest)?;
                 }
             }
@@ -197,19 +174,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.write_scalar(res, dest)?;
             }
 
-            // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
-            // These shims are enabled only when the caller is in the standard library.
-            "mmap" if this.frame_in_std() => {
-                // This is a horrible hack, but since the guard page mechanism calls mmap and expects a particular return value, we just give it that value.
-                let [addr, _, _, _, _, _] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let addr = this.read_scalar(addr)?;
-                this.write_scalar(addr, dest)?;
-            }
-
-            _ => return Ok(EmulateByNameResult::NotSupported),
+            _ => return Ok(EmulateItemResult::NotSupported),
         };
 
-        Ok(EmulateByNameResult::NeedsJumping)
+        Ok(EmulateItemResult::NeedsReturn)
     }
 }

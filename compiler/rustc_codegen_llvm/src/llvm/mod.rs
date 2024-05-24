@@ -11,6 +11,7 @@ pub use self::RealPredicate::*;
 use libc::c_uint;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_llvm::RustString;
+use rustc_target::abi::Align;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::str::FromStr;
@@ -137,6 +138,7 @@ impl FromStr for ArchiveKind {
             "bsd" => Ok(ArchiveKind::K_BSD),
             "darwin" => Ok(ArchiveKind::K_DARWIN),
             "coff" => Ok(ArchiveKind::K_COFF),
+            "aix_big" => Ok(ArchiveKind::K_AIXBIG),
             _ => Err(()),
         }
     }
@@ -228,9 +230,9 @@ pub fn set_visibility(llglobal: &Value, visibility: Visibility) {
     }
 }
 
-pub fn set_alignment(llglobal: &Value, bytes: usize) {
+pub fn set_alignment(llglobal: &Value, align: Align) {
     unsafe {
-        ffi::LLVMSetAlignment(llglobal, bytes as c_uint);
+        ffi::LLVMSetAlignment(llglobal, align.bytes() as c_uint);
     }
 }
 

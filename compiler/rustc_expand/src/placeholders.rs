@@ -2,13 +2,14 @@ use crate::expand::{AstFragment, AstFragmentKind};
 use rustc_ast as ast;
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
+use rustc_ast::token::Delimiter;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_span::source_map::DUMMY_SP;
 use rustc_span::symbol::Ident;
+use rustc_span::DUMMY_SP;
 use smallvec::{smallvec, SmallVec};
 use thin_vec::ThinVec;
 
-pub fn placeholder(
+pub(crate) fn placeholder(
     kind: AstFragmentKind,
     id: ast::NodeId,
     vis: Option<ast::Visibility>,
@@ -18,10 +19,9 @@ pub fn placeholder(
             path: ast::Path { span: DUMMY_SP, segments: ThinVec::new(), tokens: None },
             args: P(ast::DelimArgs {
                 dspan: ast::tokenstream::DelimSpan::dummy(),
-                delim: ast::MacDelimiter::Parenthesis,
+                delim: Delimiter::Parenthesis,
                 tokens: ast::tokenstream::TokenStream::new(Vec::new()),
             }),
-            prior_type_ascription: None,
         })
     }
 
@@ -119,7 +119,7 @@ pub fn placeholder(
         }]),
         AstFragmentKind::Arms => AstFragment::Arms(smallvec![ast::Arm {
             attrs: Default::default(),
-            body: expr_placeholder(),
+            body: Some(expr_placeholder()),
             guard: None,
             id,
             pat: pat(),
@@ -174,7 +174,10 @@ pub fn placeholder(
         }]),
         AstFragmentKind::Variants => AstFragment::Variants(smallvec![ast::Variant {
             attrs: Default::default(),
-            data: ast::VariantData::Struct(Default::default(), false),
+            data: ast::VariantData::Struct {
+                fields: Default::default(),
+                recovered: ast::Recovered::No
+            },
             disr_expr: None,
             id,
             ident,
@@ -271,14 +274,14 @@ impl MutVisitor for PlaceholderExpander {
     fn flat_map_trait_item(&mut self, item: P<ast::AssocItem>) -> SmallVec<[P<ast::AssocItem>; 1]> {
         match item.kind {
             ast::AssocItemKind::MacCall(_) => self.remove(item.id).make_trait_items(),
-            _ => noop_flat_map_assoc_item(item, self),
+            _ => noop_flat_map_item(item, self),
         }
     }
 
     fn flat_map_impl_item(&mut self, item: P<ast::AssocItem>) -> SmallVec<[P<ast::AssocItem>; 1]> {
         match item.kind {
             ast::AssocItemKind::MacCall(_) => self.remove(item.id).make_impl_items(),
-            _ => noop_flat_map_assoc_item(item, self),
+            _ => noop_flat_map_item(item, self),
         }
     }
 
@@ -288,7 +291,7 @@ impl MutVisitor for PlaceholderExpander {
     ) -> SmallVec<[P<ast::ForeignItem>; 1]> {
         match item.kind {
             ast::ForeignItemKind::MacCall(_) => self.remove(item.id).make_foreign_items(),
-            _ => noop_flat_map_foreign_item(item, self),
+            _ => noop_flat_map_item(item, self),
         }
     }
 

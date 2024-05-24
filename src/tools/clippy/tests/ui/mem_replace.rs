@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![allow(unused)]
 #![warn(
     clippy::all,
@@ -73,6 +71,14 @@ fn dont_lint_primitive() {
     let _ = std::mem::replace(&mut pint, 0);
 }
 
+// lint is disabled for expressions that are not used because changing to `take` is not the
+// recommended fix. Additionally, the `replace` is #[must_use], so that lint will provide
+// the correct suggestion
+fn dont_lint_not_used() {
+    let mut s = String::from("foo");
+    std::mem::replace(&mut s, String::default());
+}
+
 fn main() {
     replace_option_with_none();
     replace_with_default();
@@ -89,4 +95,38 @@ fn msrv_1_39() {
 fn msrv_1_40() {
     let mut s = String::from("foo");
     let _ = std::mem::replace(&mut s, String::default());
+}
+
+fn issue9824() {
+    struct Foo<'a>(Option<&'a str>);
+    impl<'a> std::ops::Deref for Foo<'a> {
+        type Target = Option<&'a str>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl<'a> std::ops::DerefMut for Foo<'a> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    struct Bar {
+        opt: Option<u8>,
+        val: String,
+    }
+
+    let mut f = Foo(Some("foo"));
+    let mut b = Bar {
+        opt: Some(1),
+        val: String::from("bar"),
+    };
+
+    // replace option with none
+    let _ = std::mem::replace(&mut f.0, None);
+    let _ = std::mem::replace(&mut *f, None);
+    let _ = std::mem::replace(&mut b.opt, None);
+    // replace with default
+    let _ = std::mem::replace(&mut b.val, String::default());
 }

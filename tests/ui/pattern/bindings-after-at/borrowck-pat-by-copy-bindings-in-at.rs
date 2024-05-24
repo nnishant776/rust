@@ -1,6 +1,8 @@
-// check-pass
+//@ check-pass
 
 // Test `Copy` bindings in the rhs of `@` patterns.
+
+#![allow(dropping_copy_types)]
 
 #[derive(Copy, Clone)]
 struct C;

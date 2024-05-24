@@ -148,7 +148,7 @@ fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<St
     format_to!(example, "use {use_path};\n\n");
     if let Some(self_name) = &self_name {
         if let Some(mut_) = is_ref_mut_self(ast_func) {
-            let mut_ = if mut_ == true { "mut " } else { "" };
+            let mut_ = if mut_ { "mut " } else { "" };
             format_to!(example, "let {mut_}{self_name} = ;\n");
         }
     }
@@ -324,7 +324,7 @@ fn self_name(ast_func: &ast::Fn) -> Option<String> {
     self_partial_type(ast_func).map(|name| to_lower_snake_case(&name))
 }
 
-/// Heper function to get the name of the type of `self`
+/// Helper function to get the name of the type of `self`
 fn self_type(ast_func: &ast::Fn) -> Option<ast::Type> {
     ast_func.syntax().ancestors().find_map(ast::Impl::cast).and_then(|i| i.self_ty())
 }
@@ -350,7 +350,7 @@ fn self_type_without_lifetimes(ast_func: &ast::Fn) -> Option<String> {
     Some(name)
 }
 
-/// Heper function to get the name of the type of `self` without generic arguments
+/// Helper function to get the name of the type of `self` without generic arguments
 fn self_partial_type(ast_func: &ast::Fn) -> Option<String> {
     let mut self_type = self_type(ast_func)?.to_string();
     if let Some(idx) = self_type.find(|c| ['<', ' '].contains(&c)) {
@@ -364,7 +364,7 @@ fn is_in_trait_impl(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
     ctx.sema
         .to_def(ast_func)
         .and_then(|hir_func| hir_func.as_assoc_item(ctx.db()))
-        .and_then(|assoc_item| assoc_item.containing_trait_impl(ctx.db()))
+        .and_then(|assoc_item| assoc_item.implemented_trait(ctx.db()))
         .is_some()
 }
 
@@ -373,7 +373,7 @@ fn is_in_trait_def(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
     ctx.sema
         .to_def(ast_func)
         .and_then(|hir_func| hir_func.as_assoc_item(ctx.db()))
-        .and_then(|assoc_item| assoc_item.containing_trait(ctx.db()))
+        .and_then(|assoc_item| assoc_item.container_trait(ctx.db()))
         .is_some()
 }
 
@@ -416,9 +416,9 @@ fn arguments_from_params(param_list: &ast::ParamList) -> String {
                 true => format!("&mut {name}"),
                 false => name.to_string(),
             },
-            None => "_".to_string(),
+            None => "_".to_owned(),
         },
-        _ => "_".to_string(),
+        _ => "_".to_owned(),
     });
     args_iter.format(", ").to_string()
 }

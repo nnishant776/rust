@@ -7,9 +7,12 @@
 //! Hopefully, one day a reliable file watching/walking crate appears on
 //! crates.io, and we can reduce this to trivial glue code.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
-use std::fs;
+use std::{
+    fs,
+    path::{Component, Path},
+};
 
 use crossbeam_channel::{never, select, unbounded, Receiver, Sender};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -21,7 +24,7 @@ use walkdir::WalkDir;
 pub struct NotifyHandle {
     // Relative order of fields below is significant.
     sender: Sender<Message>,
-    _thread: jod_thread::JoinHandle,
+    _thread: stdx::thread::JoinHandle,
 }
 
 #[derive(Debug)]
@@ -34,7 +37,7 @@ impl loader::Handle for NotifyHandle {
     fn spawn(sender: loader::Sender) -> NotifyHandle {
         let actor = NotifyActor::new(sender);
         let (sender, receiver) = unbounded::<Message>();
-        let thread = jod_thread::Builder::new()
+        let thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker)
             .name("VfsLoader".to_owned())
             .spawn(move || actor.run(receiver))
             .expect("failed to spawn thread");
@@ -103,7 +106,12 @@ impl NotifyActor {
                         let config_version = config.version;
 
                         let n_total = config.load.len();
-                        self.send(loader::Message::Progress { n_total, n_done: 0, config_version });
+                        self.send(loader::Message::Progress {
+                            n_total,
+                            n_done: None,
+                            config_version,
+                            dir: None,
+                        });
 
                         self.watched_entries.clear();
 
@@ -112,19 +120,26 @@ impl NotifyActor {
                             if watch {
                                 self.watched_entries.push(entry.clone());
                             }
-                            let files = self.load_entry(entry, watch);
+                            let files =
+                                self.load_entry(entry, watch, |file| loader::Message::Progress {
+                                    n_total,
+                                    n_done: Some(i),
+                                    dir: Some(file),
+                                    config_version,
+                                });
                             self.send(loader::Message::Loaded { files });
                             self.send(loader::Message::Progress {
                                 n_total,
-                                n_done: i + 1,
+                                n_done: Some(i + 1),
                                 config_version,
+                                dir: None,
                             });
                         }
                     }
                     Message::Invalidate(path) => {
                         let contents = read(path.as_path());
                         let files = vec![(path, contents)];
-                        self.send(loader::Message::Loaded { files });
+                        self.send(loader::Message::Changed { files });
                     }
                 },
                 Event::NotifyEvent(event) => {
@@ -160,7 +175,7 @@ impl NotifyActor {
                                 Some((path, contents))
                             })
                             .collect();
-                        self.send(loader::Message::Loaded { files });
+                        self.send(loader::Message::Changed { files });
                     }
                 }
             }
@@ -170,6 +185,7 @@ impl NotifyActor {
         &mut self,
         entry: loader::Entry,
         watch: bool,
+        make_message: impl Fn(AbsPathBuf) -> loader::Message,
     ) -> Vec<(AbsPathBuf, Option<Vec<u8>>)> {
         match entry {
             loader::Entry::Files(files) => files
@@ -186,20 +202,30 @@ impl NotifyActor {
                 let mut res = Vec::new();
 
                 for root in &dirs.include {
+                    self.send(make_message(root.clone()));
                     let walkdir =
                         WalkDir::new(root).follow_links(true).into_iter().filter_entry(|entry| {
                             if !entry.file_type().is_dir() {
                                 return true;
                             }
-                            let path = AbsPath::assert(entry.path());
+                            let path = entry.path();
+
+                            if path_is_parent_symlink(path) {
+                                return false;
+                            }
+
                             root == path
                                 || dirs.exclude.iter().chain(&dirs.include).all(|it| it != path)
                         });
 
                     let files = walkdir.filter_map(|it| it.ok()).filter_map(|entry| {
+                        let depth = entry.depth();
                         let is_dir = entry.file_type().is_dir();
                         let is_file = entry.file_type().is_file();
-                        let abs_path = AbsPathBuf::assert(entry.into_path());
+                        let abs_path = AbsPathBuf::try_from(entry.into_path()).ok()?;
+                        if depth < 2 && is_dir {
+                            self.send(make_message(abs_path.clone()));
+                        }
                         if is_dir && watch {
                             self.watch(abs_path.clone());
                         }
@@ -239,4 +265,22 @@ fn read(path: &AbsPath) -> Option<Vec<u8>> {
 
 fn log_notify_error<T>(res: notify::Result<T>) -> Option<T> {
     res.map_err(|err| tracing::warn!("notify error: {}", err)).ok()
+}
+
+/// Is `path` a symlink to a parent directory?
+///
+/// Including this path is guaranteed to cause an infinite loop. This
+/// heuristic is not sufficient to catch all symlink cycles (it's
+/// possible to construct cycle using two or more symlinks), but it
+/// catches common cases.
+fn path_is_parent_symlink(path: &Path) -> bool {
+    let Ok(destination) = std::fs::read_link(path) else {
+        return false;
+    };
+
+    // If the symlink is of the form "../..", it's a parent symlink.
+    let is_relative_parent =
+        destination.components().all(|c| matches!(c, Component::CurDir | Component::ParentDir));
+
+    is_relative_parent || path.starts_with(destination)
 }

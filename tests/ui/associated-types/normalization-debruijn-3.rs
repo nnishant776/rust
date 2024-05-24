@@ -1,15 +1,15 @@
-// build-pass
-// edition:2018
+//@ build-pass
+//@ edition:2018
 
 // Regression test to ensure we handle debruijn indices correctly in projection
 // normalization under binders. Found in crater run for #85499
 
 use std::future::{Future, Ready};
 async fn read() {
-    let _ = connect(&()).await;
+    connect(&()).await;
 }
 async fn connect<A: ToSocketAddr>(addr: A) {
-    let _ = addr.to_socket_addr().await;
+    addr.to_socket_addr().await;
 }
 pub trait ToSocketAddr {
     type Future: Future<Output = ()>;

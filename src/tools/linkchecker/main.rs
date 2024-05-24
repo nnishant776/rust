@@ -14,6 +14,10 @@
 //! A few exceptions are allowed as there's known bugs in rustdoc, but this
 //! should catch the majority of "broken link" cases.
 
+use html5ever::tendril::ByteTendril;
+use html5ever::tokenizer::{
+    BufferQueue, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -22,9 +26,6 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
-
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 // Add linkcheck exceptions here
 // If at all possible you should use intra-doc links to avoid linkcheck issues. These
@@ -66,8 +67,12 @@ const INTRA_DOC_LINK_EXCEPTIONS: &[(&str, &[&str])] = &[
 
 ];
 
-static BROKEN_INTRA_DOC_LINK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\[<code>(.*)</code>\]"#).unwrap());
+macro_rules! static_regex {
+    ($re:literal) => {{
+        static RE: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
+        RE.get_or_init(|| ::regex::Regex::new($re).unwrap())
+    }};
+}
 
 macro_rules! t {
     ($e:expr) => {
@@ -139,18 +144,18 @@ enum FileEntry {
 type Cache = HashMap<String, FileEntry>;
 
 fn small_url_encode(s: &str) -> String {
-    s.replace("<", "%3C")
-        .replace(">", "%3E")
-        .replace(" ", "%20")
-        .replace("?", "%3F")
-        .replace("'", "%27")
-        .replace("&", "%26")
-        .replace(",", "%2C")
-        .replace(":", "%3A")
-        .replace(";", "%3B")
-        .replace("[", "%5B")
-        .replace("]", "%5D")
-        .replace("\"", "%22")
+    s.replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace(' ', "%20")
+        .replace('?', "%3F")
+        .replace('\'', "%27")
+        .replace('&', "%26")
+        .replace(',', "%2C")
+        .replace(':', "%3A")
+        .replace(';', "%3B")
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('\"', "%22")
 }
 
 impl Checker {
@@ -182,164 +187,10 @@ impl Checker {
             }
         };
 
-        // Search for anything that's the regex 'href[ ]*=[ ]*".*?"'
-        with_attrs_in_source(&source, " href", |url, i, base| {
-            // Ignore external URLs
-            if url.starts_with("http:")
-                || url.starts_with("https:")
-                || url.starts_with("javascript:")
-                || url.starts_with("ftp:")
-                || url.starts_with("irc:")
-                || url.starts_with("data:")
-                || url.starts_with("mailto:")
-            {
-                report.links_ignored_external += 1;
-                return;
-            }
-            report.links_checked += 1;
-            let (url, fragment) = match url.split_once('#') {
-                None => (url, None),
-                Some((url, fragment)) => (url, Some(fragment)),
-            };
-            // NB: the `splitn` always succeeds, even if the delimiter is not present.
-            let url = url.splitn(2, '?').next().unwrap();
-
-            // Once we've plucked out the URL, parse it using our base url and
-            // then try to extract a file path.
-            let mut path = file.to_path_buf();
-            if !base.is_empty() || !url.is_empty() {
-                path.pop();
-                for part in Path::new(base).join(url).components() {
-                    match part {
-                        Component::Prefix(_) | Component::RootDir => {
-                            // Avoid absolute paths as they make the docs not
-                            // relocatable by making assumptions on where the docs
-                            // are hosted relative to the site root.
-                            report.errors += 1;
-                            println!(
-                                "{}:{}: absolute path - {}",
-                                pretty_path,
-                                i + 1,
-                                Path::new(base).join(url).display()
-                            );
-                            return;
-                        }
-                        Component::CurDir => {}
-                        Component::ParentDir => {
-                            path.pop();
-                        }
-                        Component::Normal(s) => {
-                            path.push(s);
-                        }
-                    }
-                }
-            }
-
-            let (target_pretty_path, target_entry) = self.load_file(&path, report);
-            let (target_source, target_ids) = match target_entry {
-                FileEntry::Missing => {
-                    if is_exception(file, &target_pretty_path) {
-                        report.links_ignored_exception += 1;
-                    } else {
-                        report.errors += 1;
-                        println!(
-                            "{}:{}: broken link - `{}`",
-                            pretty_path,
-                            i + 1,
-                            target_pretty_path
-                        );
-                    }
-                    return;
-                }
-                FileEntry::Dir => {
-                    // Links to directories show as directory listings when viewing
-                    // the docs offline so it's best to avoid them.
-                    report.errors += 1;
-                    println!(
-                        "{}:{}: directory link to `{}` \
-                         (directory links should use index.html instead)",
-                        pretty_path,
-                        i + 1,
-                        target_pretty_path
-                    );
-                    return;
-                }
-                FileEntry::OtherFile => return,
-                FileEntry::Redirect { target } => {
-                    let t = target.clone();
-                    drop(target);
-                    let (target, redir_entry) = self.load_file(&t, report);
-                    match redir_entry {
-                        FileEntry::Missing => {
-                            report.errors += 1;
-                            println!(
-                                "{}:{}: broken redirect from `{}` to `{}`",
-                                pretty_path,
-                                i + 1,
-                                target_pretty_path,
-                                target
-                            );
-                            return;
-                        }
-                        FileEntry::Redirect { target } => {
-                            // Redirect to a redirect, this link checker
-                            // currently doesn't support this, since it would
-                            // require cycle checking, etc.
-                            report.errors += 1;
-                            println!(
-                                "{}:{}: redirect from `{}` to `{}` \
-                                 which is also a redirect (not supported)",
-                                pretty_path,
-                                i + 1,
-                                target_pretty_path,
-                                target.display()
-                            );
-                            return;
-                        }
-                        FileEntry::Dir => {
-                            report.errors += 1;
-                            println!(
-                                "{}:{}: redirect from `{}` to `{}` \
-                                 which is a directory \
-                                 (directory links should use index.html instead)",
-                                pretty_path,
-                                i + 1,
-                                target_pretty_path,
-                                target
-                            );
-                            return;
-                        }
-                        FileEntry::OtherFile => return,
-                        FileEntry::HtmlFile { source, ids } => (source, ids),
-                    }
-                }
-                FileEntry::HtmlFile { source, ids } => (source, ids),
-            };
-
-            // Alright, if we've found an HTML file for the target link. If
-            // this is a fragment link, also check that the `id` exists.
-            if let Some(ref fragment) = fragment {
-                // Fragments like `#1-6` are most likely line numbers to be
-                // interpreted by javascript, so we're ignoring these
-                if fragment.splitn(2, '-').all(|f| f.chars().all(|c| c.is_numeric())) {
-                    return;
-                }
-
-                parse_ids(&mut target_ids.borrow_mut(), &pretty_path, target_source, report);
-
-                if target_ids.borrow().contains(*fragment) {
-                    return;
-                }
-
-                if is_exception(file, &format!("#{}", fragment)) {
-                    report.links_ignored_exception += 1;
-                } else {
-                    report.errors += 1;
-                    print!("{}:{}: broken link fragment ", pretty_path, i + 1);
-                    println!("`#{}` pointing to `{}`", fragment, target_pretty_path);
-                };
-            }
-        });
+        let (base, urls) = get_urls(&source);
+        for (i, url) in urls {
+            self.check_url(file, &pretty_path, report, &base, i, &url);
+        }
 
         self.check_intra_doc_links(file, &pretty_path, &source, report);
 
@@ -348,6 +199,159 @@ impl Checker {
         match self.cache.get_mut(&pretty_path).unwrap() {
             FileEntry::HtmlFile { source, .. } => *source = Rc::new(String::new()),
             _ => unreachable!("must be html file"),
+        }
+    }
+
+    fn check_url(
+        &mut self,
+        file: &Path,
+        pretty_path: &str,
+        report: &mut Report,
+        base: &Option<String>,
+        i: u64,
+        url: &str,
+    ) {
+        // Ignore external URLs
+        if url.starts_with("http:")
+            || url.starts_with("https:")
+            || url.starts_with("javascript:")
+            || url.starts_with("ftp:")
+            || url.starts_with("irc:")
+            || url.starts_with("data:")
+            || url.starts_with("mailto:")
+        {
+            report.links_ignored_external += 1;
+            return;
+        }
+        report.links_checked += 1;
+        let (url, fragment) = match url.split_once('#') {
+            None => (url, None),
+            Some((url, fragment)) => (url, Some(fragment)),
+        };
+        // NB: the `splitn` always succeeds, even if the delimiter is not present.
+        let url = url.splitn(2, '?').next().unwrap();
+
+        // Once we've plucked out the URL, parse it using our base url and
+        // then try to extract a file path.
+        let mut path = file.to_path_buf();
+        if base.is_some() || !url.is_empty() {
+            let base = base.as_deref().unwrap_or("");
+            path.pop();
+            for part in Path::new(base).join(url).components() {
+                match part {
+                    Component::Prefix(_) | Component::RootDir => {
+                        // Avoid absolute paths as they make the docs not
+                        // relocatable by making assumptions on where the docs
+                        // are hosted relative to the site root.
+                        report.errors += 1;
+                        println!(
+                            "{}:{}: absolute path - {}",
+                            pretty_path,
+                            i,
+                            Path::new(base).join(url).display()
+                        );
+                        return;
+                    }
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        path.pop();
+                    }
+                    Component::Normal(s) => {
+                        path.push(s);
+                    }
+                }
+            }
+        }
+
+        let (target_pretty_path, target_entry) = self.load_file(&path, report);
+        let (target_source, target_ids) = match target_entry {
+            FileEntry::Missing => {
+                if is_exception(file, &target_pretty_path) {
+                    report.links_ignored_exception += 1;
+                } else {
+                    report.errors += 1;
+                    println!("{}:{}: broken link - `{}`", pretty_path, i, target_pretty_path);
+                }
+                return;
+            }
+            FileEntry::Dir => {
+                // Links to directories show as directory listings when viewing
+                // the docs offline so it's best to avoid them.
+                report.errors += 1;
+                println!(
+                    "{}:{}: directory link to `{}` \
+                         (directory links should use index.html instead)",
+                    pretty_path, i, target_pretty_path
+                );
+                return;
+            }
+            FileEntry::OtherFile => return,
+            FileEntry::Redirect { target } => {
+                let t = target.clone();
+                let (target, redir_entry) = self.load_file(&t, report);
+                match redir_entry {
+                    FileEntry::Missing => {
+                        report.errors += 1;
+                        println!(
+                            "{}:{}: broken redirect from `{}` to `{}`",
+                            pretty_path, i, target_pretty_path, target
+                        );
+                        return;
+                    }
+                    FileEntry::Redirect { target } => {
+                        // Redirect to a redirect, this link checker
+                        // currently doesn't support this, since it would
+                        // require cycle checking, etc.
+                        report.errors += 1;
+                        println!(
+                            "{}:{}: redirect from `{}` to `{}` \
+                                 which is also a redirect (not supported)",
+                            pretty_path,
+                            i,
+                            target_pretty_path,
+                            target.display()
+                        );
+                        return;
+                    }
+                    FileEntry::Dir => {
+                        report.errors += 1;
+                        println!(
+                            "{}:{}: redirect from `{}` to `{}` \
+                                 which is a directory \
+                                 (directory links should use index.html instead)",
+                            pretty_path, i, target_pretty_path, target
+                        );
+                        return;
+                    }
+                    FileEntry::OtherFile => return,
+                    FileEntry::HtmlFile { source, ids } => (source, ids),
+                }
+            }
+            FileEntry::HtmlFile { source, ids } => (source, ids),
+        };
+
+        // Alright, if we've found an HTML file for the target link. If
+        // this is a fragment link, also check that the `id` exists.
+        if let Some(ref fragment) = fragment {
+            // Fragments like `#1-6` are most likely line numbers to be
+            // interpreted by javascript, so we're ignoring these
+            if fragment.splitn(2, '-').all(|f| f.chars().all(|c| c.is_numeric())) {
+                return;
+            }
+
+            parse_ids(&mut target_ids.borrow_mut(), &pretty_path, target_source, report);
+
+            if target_ids.borrow().contains(*fragment) {
+                return;
+            }
+
+            if is_exception(file, &format!("#{}", fragment)) {
+                report.links_ignored_exception += 1;
+            } else {
+                report.errors += 1;
+                print!("{}:{}: broken link fragment ", pretty_path, i);
+                println!("`#{}` pointing to `{}`", fragment, target_pretty_path);
+            };
         }
     }
 
@@ -369,10 +373,9 @@ impl Checker {
             return;
         }
         // Search for intra-doc links that rustdoc didn't warn about
-        // FIXME(#77199, 77200) Rustdoc should just warn about these directly.
         // NOTE: only looks at one line at a time; in practice this should find most links
         for (i, line) in source.lines().enumerate() {
-            for broken_link in BROKEN_INTRA_DOC_LINK.captures_iter(line) {
+            for broken_link in static_regex!(r#"\[<code>(.*)</code>\]"#).captures_iter(line) {
                 if is_intra_doc_exception(file, &broken_link[1]) {
                     report.intra_doc_exceptions += 1;
                 } else {
@@ -391,7 +394,7 @@ impl Checker {
         const ERROR_INVALID_NAME: i32 = 123;
 
         let pretty_path =
-            file.strip_prefix(&self.root).unwrap_or(&file).to_str().unwrap().to_string();
+            file.strip_prefix(&self.root).unwrap_or(file).to_str().unwrap().to_string();
 
         let entry =
             self.cache.entry(pretty_path.clone()).or_insert_with(|| match fs::metadata(file) {
@@ -470,10 +473,8 @@ fn is_exception(file: &Path, link: &str) -> bool {
         // NOTE: This cannot be added to `LINKCHECK_EXCEPTIONS` because the resolved path
         // calculated in `check` function is outside `build/<triple>/doc` dir.
         // So the `strip_prefix` method just returns the old absolute broken path.
-        if file.ends_with("std/primitive.slice.html") {
-            if link.ends_with("primitive.slice.html") {
-                return true;
-            }
+        if file.ends_with("std/primitive.slice.html") && link.ends_with("primitive.slice.html") {
+            return true;
         }
         false
     }
@@ -500,59 +501,93 @@ fn maybe_redirect(source: &str) -> Option<String> {
     find_redirect(REDIRECT_RUSTDOC).or_else(|| find_redirect(REDIRECT_MDBOOK))
 }
 
-fn with_attrs_in_source<F: FnMut(&str, usize, &str)>(source: &str, attr: &str, mut f: F) {
-    let mut base = "";
-    for (i, mut line) in source.lines().enumerate() {
-        while let Some(j) = line.find(attr) {
-            let rest = &line[j + attr.len()..];
-            // The base tag should always be the first link in the document so
-            // we can get away with using one pass.
-            let is_base = line[..j].ends_with("<base");
-            line = rest;
-            let pos_equals = match rest.find('=') {
-                Some(i) => i,
-                None => continue,
-            };
-            if rest[..pos_equals].trim_start_matches(' ') != "" {
-                continue;
-            }
+fn parse_html<Sink: TokenSink>(source: &str, sink: Sink) -> Sink {
+    let tendril: ByteTendril = source.as_bytes().into();
+    let mut input = BufferQueue::new();
+    input.push_back(tendril.try_reinterpret().unwrap());
 
-            let rest = &rest[pos_equals + 1..];
+    let mut tok = Tokenizer::new(sink, TokenizerOpts::default());
+    let _ = tok.feed(&mut input);
+    assert!(input.is_empty());
+    tok.end();
+    tok.sink
+}
 
-            let pos_quote = match rest.find(&['"', '\''][..]) {
-                Some(i) => i,
-                None => continue,
-            };
-            let quote_delim = rest.as_bytes()[pos_quote] as char;
+#[derive(Default)]
+struct AttrCollector {
+    attr_name: &'static [u8],
+    base: Option<String>,
+    found_attrs: Vec<(u64, String)>,
+    /// Tracks whether or not it is inside a <script> tag.
+    ///
+    /// A lot of our sources have JSON script tags which have HTML embedded
+    /// within, but that cannot be parsed or processed correctly (since it is
+    /// JSON, not HTML). I think the sink is supposed to return
+    /// `TokenSinkResult::Script(…)` (and then maybe switch parser?), but I
+    /// don't fully understand the best way to use that, and this seems good
+    /// enough for now.
+    in_script: bool,
+}
 
-            if rest[..pos_quote].trim_start_matches(' ') != "" {
-                continue;
+impl TokenSink for AttrCollector {
+    type Handle = ();
+
+    fn process_token(&mut self, token: Token, line_number: u64) -> TokenSinkResult<()> {
+        match token {
+            TagToken(tag) => {
+                let tag_name = tag.name.as_bytes();
+                if tag_name == b"base" {
+                    if let Some(href) =
+                        tag.attrs.iter().find(|attr| attr.name.local.as_bytes() == b"href")
+                    {
+                        self.base = Some(href.value.to_string());
+                    }
+                    return TokenSinkResult::Continue;
+                } else if tag_name == b"script" {
+                    self.in_script = !self.in_script;
+                }
+                if self.in_script {
+                    return TokenSinkResult::Continue;
+                }
+                for attr in tag.attrs.iter() {
+                    let name = attr.name.local.as_bytes();
+                    if name == self.attr_name {
+                        let url = attr.value.to_string();
+                        self.found_attrs.push((line_number, url));
+                    }
+                }
             }
-            let rest = &rest[pos_quote + 1..];
-            let url = match rest.find(quote_delim) {
-                Some(i) => &rest[..i],
-                None => continue,
-            };
-            if is_base {
-                base = url;
-                continue;
-            }
-            f(url, i, base)
+            // Note: ParseError is pretty noisy. It seems html5ever does not
+            // particularly like some kinds of HTML comments.
+            _ => {}
         }
+        TokenSinkResult::Continue
     }
 }
 
+/// Retrieves href="..." attributes from HTML elements.
+fn get_urls(source: &str) -> (Option<String>, Vec<(u64, String)>) {
+    let collector = AttrCollector { attr_name: b"href", ..AttrCollector::default() };
+    let sink = parse_html(source, collector);
+    (sink.base, sink.found_attrs)
+}
+
+/// Retrieves id="..." attributes from HTML elements.
 fn parse_ids(ids: &mut HashSet<String>, file: &str, source: &str, report: &mut Report) {
-    if ids.is_empty() {
-        with_attrs_in_source(source, " id", |fragment, i, _| {
-            let frag = fragment.trim_start_matches("#").to_owned();
-            let encoded = small_url_encode(&frag);
-            if !ids.insert(frag) {
-                report.errors += 1;
-                println!("{}:{}: id is not unique: `{}`", file, i, fragment);
-            }
-            // Just in case, we also add the encoded id.
-            ids.insert(encoded);
-        });
+    if !ids.is_empty() {
+        // ids have already been parsed
+        return;
+    }
+
+    let collector = AttrCollector { attr_name: b"id", ..AttrCollector::default() };
+    let sink = parse_html(source, collector);
+    for (line_number, id) in sink.found_attrs {
+        let encoded = small_url_encode(&id);
+        if let Some(id) = ids.replace(id) {
+            report.errors += 1;
+            println!("{}:{}: id is not unique: `{}`", file, line_number, id);
+        }
+        // Just in case, we also add the encoded id.
+        ids.insert(encoded);
     }
 }

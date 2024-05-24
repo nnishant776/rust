@@ -9,7 +9,8 @@ use crate::io;
 use crate::path::Path;
 use crate::sealed::Sealed;
 use crate::sys;
-use crate::sys_common::{AsInner, AsInnerMut};
+use crate::sys_common::{AsInner, AsInnerMut, IntoInner};
+use crate::time::SystemTime;
 
 /// Windows-specific extensions to [`fs::File`].
 #[stable(feature = "file_offset", since = "1.15.0")]
@@ -58,7 +59,7 @@ pub trait FileExt {
     /// function, it is set to the end of the write.
     ///
     /// When writing beyond the end of the file, the file is appropriately
-    /// extended and the intermediate bytes are left uninitialized.
+    /// extended and the intermediate bytes are set to zero.
     ///
     /// Note that similar to `File::write`, it is not an error to return a
     /// short write. When returning from such a short write, the file pointer
@@ -526,6 +527,22 @@ impl FileTypeExt for fs::FileType {
     }
 }
 
+/// Windows-specific extensions to [`fs::FileTimes`].
+#[stable(feature = "file_set_times", since = "1.75.0")]
+pub trait FileTimesExt: Sealed {
+    /// Set the creation time of a file.
+    #[stable(feature = "file_set_times", since = "1.75.0")]
+    fn set_created(self, t: SystemTime) -> Self;
+}
+
+#[stable(feature = "file_set_times", since = "1.75.0")]
+impl FileTimesExt for fs::FileTimes {
+    fn set_created(mut self, t: SystemTime) -> Self {
+        self.as_inner_mut().set_created(t.into_inner());
+        self
+    }
+}
+
 /// Creates a new symlink to a non-directory file on the filesystem.
 ///
 /// The `link` path will be a file symbolic link pointing to the `original`
@@ -602,4 +619,16 @@ pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io:
 #[stable(feature = "symlink", since = "1.1.0")]
 pub fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     sys::fs::symlink_inner(original.as_ref(), link.as_ref(), true)
+}
+
+/// Create a junction point.
+///
+/// The `link` path will be a directory junction pointing to the original path.
+/// If `link` is a relative path then it will be made absolute prior to creating the junction point.
+/// The `original` path must be a directory or a link to a directory, otherwise the junction point will be broken.
+///
+/// If either path is not a local file path then this will fail.
+#[unstable(feature = "junction_point", issue = "121709")]
+pub fn junction_point<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
+    sys::fs::junction_point(original.as_ref(), link.as_ref())
 }

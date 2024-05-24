@@ -5,25 +5,29 @@
 //! is used to provide basic infrastructure for communication between two
 //! processes: Client (RA itself), Server (the external program)
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 pub mod msg;
 mod process;
 mod version;
 
-use paths::AbsPathBuf;
+use base_db::Env;
+use indexmap::IndexSet;
+use paths::{AbsPath, AbsPathBuf};
+use rustc_hash::FxHashMap;
+use span::Span;
 use std::{
-    ffi::OsStr,
     fmt, io,
     sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
 
-use ::tt::token_id as tt;
-
 use crate::{
-    msg::{ExpandMacro, FlatTree, PanicMessage},
+    msg::{
+        deserialize_span_data_index_map, flat::serialize_span_data_index_map, ExpandMacro,
+        ExpnGlobals, FlatTree, PanicMessage, HAS_GLOBAL_SPANS, RUST_ANALYZER_SPAN_SUPPORT,
+    },
     process::ProcMacroProcessSrv,
 };
 
@@ -32,8 +36,11 @@ pub use version::{read_dylib_info, read_version, RustCInfo};
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ProcMacroKind {
     CustomDerive,
-    FuncLike,
     Attr,
+    // This used to be called FuncLike, so that's what the server expects currently.
+    #[serde(alias = "Bang")]
+    #[serde(rename(serialize = "FuncLike", deserialize = "FuncLike"))]
+    Bang,
 }
 
 /// A handle to an external process which load dylibs with macros (.so or .dll)
@@ -47,6 +54,7 @@ pub struct ProcMacroServer {
     ///
     /// Therefore, we just wrap the `ProcMacroProcessSrv` in a mutex here.
     process: Arc<Mutex<ProcMacroProcessSrv>>,
+    path: AbsPathBuf,
 }
 
 pub struct MacroDylib {
@@ -54,18 +62,8 @@ pub struct MacroDylib {
 }
 
 impl MacroDylib {
-    // FIXME: this is buggy due to TOCTOU, we should check the version in the
-    // macro process instead.
-    pub fn new(path: AbsPathBuf) -> io::Result<MacroDylib> {
-        let _p = profile::span("MacroDylib::new");
-
-        let info = version::read_dylib_info(&path)?;
-        if info.version.0 < 1 || info.version.1 < 47 {
-            let msg = format!("proc-macro {} built by {info:#?} is not supported by rust-analyzer, please update your Rust version.", path.display());
-            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
-        }
-
-        Ok(MacroDylib { path })
+    pub fn new(path: AbsPathBuf) -> MacroDylib {
+        MacroDylib { path }
     }
 }
 
@@ -91,9 +89,11 @@ impl PartialEq for ProcMacro {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ServerError {
     pub message: String,
-    pub io: Option<io::Error>,
+    // io::Error isn't Clone for some reason
+    pub io: Option<Arc<io::Error>>,
 }
 
 impl fmt::Display for ServerError {
@@ -114,15 +114,22 @@ pub struct MacroPanic {
 impl ProcMacroServer {
     /// Spawns an external process as the proc macro server and returns a client connected to it.
     pub fn spawn(
-        process_path: AbsPathBuf,
-        args: impl IntoIterator<Item = impl AsRef<OsStr>> + Clone,
+        process_path: &AbsPath,
+        env: &FxHashMap<String, String>,
     ) -> io::Result<ProcMacroServer> {
-        let process = ProcMacroProcessSrv::run(process_path, args)?;
-        Ok(ProcMacroServer { process: Arc::new(Mutex::new(process)) })
+        let process = ProcMacroProcessSrv::run(process_path, env)?;
+        Ok(ProcMacroServer {
+            process: Arc::new(Mutex::new(process)),
+            path: process_path.to_owned(),
+        })
+    }
+
+    pub fn path(&self) -> &AbsPath {
+        &self.path
     }
 
     pub fn load_dylib(&self, dylib: MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
-        let _p = profile::span("ProcMacroClient::load_dylib");
+        let _p = tracing::span!(tracing::Level::INFO, "ProcMacroServer::load_dylib").entered();
         let macros =
             self.process.lock().unwrap_or_else(|e| e.into_inner()).find_proc_macros(&dylib.path)?;
 
@@ -152,31 +159,58 @@ impl ProcMacro {
 
     pub fn expand(
         &self,
-        subtree: &tt::Subtree,
-        attr: Option<&tt::Subtree>,
-        env: Vec<(String, String)>,
-    ) -> Result<Result<tt::Subtree, PanicMessage>, ServerError> {
-        let current_dir = env
-            .iter()
-            .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
-            .map(|(_, value)| value.clone());
+        subtree: &tt::Subtree<Span>,
+        attr: Option<&tt::Subtree<Span>>,
+        env: Env,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+    ) -> Result<Result<tt::Subtree<Span>, PanicMessage>, ServerError> {
+        let version = self.process.lock().unwrap_or_else(|e| e.into_inner()).version();
+        let current_dir = env.get("CARGO_MANIFEST_DIR");
 
+        let mut span_data_table = IndexSet::default();
+        let def_site = span_data_table.insert_full(def_site).0;
+        let call_site = span_data_table.insert_full(call_site).0;
+        let mixed_site = span_data_table.insert_full(mixed_site).0;
         let task = ExpandMacro {
-            macro_body: FlatTree::new(subtree),
+            macro_body: FlatTree::new(subtree, version, &mut span_data_table),
             macro_name: self.name.to_string(),
-            attributes: attr.map(FlatTree::new),
+            attributes: attr.map(|subtree| FlatTree::new(subtree, version, &mut span_data_table)),
             lib: self.dylib_path.to_path_buf().into(),
-            env,
+            env: env.into(),
             current_dir,
+            has_global_spans: ExpnGlobals {
+                serialize: version >= HAS_GLOBAL_SPANS,
+                def_site,
+                call_site,
+                mixed_site,
+            },
+            span_data_table: if version >= RUST_ANALYZER_SPAN_SUPPORT {
+                serialize_span_data_index_map(&span_data_table)
+            } else {
+                Vec::new()
+            },
         };
 
-        let request = msg::Request::ExpandMacro(task);
-        let response = self.process.lock().unwrap_or_else(|e| e.into_inner()).send_task(request)?;
+        let response = self
+            .process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_task(msg::Request::ExpandMacro(Box::new(task)))?;
+
         match response {
-            msg::Response::ExpandMacro(it) => Ok(it.map(FlatTree::to_subtree)),
-            msg::Response::ListMacros(..) | msg::Response::ApiVersionCheck(..) => {
-                Err(ServerError { message: "unexpected response".to_string(), io: None })
+            msg::Response::ExpandMacro(it) => {
+                Ok(it.map(|tree| FlatTree::to_subtree_resolved(tree, version, &span_data_table)))
             }
+            msg::Response::ExpandMacroExtended(it) => Ok(it.map(|resp| {
+                FlatTree::to_subtree_resolved(
+                    resp.tree,
+                    version,
+                    &deserialize_span_data_index_map(&resp.span_data_table),
+                )
+            })),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         }
     }
 }

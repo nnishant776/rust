@@ -1,4 +1,3 @@
-use crate::io::ErrorKind;
 use crate::net::test::{next_test_ip4, next_test_ip6};
 use crate::net::*;
 use crate::sync::mpsc::channel;
@@ -180,7 +179,10 @@ fn debug() {
 // FIXME: re-enabled openbsd/netbsd tests once their socket timeout code
 //        no longer has rounding errors.
 // VxWorks ignores SO_SNDTIMEO.
-#[cfg_attr(any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks"), ignore)]
+#[cfg_attr(
+    any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks", target_os = "nto"),
+    ignore
+)]
 #[test]
 fn timeouts() {
     let addr = next_test_ip4();

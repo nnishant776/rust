@@ -1,14 +1,3 @@
-error: expected identifier, found keyword `true`
-  --> $DIR/issue-44406.rs:8:10
-   |
-LL |     foo!(true);
-   |          ^^^^ expected identifier, found keyword
-   |
-help: escape `true` to use it as an identifier
-   |
-LL |     foo!(r#true);
-   |          ++
-
 error: invalid `struct` delimiters or `fn` call arguments
   --> $DIR/issue-44406.rs:3:9
    |
@@ -26,8 +15,8 @@ LL |         bar { baz: $rest }
 help: if `bar` is a function, use the arguments directly
    |
 LL -         bar(baz: $rest)
-LL +         bar(: $rest)
+LL +         bar($rest)
    |
 
-error: aborting due to 2 previous errors
+error: aborting due to 1 previous error
 

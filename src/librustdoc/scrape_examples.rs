@@ -38,28 +38,23 @@ pub(crate) struct ScrapeExamplesOptions {
 }
 
 impl ScrapeExamplesOptions {
-    pub(crate) fn new(
-        matches: &getopts::Matches,
-        diag: &rustc_errors::Handler,
-    ) -> Result<Option<Self>, i32> {
+    pub(crate) fn new(matches: &getopts::Matches, dcx: &rustc_errors::DiagCtxt) -> Option<Self> {
         let output_path = matches.opt_str("scrape-examples-output-path");
         let target_crates = matches.opt_strs("scrape-examples-target-crate");
         let scrape_tests = matches.opt_present("scrape-tests");
         match (output_path, !target_crates.is_empty(), scrape_tests) {
-            (Some(output_path), true, _) => Ok(Some(ScrapeExamplesOptions {
+            (Some(output_path), true, _) => Some(ScrapeExamplesOptions {
                 output_path: PathBuf::from(output_path),
                 target_crates,
                 scrape_tests,
-            })),
+            }),
             (Some(_), false, _) | (None, true, _) => {
-                diag.err("must use --scrape-examples-output-path and --scrape-examples-target-crate together");
-                Err(1)
+                dcx.fatal("must use --scrape-examples-output-path and --scrape-examples-target-crate together");
             }
             (None, false, true) => {
-                diag.err("must use --scrape-examples-output-path and --scrape-examples-target-crate with --scrape-tests");
-                Err(1)
+                dcx.fatal("must use --scrape-examples-output-path and --scrape-examples-target-crate with --scrape-tests");
             }
-            (None, false, false) => Ok(None),
+            (None, false, false) => None,
         }
     }
 }
@@ -73,7 +68,7 @@ pub(crate) struct SyntaxRange {
 impl SyntaxRange {
     fn new(span: rustc_span::Span, file: &SourceFile) -> Option<Self> {
         let get_pos = |bytepos: BytePos| file.original_relative_byte_pos(bytepos).0;
-        let get_line = |bytepos: BytePos| file.lookup_line(bytepos);
+        let get_line = |bytepos: BytePos| file.lookup_line(file.relative_position(bytepos));
 
         Some(SyntaxRange {
             byte_span: (get_pos(span.lo()), get_pos(span.hi())),
@@ -169,7 +164,7 @@ where
                 };
 
                 let ident_span = path.ident.span;
-                (tcx.type_of(def_id).subst_identity(), call_span, ident_span)
+                (tcx.type_of(def_id).instantiate_identity(), call_span, ident_span)
             }
             _ => {
                 return;
@@ -255,7 +250,7 @@ where
                 let fn_key = tcx.def_path_hash(*def_id);
                 let fn_entries = self.calls.entry(fn_key).or_default();
 
-                trace!("Including expr: {:?}", call_span);
+                trace!("Including expr: {call_span:?}");
                 let enclosing_item_span =
                     source_map.span_extend_to_prev_char(enclosing_item_span, '\n', false);
                 let location =
@@ -286,9 +281,9 @@ pub(crate) fn run(
         let (cx, _) = Context::init(krate, renderopts, cache, tcx).map_err(|e| e.to_string())?;
 
         // Collect CrateIds corresponding to provided target crates
-        // If two different versions of the crate in the dependency tree, then examples will be collcted from both.
+        // If two different versions of the crate in the dependency tree, then examples will be collected from both.
         let all_crates = tcx
-            .crates(())
+            .crates_including_speculative(())
             .iter()
             .chain([&LOCAL_CRATE])
             .map(|crate_num| (crate_num, tcx.crate_name(*crate_num)))
@@ -311,7 +306,7 @@ pub(crate) fn run(
 
         // The visitor might have found a type error, which we need to
         // promote to a fatal error
-        if tcx.sess.diagnostic().has_errors_or_lint_errors().is_some() {
+        if tcx.dcx().has_errors().is_some() {
             return Err(String::from("Compilation failed, aborting rustdoc"));
         }
 
@@ -325,40 +320,39 @@ pub(crate) fn run(
         // Save output to provided path
         let mut encoder = FileEncoder::new(options.output_path).map_err(|e| e.to_string())?;
         calls.encode(&mut encoder);
-        encoder.finish().map_err(|e| e.to_string())?;
+        encoder.finish().map_err(|(_path, e)| e.to_string())?;
 
         Ok(())
     };
 
     if let Err(e) = inner() {
-        tcx.sess.fatal(&e);
+        tcx.dcx().fatal(e);
     }
 
     Ok(())
 }
 
-// Note: the Handler must be passed in explicitly because sess isn't available while parsing options
+// Note: the DiagCtxt must be passed in explicitly because sess isn't available while parsing
+// options.
 pub(crate) fn load_call_locations(
     with_examples: Vec<String>,
-    diag: &rustc_errors::Handler,
-) -> Result<AllCallLocations, i32> {
-    let inner = || {
-        let mut all_calls: AllCallLocations = FxHashMap::default();
-        for path in with_examples {
-            let bytes = fs::read(&path).map_err(|e| format!("{} (for path {})", e, path))?;
-            let mut decoder = MemDecoder::new(&bytes, 0);
-            let calls = AllCallLocations::decode(&mut decoder);
+    dcx: &rustc_errors::DiagCtxt,
+) -> AllCallLocations {
+    let mut all_calls: AllCallLocations = FxHashMap::default();
+    for path in with_examples {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => dcx.fatal(format!("failed to load examples: {e}")),
+        };
+        let Ok(mut decoder) = MemDecoder::new(&bytes, 0) else {
+            dcx.fatal(format!("Corrupt metadata encountered in {path}"))
+        };
+        let calls = AllCallLocations::decode(&mut decoder);
 
-            for (function, fn_calls) in calls.into_iter() {
-                all_calls.entry(function).or_default().extend(fn_calls.into_iter());
-            }
+        for (function, fn_calls) in calls.into_iter() {
+            all_calls.entry(function).or_default().extend(fn_calls.into_iter());
         }
+    }
 
-        Ok(all_calls)
-    };
-
-    inner().map_err(|e: String| {
-        diag.err(&format!("failed to load examples: {}", e));
-        1
-    })
+    all_calls
 }

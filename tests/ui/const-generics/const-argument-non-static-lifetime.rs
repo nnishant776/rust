@@ -1,5 +1,5 @@
-// [full] check-pass
-// revisions: full min
+//@ [full] check-pass
+//@ revisions: full min
 
 // regression test for #78180
 
@@ -11,7 +11,7 @@ fn test<const N: usize>() {}
 
 fn wow<'a>() -> &'a () {
     test::<{
-        let _: &'a (); //[min]~ ERROR a non-static lifetime
+        let _: &'a (); //[min]~ ERROR generic parameters may not be used in const operations
         3
     }>();
     &()

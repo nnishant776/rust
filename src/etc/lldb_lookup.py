@@ -58,6 +58,11 @@ def summary_lookup(valobj, dict):
     if rust_type == RustType.STD_NONZERO_NUMBER:
         return StdNonZeroNumberSummaryProvider(valobj, dict)
 
+    if rust_type == RustType.STD_PATHBUF:
+        return StdPathBufSummaryProvider(valobj, dict)
+    if rust_type == RustType.STD_PATH:
+        return StdPathSummaryProvider(valobj, dict)
+
     return ""
 
 
@@ -81,12 +86,13 @@ def synthetic_lookup(valobj, dict):
         return synthetic_lookup(valobj.GetChildAtIndex(discriminant), dict)
     if rust_type == RustType.SINGLETON_ENUM:
         return synthetic_lookup(valobj.GetChildAtIndex(0), dict)
-
+    if rust_type == RustType.ENUM:
+        return ClangEncodedEnumProvider(valobj, dict)
     if rust_type == RustType.STD_VEC:
         return StdVecSyntheticProvider(valobj, dict)
     if rust_type == RustType.STD_VEC_DEQUE:
         return StdVecDequeSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_SLICE:
+    if rust_type == RustType.STD_SLICE or rust_type == RustType.STD_STR:
         return StdSliceSyntheticProvider(valobj, dict)
 
     if rust_type == RustType.STD_HASH_MAP:
@@ -115,4 +121,4 @@ def synthetic_lookup(valobj, dict):
     if rust_type == RustType.STD_REF_CELL:
         return StdRefSyntheticProvider(valobj, dict, is_cell=True)
 
-    return DefaultSynthteticProvider(valobj, dict)
+    return DefaultSyntheticProvider(valobj, dict)

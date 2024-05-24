@@ -9,7 +9,7 @@ use libc::c_uint;
 use super::{DiagnosticInfo, SMDiagnostic};
 use rustc_span::InnerSpan;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum OptimizationDiagnosticKind {
     OptimizationRemark,
     OptimizationMissed,
@@ -123,7 +123,7 @@ impl SrcMgrDiagnostic {
 #[derive(Clone)]
 pub struct InlineAsmDiagnostic {
     pub level: super::DiagnosticLevel,
-    pub cookie: c_uint,
+    pub cookie: u64,
     pub message: String,
     pub source: Option<(String, Vec<InnerSpan>)>,
 }
@@ -149,7 +149,7 @@ impl InlineAsmDiagnostic {
         let smdiag = SrcMgrDiagnostic::unpack(super::LLVMRustGetSMDiagnostic(di, &mut cookie));
         InlineAsmDiagnostic {
             level: smdiag.level,
-            cookie,
+            cookie: cookie.into(),
             message: smdiag.message,
             source: smdiag.source,
         }

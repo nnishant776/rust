@@ -1,5 +1,7 @@
 use rustc_hir as hir;
+use rustc_middle::bug;
 use rustc_middle::ty::{self, CanonicalUserType, TyCtxt, UserType};
+use tracing::debug;
 
 pub(crate) trait UserAnnotatedTyHelpers<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx>;
@@ -7,9 +9,9 @@ pub(crate) trait UserAnnotatedTyHelpers<'tcx> {
     fn typeck_results(&self) -> &ty::TypeckResults<'tcx>;
 
     /// Looks up the type associated with this hir-id and applies the
-    /// user-given substitutions; the hir-id must map to a suitable
+    /// user-given generic parameters; the hir-id must map to a suitable
     /// type.
-    fn user_substs_applied_to_ty_of_hir_id(
+    fn user_args_applied_to_ty_of_hir_id(
         &self,
         hir_id: hir::HirId,
     ) -> Option<CanonicalUserType<'tcx>> {

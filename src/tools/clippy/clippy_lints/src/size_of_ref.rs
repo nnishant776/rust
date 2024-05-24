@@ -1,7 +1,9 @@
-use clippy_utils::{diagnostics::span_lint_and_help, path_def_id, ty::peel_mid_ty_refs};
+use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::path_def_id;
+use clippy_utils::ty::peel_mid_ty_refs;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::sym;
 
 declare_clippy_lint! {
@@ -17,7 +19,7 @@ declare_clippy_lint! {
     /// the reference.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct Foo {
     ///     buffer: [u8],
     /// }
@@ -26,14 +28,14 @@ declare_clippy_lint! {
     ///     fn size(&self) -> usize {
     ///         // Note that `&self` as an argument is a `&&Foo`: Because `self`
     ///         // is already a reference, `&self` is a double-reference.
-    ///         // The return value of `size_of_val()` therefor is the
+    ///         // The return value of `size_of_val()` therefore is the
     ///         // size of the reference-type, not the size of `self`.
     ///         std::mem::size_of_val(&self)
     ///     }
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// struct Foo {
     ///     buffer: [u8],
     /// }
@@ -45,7 +47,7 @@ declare_clippy_lint! {
     ///     }
     /// }
     /// ```
-    #[clippy::version = "1.67.0"]
+    #[clippy::version = "1.68.0"]
     pub SIZE_OF_REF,
     suspicious,
     "Argument to `std::mem::size_of_val()` is a double-reference, which is almost certainly unintended"

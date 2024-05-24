@@ -1,8 +1,9 @@
 use crate::iter::adapters::{
-    zip::try_get_unchecked, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
+    zip::try_get_unchecked, SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
 };
-use crate::iter::{FusedIterator, TrustedLen, UncheckedIterator};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen, UncheckedIterator};
 use crate::ops::Try;
+use core::num::NonZero;
 
 /// An iterator that clones the elements of an underlying iterator.
 ///
@@ -152,4 +153,38 @@ where
         let item = unsafe { self.it.next_unchecked() };
         item.clone()
     }
+}
+
+#[stable(feature = "default_iters", since = "1.70.0")]
+impl<I: Default> Default for Cloned<I> {
+    /// Creates a `Cloned` iterator from the default value of `I`
+    /// ```
+    /// # use core::slice;
+    /// # use core::iter::Cloned;
+    /// let iter: Cloned<slice::Iter<'_, u8>> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I> SourceIter for Cloned<I>
+where
+    I: SourceIter,
+{
+    type Source = I::Source;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
+        // SAFETY: unsafe function forwarding to unsafe function with the same requirements
+        unsafe { SourceIter::as_inner(&mut self.it) }
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Cloned<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

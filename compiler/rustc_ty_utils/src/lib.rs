@@ -5,19 +5,18 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![allow(internal_features)]
+#![feature(assert_matches)]
+#![feature(associated_type_defaults)]
+#![feature(box_patterns)]
+#![feature(if_let_guard)]
+#![feature(iterator_try_collect)]
 #![feature(let_chains)]
 #![feature(never_type)]
-#![feature(box_patterns)]
-#![recursion_limit = "256"]
 
-#[macro_use]
-extern crate rustc_middle;
-#[macro_use]
-extern crate tracing;
-
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_macros::fluent_messages;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 
 mod abi;
 mod assoc;
@@ -25,15 +24,17 @@ mod common_traits;
 mod consts;
 mod errors;
 mod implied_bounds;
-pub mod instance;
+mod instance;
 mod layout;
 mod layout_sanity_check;
 mod needs_drop;
-pub mod representability;
+mod opaque_types;
+mod representability;
+pub mod sig_types;
 mod structural_match;
 mod ty;
 
-fluent_messages! { "../locales/en-US.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub fn provide(providers: &mut Providers) {
     abi::provide(providers);
@@ -43,6 +44,7 @@ pub fn provide(providers: &mut Providers) {
     implied_bounds::provide(providers);
     layout::provide(providers);
     needs_drop::provide(providers);
+    opaque_types::provide(providers);
     representability::provide(providers);
     ty::provide(providers);
     instance::provide(providers);

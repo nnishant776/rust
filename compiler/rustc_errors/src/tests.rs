@@ -2,10 +2,10 @@ use crate::error::{TranslateError, TranslateErrorKind};
 use crate::fluent_bundle::*;
 use crate::translation::Translate;
 use crate::FluentBundle;
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
 use rustc_error_messages::fluent_bundle::resolver::errors::{ReferenceKind, ResolverError};
 use rustc_error_messages::langid;
-use rustc_error_messages::DiagnosticMessage;
+use rustc_error_messages::DiagMessage;
 
 struct Dummy {
     bundle: FluentBundle,
@@ -27,10 +27,14 @@ fn make_dummy(ftl: &'static str) -> Dummy {
     let langid_en = langid!("en-US");
 
     #[cfg(parallel_compiler)]
-    let mut bundle = FluentBundle::new_concurrent(vec![langid_en]);
+    let mut bundle: FluentBundle =
+        IntoDynSyncSend(crate::fluent_bundle::bundle::FluentBundle::new_concurrent(vec![
+            langid_en,
+        ]));
 
     #[cfg(not(parallel_compiler))]
-    let mut bundle = FluentBundle::new(vec![langid_en]);
+    let mut bundle: FluentBundle =
+        IntoDynSyncSend(crate::fluent_bundle::bundle::FluentBundle::new(vec![langid_en]));
 
     bundle.add_resource(resource).expect("Failed to add FTL resources to the bundle.");
 
@@ -49,7 +53,7 @@ fn wellformed_fluent() {
     args.set("name", "Foo");
     args.set("ty", "std::string::String");
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("suggestion".into()),
         );
@@ -61,7 +65,7 @@ fn wellformed_fluent() {
     }
 
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("value_borrowed_label".into()),
         );
@@ -73,7 +77,7 @@ fn wellformed_fluent() {
     }
 
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("occurs_because_label".into()),
         );
@@ -84,7 +88,7 @@ fn wellformed_fluent() {
         );
 
         {
-            let message = DiagnosticMessage::FluentIdentifier(
+            let message = DiagMessage::FluentIdentifier(
                 "mir_build_borrow_of_moved_value".into(),
                 Some("label".into()),
             );
@@ -108,7 +112,7 @@ fn misformed_fluent() {
     args.set("name", "Foo");
     args.set("ty", "std::string::String");
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("value_borrowed_label".into()),
         );
@@ -137,7 +141,7 @@ fn misformed_fluent() {
     }
 
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("label".into()),
         );
@@ -147,12 +151,14 @@ fn misformed_fluent() {
             primary: box TranslateError::One { kind: TranslateErrorKind::PrimaryBundleMissing, .. },
             fallback: box TranslateError::One { kind: TranslateErrorKind::Fluent { errs }, .. },
         } = &err
-            && let [FluentError::ResolverError(ResolverError::Reference(
-                ReferenceKind::Message { id, .. }
-                    | ReferenceKind::Variable { id, .. },
-            ))] = &**errs
+            && let [
+                FluentError::ResolverError(ResolverError::Reference(
+                    ReferenceKind::Message { id, .. } | ReferenceKind::Variable { id, .. },
+                )),
+            ] = &**errs
             && id == "name"
-        {} else {
+        {
+        } else {
             panic!("{err:#?}")
         };
         assert_eq!(
@@ -162,7 +168,7 @@ fn misformed_fluent() {
     }
 
     {
-        let message = DiagnosticMessage::FluentIdentifier(
+        let message = DiagMessage::FluentIdentifier(
             "mir_build_borrow_of_moved_value".into(),
             Some("occurs_because_label".into()),
         );
@@ -172,12 +178,14 @@ fn misformed_fluent() {
             primary: box TranslateError::One { kind: TranslateErrorKind::PrimaryBundleMissing, .. },
             fallback: box TranslateError::One { kind: TranslateErrorKind::Fluent { errs }, .. },
         } = &err
-            && let [FluentError::ResolverError(ResolverError::Reference(
-                ReferenceKind::Message { id, .. }
-                    | ReferenceKind::Variable { id, .. },
-            ))] = &**errs
+            && let [
+                FluentError::ResolverError(ResolverError::Reference(
+                    ReferenceKind::Message { id, .. } | ReferenceKind::Variable { id, .. },
+                )),
+            ] = &**errs
             && id == "oops"
-        {} else {
+        {
+        } else {
             panic!("{err:#?}")
         };
         assert_eq!(

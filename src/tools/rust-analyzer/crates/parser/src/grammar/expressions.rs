@@ -4,8 +4,8 @@ use crate::grammar::attributes::ATTRIBUTE_FIRST;
 
 use super::*;
 
-pub(crate) use self::atom::{block_expr, match_arm_list};
-pub(super) use self::atom::{literal, LITERAL_FIRST};
+pub(crate) use atom::{block_expr, match_arm_list};
+pub(super) use atom::{literal, LITERAL_FIRST};
 
 #[derive(PartialEq, Eq)]
 pub(super) enum Semicolon {
@@ -16,9 +16,9 @@ pub(super) enum Semicolon {
 
 const EXPR_FIRST: TokenSet = LHS_FIRST;
 
-pub(super) fn expr(p: &mut Parser<'_>) -> bool {
+pub(super) fn expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let r = Restrictions { forbid_structs: false, prefer_stmt: false };
-    expr_bp(p, None, r, 1).is_some()
+    expr_bp(p, None, r, 1).map(|(m, _)| m)
 }
 
 pub(super) fn expr_stmt(
@@ -59,7 +59,8 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
     attributes::outer_attrs(p);
 
     if p.at(T![let]) {
-        let_stmt(p, m, semicolon);
+        let_stmt(p, semicolon);
+        m.complete(p, LET_STMT);
         return;
     }
 
@@ -109,43 +110,53 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
             m.complete(p, EXPR_STMT);
         }
     }
+}
 
-    // test let_stmt
-    // fn f() { let x: i32 = 92; }
-    fn let_stmt(p: &mut Parser<'_>, m: Marker, with_semi: Semicolon) {
-        p.bump(T![let]);
-        patterns::pattern(p);
-        if p.at(T![:]) {
-            // test let_stmt_ascription
-            // fn f() { let x: i32; }
-            types::ascription(p);
-        }
-        if p.eat(T![=]) {
-            // test let_stmt_init
-            // fn f() { let x = 92; }
-            expressions::expr(p);
-        }
+// test let_stmt
+// fn f() { let x: i32 = 92; }
+pub(super) fn let_stmt(p: &mut Parser<'_>, with_semi: Semicolon) {
+    p.bump(T![let]);
+    patterns::pattern(p);
+    if p.at(T![:]) {
+        // test let_stmt_ascription
+        // fn f() { let x: i32; }
+        types::ascription(p);
+    }
 
-        if p.at(T![else]) {
-            // test let_else
-            // fn f() { let Some(x) = opt else { return }; }
+    let mut expr_after_eq: Option<CompletedMarker> = None;
+    if p.eat(T![=]) {
+        // test let_stmt_init
+        // fn f() { let x = 92; }
+        expr_after_eq = expressions::expr(p);
+    }
 
-            let m = p.start();
-            p.bump(T![else]);
-            block_expr(p);
-            m.complete(p, LET_ELSE);
-        }
-
-        match with_semi {
-            Semicolon::Forbidden => (),
-            Semicolon::Optional => {
-                p.eat(T![;]);
-            }
-            Semicolon::Required => {
-                p.expect(T![;]);
+    if p.at(T![else]) {
+        // test_err let_else_right_curly_brace
+        // fn func() { let Some(_) = {Some(1)} else { panic!("h") };}
+        if let Some(expr) = expr_after_eq {
+            if BlockLike::is_blocklike(expr.kind()) {
+                p.error(
+                    "right curly brace `}` before `else` in a `let...else` statement not allowed",
+                )
             }
         }
-        m.complete(p, LET_STMT);
+
+        // test let_else
+        // fn f() { let Some(x) = opt else { return }; }
+        let m = p.start();
+        p.bump(T![else]);
+        block_expr(p);
+        m.complete(p, LET_ELSE);
+    }
+
+    match with_semi {
+        Semicolon::Forbidden => (),
+        Semicolon::Optional => {
+            p.eat(T![;]);
+        }
+        Semicolon::Required => {
+            p.expect(T![;]);
+        }
     }
 }
 
@@ -177,47 +188,55 @@ struct Restrictions {
     prefer_stmt: bool,
 }
 
+enum Associativity {
+    Left,
+    Right,
+}
+
 /// Binding powers of operators for a Pratt parser.
 ///
 /// See <https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html>
+///
+/// Note that Rust doesn't define associativity for some infix operators (e.g. `==` and `..`) and
+/// requires parentheses to disambiguate. We just treat them as left associative.
 #[rustfmt::skip]
-fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind) {
-    const NOT_AN_OP: (u8, SyntaxKind) = (0, T![@]);
+fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind, Associativity) {
+    use Associativity::*;
+    const NOT_AN_OP: (u8, SyntaxKind, Associativity) = (0, T![@], Left);
     match p.current() {
-        T![|] if p.at(T![||])  => (3,  T![||]),
-        T![|] if p.at(T![|=])  => (1,  T![|=]),
-        T![|]                  => (6,  T![|]),
-        T![>] if p.at(T![>>=]) => (1,  T![>>=]),
-        T![>] if p.at(T![>>])  => (9,  T![>>]),
-        T![>] if p.at(T![>=])  => (5,  T![>=]),
-        T![>]                  => (5,  T![>]),
-        T![=] if p.at(T![=>])  => NOT_AN_OP,
-        T![=] if p.at(T![==])  => (5,  T![==]),
-        T![=]                  => (1,  T![=]),
-        T![<] if p.at(T![<=])  => (5,  T![<=]),
-        T![<] if p.at(T![<<=]) => (1,  T![<<=]),
-        T![<] if p.at(T![<<])  => (9,  T![<<]),
-        T![<]                  => (5,  T![<]),
-        T![+] if p.at(T![+=])  => (1,  T![+=]),
-        T![+]                  => (10, T![+]),
-        T![^] if p.at(T![^=])  => (1,  T![^=]),
-        T![^]                  => (7,  T![^]),
-        T![%] if p.at(T![%=])  => (1,  T![%=]),
-        T![%]                  => (11, T![%]),
-        T![&] if p.at(T![&=])  => (1,  T![&=]),
+        T![|] if p.at(T![||])  => (3,  T![||],  Left),
+        T![|] if p.at(T![|=])  => (1,  T![|=],  Right),
+        T![|]                  => (6,  T![|],   Left),
+        T![>] if p.at(T![>>=]) => (1,  T![>>=], Right),
+        T![>] if p.at(T![>>])  => (9,  T![>>],  Left),
+        T![>] if p.at(T![>=])  => (5,  T![>=],  Left),
+        T![>]                  => (5,  T![>],   Left),
+        T![=] if p.at(T![==])  => (5,  T![==],  Left),
+        T![=] if !p.at(T![=>]) => (1,  T![=],   Right),
+        T![<] if p.at(T![<=])  => (5,  T![<=],  Left),
+        T![<] if p.at(T![<<=]) => (1,  T![<<=], Right),
+        T![<] if p.at(T![<<])  => (9,  T![<<],  Left),
+        T![<]                  => (5,  T![<],   Left),
+        T![+] if p.at(T![+=])  => (1,  T![+=],  Right),
+        T![+]                  => (10, T![+],   Left),
+        T![^] if p.at(T![^=])  => (1,  T![^=],  Right),
+        T![^]                  => (7,  T![^],   Left),
+        T![%] if p.at(T![%=])  => (1,  T![%=],  Right),
+        T![%]                  => (11, T![%],   Left),
+        T![&] if p.at(T![&=])  => (1,  T![&=],  Right),
         // If you update this, remember to update `expr_let()` too.
-        T![&] if p.at(T![&&])  => (4,  T![&&]),
-        T![&]                  => (8,  T![&]),
-        T![/] if p.at(T![/=])  => (1,  T![/=]),
-        T![/]                  => (11, T![/]),
-        T![*] if p.at(T![*=])  => (1,  T![*=]),
-        T![*]                  => (11, T![*]),
-        T![.] if p.at(T![..=]) => (2,  T![..=]),
-        T![.] if p.at(T![..])  => (2,  T![..]),
-        T![!] if p.at(T![!=])  => (5,  T![!=]),
-        T![-] if p.at(T![-=])  => (1,  T![-=]),
-        T![-]                  => (10, T![-]),
-        T![as]                 => (12, T![as]),
+        T![&] if p.at(T![&&])  => (4,  T![&&],  Left),
+        T![&]                  => (8,  T![&],   Left),
+        T![/] if p.at(T![/=])  => (1,  T![/=],  Right),
+        T![/]                  => (11, T![/],   Left),
+        T![*] if p.at(T![*=])  => (1,  T![*=],  Right),
+        T![*]                  => (11, T![*],   Left),
+        T![.] if p.at(T![..=]) => (2,  T![..=], Left),
+        T![.] if p.at(T![..])  => (2,  T![..],  Left),
+        T![!] if p.at(T![!=])  => (5,  T![!=],  Left),
+        T![-] if p.at(T![-=])  => (1,  T![-=],  Right),
+        T![-]                  => (10, T![-],   Left),
+        T![as]                 => (12, T![as],  Left),
 
         _                      => NOT_AN_OP
     }
@@ -227,7 +246,7 @@ fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind) {
 fn expr_bp(
     p: &mut Parser<'_>,
     m: Option<Marker>,
-    mut r: Restrictions,
+    r: Restrictions,
     bp: u8,
 ) -> Option<(CompletedMarker, BlockLike)> {
     let m = m.unwrap_or_else(|| {
@@ -262,7 +281,7 @@ fn expr_bp(
 
     loop {
         let is_range = p.at(T![..]) || p.at(T![..=]);
-        let (op_bp, op) = current_op(p);
+        let (op_bp, op, associativity) = current_op(p);
         if op_bp < bp {
             break;
         }
@@ -274,10 +293,6 @@ fn expr_bp(
         }
         let m = lhs.precede(p);
         p.bump(op);
-
-        // test binop_resets_statementness
-        // fn f() { v = {1}&2; }
-        r = Restrictions { prefer_stmt: false, ..r };
 
         if is_range {
             // test postfix_range
@@ -295,7 +310,14 @@ fn expr_bp(
             }
         }
 
-        expr_bp(p, None, Restrictions { prefer_stmt: false, ..r }, op_bp + 1);
+        let op_bp = match associativity {
+            Associativity::Left => op_bp + 1,
+            Associativity::Right => op_bp,
+        };
+
+        // test binop_resets_statementness
+        // fn f() { v = {1}&2; }
+        expr_bp(p, None, Restrictions { prefer_stmt: false, ..r }, op_bp);
         lhs = m.complete(p, if is_range { RANGE_EXPR } else { BIN_EXPR });
     }
     Some((lhs, BlockLike::NotBlock))
@@ -321,7 +343,7 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
         T![&] => {
             m = p.start();
             p.bump(T![&]);
-            if p.at_contextual_kw(T![raw]) && (p.nth_at(1, T![mut]) || p.nth_at(1, T![const])) {
+            if p.at_contextual_kw(T![raw]) && [T![mut], T![const]].contains(&p.nth(1)) {
                 p.bump_remap(T![raw]);
                 p.bump_any();
             } else {
@@ -347,7 +369,15 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                 if p.at(op) {
                     m = p.start();
                     p.bump(op);
-                    if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) {
+
+                    // test closure_range_method_call
+                    // fn foo() {
+                    //     || .. .method();
+                    //     || .. .field;
+                    // }
+                    let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
+                    let struct_forbidden = r.forbid_structs && p.at(T!['{']);
+                    if p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden {
                         expr_bp(p, None, r, 2);
                     }
                     let cm = m.complete(p, RANGE_EXPR);
@@ -406,7 +436,7 @@ fn postfix_expr(
         allow_calls = true;
         block_like = BlockLike::NotBlock;
     }
-    return (lhs, block_like);
+    (lhs, block_like)
 }
 
 fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
@@ -498,6 +528,15 @@ fn method_call_expr<const FLOAT_RECOVERY: bool>(
     generic_args::opt_generic_arg_list(p, true);
     if p.at(T!['(']) {
         arg_list(p);
+    } else {
+        // emit an error when argument list is missing
+
+        // test_err method_call_missing_argument_list
+        // fn func() {
+        //     foo.bar::<>
+        //     foo.bar::<i32>;
+        // }
+        p.error("expected argument list");
     }
     m.complete(p, METHOD_CALL_EXPR)
 }
@@ -570,6 +609,7 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 //     foo(bar::);
 //     foo(bar:);
 //     foo(bar+);
+//     foo(a, , b);
 // }
 fn arg_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['(']));
@@ -578,7 +618,15 @@ fn arg_list(p: &mut Parser<'_>) {
     // fn main() {
     //     foo(#[attr] 92)
     // }
-    delimited(p, T!['('], T![')'], T![,], EXPR_FIRST.union(ATTRIBUTE_FIRST), expr);
+    delimited(
+        p,
+        T!['('],
+        T![')'],
+        T![,],
+        || "expected expression".into(),
+        EXPR_FIRST.union(ATTRIBUTE_FIRST),
+        |p| expr(p).is_some(),
+    );
     m.complete(p, ARG_LIST);
 }
 
@@ -628,27 +676,38 @@ pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
         attributes::outer_attrs(p);
 
         match p.current() {
-            IDENT | INT_NUMBER => {
+            IDENT | INT_NUMBER if p.nth_at(1, T![::]) => {
                 // test_err record_literal_missing_ellipsis_recovery
                 // fn main() {
                 //     S { S::default() }
                 // }
-                if p.nth_at(1, T![::]) {
-                    m.abandon(p);
-                    p.expect(T![..]);
-                    expr(p);
-                } else {
+                m.abandon(p);
+                p.expect(T![..]);
+                expr(p);
+            }
+            IDENT | INT_NUMBER => {
+                if p.nth_at(1, T![..]) {
                     // test_err record_literal_before_ellipsis_recovery
                     // fn main() {
                     //     S { field ..S::default() }
                     // }
-                    if p.nth_at(1, T![:]) || p.nth_at(1, T![..]) {
+                    name_ref_or_index(p);
+                    p.error("expected `:`");
+                } else {
+                    // test_err record_literal_field_eq_recovery
+                    // fn main() {
+                    //     S { field = foo }
+                    // }
+                    if p.nth_at(1, T![:]) {
                         name_ref_or_index(p);
-                        p.expect(T![:]);
+                        p.bump(T![:]);
+                    } else if p.nth_at(1, T![=]) {
+                        name_ref_or_index(p);
+                        p.err_and_bump("expected `:`");
                     }
                     expr(p);
-                    m.complete(p, RECORD_EXPR_FIELD);
                 }
+                m.complete(p, RECORD_EXPR_FIELD);
             }
             T![.] if p.at(T![..]) => {
                 m.abandon(p);
@@ -662,6 +721,17 @@ pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
                 // We permit `.. }` on the left-hand side of a destructuring assignment.
                 if !p.at(T!['}']) {
                     expr(p);
+
+                    if p.at(T![,]) {
+                        // test_err comma_after_functional_update_syntax
+                        // fn foo() {
+                        //     S { ..x, };
+                        //     S { ..x, a: 0 }
+                        // }
+
+                        // Do not bump, so we can support additional fields after this comma.
+                        p.error("cannot use a comma after the base struct");
+                    }
                 }
             }
             T!['{'] => {

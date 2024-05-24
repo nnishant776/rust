@@ -1,5 +1,6 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
 use clippy_utils::trait_ref_of_method;
+use itertools::Itertools;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::nested_filter::{self as hir_nested_filter, NestedFilter};
@@ -14,12 +15,13 @@ use rustc_hir::{
     PredicateOrigin, TraitFn, TraitItem, TraitItemKind, Ty, TyKind, WherePredicate,
 };
 use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter as middle_nested_filter;
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::{kw, Ident, Symbol};
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -36,7 +38,7 @@ declare_clippy_lint! {
     /// are mentioned due to potential false positives.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// // Unnecessary lifetime annotations
     /// fn in_and_out<'a>(x: &'a u8, y: u8) -> &'a u8 {
     ///     x
@@ -44,7 +46,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn elided(x: &u8, y: u8) -> &u8 {
     ///     x
     /// }
@@ -67,7 +69,7 @@ declare_clippy_lint! {
     /// them leads to more readable code.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// // unnecessary lifetimes
     /// fn unused_lifetime<'a>(x: u8) {
     ///     // ..
@@ -75,7 +77,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn no_lifetime(x: u8) {
     ///     // ...
     /// }
@@ -144,6 +146,10 @@ fn check_fn_inner<'tcx>(
         .filter(|param| matches!(param.kind, GenericParamKind::Type { .. }));
 
     for typ in types {
+        if !typ.span.eq_ctxt(span) {
+            return;
+        }
+
         for pred in generics.bounds_for_param(typ.def_id) {
             if pred.origin == PredicateOrigin::WhereClause {
                 // has_where_lifetimes checked that this predicate contains no lifetime.
@@ -170,7 +176,7 @@ fn check_fn_inner<'tcx>(
                             _ => None,
                         });
                         for bound in lifetimes {
-                            if !bound.is_static() && !bound.is_elided() {
+                            if bound.res != LifetimeName::Static && !bound.is_elided() {
                                 return;
                             }
                         }
@@ -181,11 +187,15 @@ fn check_fn_inner<'tcx>(
     }
 
     if let Some((elidable_lts, usages)) = could_use_elision(cx, sig.decl, body, trait_sig, generics.params) {
+        if usages.iter().any(|usage| !usage.ident.span.eq_ctxt(span)) {
+            return;
+        }
+
         let lts = elidable_lts
             .iter()
             // In principle, the result of the call to `Node::ident` could be `unwrap`ped, as `DefId` should refer to a
             // `Node::GenericParam`.
-            .filter_map(|&def_id| cx.tcx.hir().get_by_def_id(def_id).ident())
+            .filter_map(|&def_id| cx.tcx.hir_node_by_def_id(def_id).ident())
             .map(|ident| ident.to_string())
             .collect::<Vec<_>>()
             .join(", ");
@@ -193,8 +203,20 @@ fn check_fn_inner<'tcx>(
         span_lint_and_then(
             cx,
             NEEDLESS_LIFETIMES,
-            span.with_hi(sig.decl.output.span().hi()),
-            &format!("the following explicit lifetimes could be elided: {lts}"),
+            elidable_lts
+                .iter()
+                .map(|&lt| cx.tcx.def_span(lt))
+                .chain(usages.iter().filter_map(|usage| {
+                    if let LifetimeName::Param(def_id) = usage.res
+                        && elidable_lts.contains(&def_id)
+                    {
+                        return Some(usage.ident.span);
+                    }
+
+                    None
+                }))
+                .collect_vec(),
+            format!("the following explicit lifetimes could be elided: {lts}"),
             |diag| {
                 if sig.header.is_async() {
                     // async functions have usages whose spans point at the lifetime declaration which messes up
@@ -263,17 +285,13 @@ fn elision_suggestions(
             .iter()
             .filter(|usage| named_lifetime(usage).map_or(false, |id| elidable_lts.contains(&id)))
             .map(|usage| {
-                match cx.tcx.hir().get_parent(usage.hir_id) {
+                match cx.tcx.parent_hir_node(usage.hir_id) {
                     Node::Ty(Ty {
                         kind: TyKind::Ref(..), ..
                     }) => {
                         // expand `&'a T` to `&'a T`
                         //          ^^         ^^^
-                        let span = cx
-                            .sess()
-                            .source_map()
-                            .span_extend_while(usage.ident.span, |ch| ch.is_ascii_whitespace())
-                            .unwrap_or(usage.ident.span);
+                        let span = cx.sess().source_map().span_extend_while_whitespace(usage.ident.span);
 
                         (span, String::new())
                     },
@@ -288,20 +306,17 @@ fn elision_suggestions(
 
 // elision doesn't work for explicit self types, see rust-lang/rust#69064
 fn explicit_self_type<'tcx>(cx: &LateContext<'tcx>, func: &FnDecl<'tcx>, ident: Option<Ident>) -> bool {
-    if_chain! {
-        if let Some(ident) = ident;
-        if ident.name == kw::SelfLower;
-        if !func.implicit_self.has_implicit_self();
+    if let Some(ident) = ident
+        && ident.name == kw::SelfLower
+        && !func.implicit_self.has_implicit_self()
+        && let Some(self_ty) = func.inputs.first()
+    {
+        let mut visitor = RefVisitor::new(cx);
+        visitor.visit_ty(self_ty);
 
-        if let Some(self_ty) = func.inputs.first();
-        then {
-            let mut visitor = RefVisitor::new(cx);
-            visitor.visit_ty(self_ty);
-
-            !visitor.all_lts().is_empty()
-        } else {
-            false
-        }
+        !visitor.all_lts().is_empty()
+    } else {
+        false
     }
 }
 
@@ -495,9 +510,11 @@ impl<'a, 'tcx> Visitor<'tcx> for RefVisitor<'a, 'tcx> {
 
     fn visit_poly_trait_ref(&mut self, poly_tref: &'tcx PolyTraitRef<'tcx>) {
         let trait_ref = &poly_tref.trait_ref;
-        if let Some(id) = trait_ref.trait_def_id() && lang_items::FN_TRAITS.iter().any(|&item| {
-            self.cx.tcx.lang_items().get(item) == Some(id)
-        }) {
+        if let Some(id) = trait_ref.trait_def_id()
+            && lang_items::FN_TRAITS
+                .iter()
+                .any(|&item| self.cx.tcx.lang_items().get(item) == Some(id))
+        {
             let mut sub_visitor = RefVisitor::new(self.cx);
             sub_visitor.visit_trait_ref(trait_ref);
             self.nested_elision_site_lts.append(&mut sub_visitor.all_lts());
@@ -554,7 +571,7 @@ fn has_where_lifetimes<'tcx>(cx: &LateContext<'tcx>, generics: &'tcx Generics<'_
                 // if the bounds define new lifetimes, they are fine to occur
                 let allowed_lts = allowed_lts_from(pred.bound_generic_params);
                 // now walk the bounds
-                for bound in pred.bounds.iter() {
+                for bound in pred.bounds {
                     walk_param_bound(&mut visitor, bound);
                 }
                 // and check that all lifetimes are allowed
@@ -599,7 +616,7 @@ impl<'cx, 'tcx, F> Visitor<'tcx> for LifetimeChecker<'cx, 'tcx, F>
 where
     F: NestedFilter<'tcx>,
 {
-    type Map = rustc_middle::hir::map::Map<'tcx>;
+    type Map = Map<'tcx>;
     type NestedFilter = F;
 
     // for lifetimes as parameters of generics

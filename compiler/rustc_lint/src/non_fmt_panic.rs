@@ -4,10 +4,12 @@ use rustc_ast as ast;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_session::lint::FutureIncompatibilityReason;
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::edition::Edition;
 use rustc_span::{hygiene, sym, symbol::kw, InnerSpan, Span, Symbol};
 use rustc_trait_selection::infer::InferCtxtExt;
@@ -53,7 +55,7 @@ impl<'tcx> LateLintPass<'tcx> for NonPanicFmt {
 
                 if Some(def_id) == cx.tcx.lang_items().begin_panic_fn()
                     || Some(def_id) == cx.tcx.lang_items().panic_fn()
-                    || f_diagnostic_name == Some(sym::panic_str)
+                    || f_diagnostic_name == Some(sym::panic_str_2015)
                 {
                     if let Some(id) = f.span.ctxt().outer_expn_data().macro_def_id {
                         if matches!(
@@ -111,24 +113,25 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
     let mut arg_span = arg.span;
     let mut arg_macro = None;
     while !span.contains(arg_span) {
-        let expn = arg_span.ctxt().outer_expn_data();
-        if expn.is_root() {
+        let ctxt = arg_span.ctxt();
+        if ctxt.is_root() {
             break;
         }
+        let expn = ctxt.outer_expn_data();
         arg_macro = expn.macro_def_id;
         arg_span = expn.call_site;
     }
 
     #[allow(rustc::diagnostic_outside_of_impl)]
-    cx.struct_span_lint(NON_FMT_PANICS, arg_span, fluent::lint_non_fmt_panic, |lint| {
-        lint.set_arg("name", symbol);
+    cx.span_lint(NON_FMT_PANICS, arg_span, fluent::lint_non_fmt_panic, |lint| {
+        lint.arg("name", symbol);
         lint.note(fluent::lint_note);
         lint.note(fluent::lint_more_info_note);
         if !is_arg_inside_call(arg_span, span) {
             // No clue where this argument is coming from.
-            return lint;
+            return;
         }
-        if arg_macro.map_or(false, |id| cx.tcx.is_diagnostic_item(sym::format_macro, id)) {
+        if arg_macro.is_some_and(|id| cx.tcx.is_diagnostic_item(sym::format_macro, id)) {
             // A case of `panic!(format!(..))`.
             lint.note(fluent::lint_supports_fmt_note);
             if let Some((open, close, _)) = find_delimiters(cx, arg_span) {
@@ -154,17 +157,13 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
 
             let infcx = cx.tcx.infer_ctxt().build();
             let suggest_display = is_str
-                || cx
-                    .tcx
-                    .get_diagnostic_item(sym::Display)
-                    .map(|t| infcx.type_implements_trait(t, [ty], cx.param_env).may_apply())
-                    == Some(true);
+                || cx.tcx.get_diagnostic_item(sym::Display).is_some_and(|t| {
+                    infcx.type_implements_trait(t, [ty], cx.param_env).may_apply()
+                });
             let suggest_debug = !suggest_display
-                && cx
-                    .tcx
-                    .get_diagnostic_item(sym::Debug)
-                    .map(|t| infcx.type_implements_trait(t, [ty], cx.param_env).may_apply())
-                    == Some(true);
+                && cx.tcx.get_diagnostic_item(sym::Debug).is_some_and(|t| {
+                    infcx.type_implements_trait(t, [ty], cx.param_env).may_apply()
+                });
 
             let suggest_panic_any = !is_str && panic == sym::std_panic_macro;
 
@@ -184,7 +183,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
                     fmt_applicability,
                 );
             } else if suggest_debug {
-                lint.set_arg("ty", ty);
+                lint.arg("ty", ty);
                 lint.span_suggestion_verbose(
                     arg_span.shrink_to_lo(),
                     fluent::lint_debug_suggestion,
@@ -195,7 +194,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
 
             if suggest_panic_any {
                 if let Some((open, close, del)) = find_delimiters(cx, span) {
-                    lint.set_arg("already_suggested", suggest_display || suggest_debug);
+                    lint.arg("already_suggested", suggest_display || suggest_debug);
                     lint.multipart_suggestion(
                         fluent::lint_panic_suggestion,
                         if del == '(' {
@@ -211,7 +210,6 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
                 }
             }
         }
-        lint
     });
 }
 
@@ -235,7 +233,7 @@ fn check_panic_str<'tcx>(
 
     let fmt_span = arg.span.source_callsite();
 
-    let (snippet, style) = match cx.sess().parse_sess.source_map().span_to_snippet(fmt_span) {
+    let (snippet, style) = match cx.sess().psess.source_map().span_to_snippet(fmt_span) {
         Ok(snippet) => {
             // Count the number of `#`s between the `r` and `"`.
             let style = snippet.strip_prefix('r').and_then(|s| s.find('"'));
@@ -255,7 +253,7 @@ fn check_panic_str<'tcx>(
                 .map(|span| fmt_span.from_inner(InnerSpan::new(span.start, span.end)))
                 .collect(),
         };
-        cx.emit_spanned_lint(
+        cx.emit_span_lint(
             NON_FMT_PANICS,
             arg_spans,
             NonFmtPanicUnused {
@@ -272,7 +270,7 @@ fn check_panic_str<'tcx>(
                     .collect()
             });
         let count = brace_spans.as_ref().map(|v| v.len()).unwrap_or(/* any number >1 */ 2);
-        cx.emit_spanned_lint(
+        cx.emit_span_lint(
             NON_FMT_PANICS,
             brace_spans.unwrap_or_else(|| vec![span]),
             NonFmtPanicBraces {
@@ -286,7 +284,7 @@ fn check_panic_str<'tcx>(
 /// Given the span of `some_macro!(args);`, gives the span of `(` and `)`,
 /// and the type of (opening) delimiter used.
 fn find_delimiters(cx: &LateContext<'_>, span: Span) -> Option<(Span, Span, char)> {
-    let snippet = cx.sess().parse_sess.source_map().span_to_snippet(span).ok()?;
+    let snippet = cx.sess().psess.source_map().span_to_snippet(span).ok()?;
     let (open, open_ch) = snippet.char_indices().find(|&(_, c)| "([{".contains(c))?;
     let close = snippet.rfind(|c| ")]}".contains(c))?;
     Some((

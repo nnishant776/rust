@@ -1,12 +1,16 @@
-// run-pass
+//@ run-pass
 
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 #![feature(never_type)]
-#![feature(pointer_is_aligned)]
+#![feature(pointer_is_aligned_to)]
+#![feature(strict_provenance)]
 
 use std::mem::size_of;
-use std::num::NonZeroU8;
+use std::num::NonZero;
+use std::ptr;
+use std::ptr::NonNull;
+use std::borrow::Cow;
 
 struct t {a: u8, b: i8}
 struct u {a: u8, b: i8, c: u8}
@@ -106,14 +110,14 @@ enum Option2<A, B> {
 
 // Two layouts are considered for `CanBeNicheFilledButShouldnt`:
 //   Niche-filling:
-//     { u32 (4 bytes), NonZeroU8 + tag in niche (1 byte), padding (3 bytes) }
+//     { u32 (4 bytes), NonZero<u8> + tag in niche (1 byte), padding (3 bytes) }
 //   Tagged:
-//     { tag (1 byte), NonZeroU8 (1 byte), padding (2 bytes), u32 (4 bytes) }
+//     { tag (1 byte), NonZero<u8> (1 byte), padding (2 bytes), u32 (4 bytes) }
 // Both are the same size (due to padding),
 // but the tagged layout is better as the tag creates a niche with 254 invalid values,
 // allowing types like `Option<Option<CanBeNicheFilledButShouldnt>>` to fit into 8 bytes.
 pub enum CanBeNicheFilledButShouldnt {
-    A(NonZeroU8, u32),
+    A(NonZero<u8>, u32),
     B
 }
 pub enum AlwaysTaggedBecauseItHasNoNiche {
@@ -131,7 +135,7 @@ pub enum NicheFilledMultipleFields {
     G,
 }
 
-struct BoolInTheMiddle(std::num::NonZeroU16, bool, u8);
+struct BoolInTheMiddle(NonZero<u16>, bool, u8);
 
 enum NicheWithData {
     A,
@@ -179,6 +183,41 @@ struct Reorder2 {
     a: u16,
     b: u8,
     ary: [u8; 6],
+}
+
+// We want the niche in the front, which means we can't treat the array as quasi-aligned more than
+// 4 bytes even though we also want to place it at an 8-aligned offset where possible.
+// So the ideal layout would look like: (char, u32, [u8; 8], u8)
+// The current layout algorithm does (char, [u8; 8], u32, u8)
+#[repr(align(8))]
+struct ReorderWithNiche {
+    a: u32,
+    b: char,
+    c: u8,
+    ary: [u8; 8]
+}
+
+#[repr(C)]
+struct EndNiche8([u8; 7], bool);
+
+#[repr(C)]
+struct MiddleNiche4(u8, u8, bool, u8);
+
+struct ReorderEndNiche {
+    a: EndNiche8,
+    b: MiddleNiche4,
+}
+
+
+// standins for std types which we want to be laid out in a reasonable way
+struct RawVecDummy {
+    ptr: NonNull<u8>,
+    cap: usize,
+}
+
+struct VecDummy {
+    r: RawVecDummy,
+    len: usize,
 }
 
 pub fn main() {
@@ -236,7 +275,7 @@ pub fn main() {
     assert_eq!(size_of::<Option<NicheFilledMultipleFields>>(), 2);
     assert_eq!(size_of::<Option<Option<NicheFilledMultipleFields>>>(), 2);
 
-    struct S1{ a: u16, b: std::num::NonZeroU16, c: u16, d: u8, e: u32, f: u64, g:[u8;2] }
+    struct S1{ a: u16, b: NonZero<u16>, c: u16, d: u8, e: u32, f: u64, g:[u8;2] }
     assert_eq!(size_of::<S1>(), 24);
     assert_eq!(size_of::<Option<S1>>(), 24);
 
@@ -248,14 +287,14 @@ pub fn main() {
         size_of::<(&(), NicheWithData)>()
     );
 
-    pub enum FillPadding { A(std::num::NonZeroU8, u32), B }
+    pub enum FillPadding { A(NonZero<u8>, u32), B }
     assert_eq!(size_of::<FillPadding>(), 8);
     assert_eq!(size_of::<Option<FillPadding>>(), 8);
     assert_eq!(size_of::<Option<Option<FillPadding>>>(), 8);
 
-    assert_eq!(size_of::<Result<(std::num::NonZeroU8, u8, u8), u16>>(), 4);
-    assert_eq!(size_of::<Option<Result<(std::num::NonZeroU8, u8, u8), u16>>>(), 4);
-    assert_eq!(size_of::<Result<(std::num::NonZeroU8, u8, u8, u8), u16>>(), 4);
+    assert_eq!(size_of::<Result<(NonZero<u8>, u8, u8), u16>>(), 4);
+    assert_eq!(size_of::<Option<Result<(NonZero<u8>, u8, u8), u16>>>(), 4);
+    assert_eq!(size_of::<Result<(NonZero<u8>, u8, u8, u8), u16>>(), 4);
 
     assert_eq!(size_of::<EnumManyVariant<u16>>(), 6);
     assert_eq!(size_of::<EnumManyVariant<NicheU16>>(), 4);
@@ -270,4 +309,29 @@ pub fn main() {
     let v = Reorder2 {a: 0, b: 0, ary: [0; 6]};
     assert_eq!(size_of::<Reorder2>(), 10);
     assert!((&v.ary).as_ptr().is_aligned_to(2), "[u8; 6] should group with align-2 fields");
+
+    let v = VecDummy { r: RawVecDummy { ptr: NonNull::dangling(), cap: 0 }, len: 1 };
+    assert_eq!(ptr::from_ref(&v), ptr::from_ref(&v.r.ptr).cast(),
+               "sort niches to the front where possible");
+
+    // Ideal layouts: (bool, u8, NonZero<u16>) or (NonZero<u16>, u8, bool)
+    // Currently the layout algorithm will choose the latter because it doesn't attempt
+    // to aggregate multiple smaller fields to move a niche before a higher-alignment one.
+    let b = BoolInTheMiddle(NonZero::new(1).unwrap(), true, 0);
+    assert!(ptr::from_ref(&b.1).addr() > ptr::from_ref(&b.2).addr());
+
+    assert_eq!(size_of::<Cow<'static, str>>(), size_of::<String>());
+
+    let v = ReorderWithNiche {a: 0, b: ' ', c: 0, ary: [0; 8]};
+    assert!((&v.ary).as_ptr().is_aligned_to(4),
+            "here [u8; 8] should group with _at least_ align-4 fields");
+    assert_eq!(ptr::from_ref(&v), ptr::from_ref(&v.b).cast(),
+               "sort niches to the front where possible");
+
+    // Neither field has a niche at the beginning so the layout algorithm should try move niches to
+    // the end which means the 8-sized field shouldn't be alignment-promoted before the 4-sized one.
+    let v = ReorderEndNiche { a: EndNiche8([0; 7], false), b: MiddleNiche4(0, 0, false, 0) };
+    assert!(ptr::from_ref(&v.a).addr() > ptr::from_ref(&v.b).addr());
+
+
 }

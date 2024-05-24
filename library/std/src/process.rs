@@ -12,9 +12,9 @@
 //! use std::process::Command;
 //!
 //! let output = Command::new("echo")
-//!                      .arg("Hello world")
-//!                      .output()
-//!                      .expect("Failed to execute command");
+//!     .arg("Hello world")
+//!     .output()
+//!     .expect("Failed to execute command");
 //!
 //! assert_eq!(b"Hello world\n", output.stdout.as_slice());
 //! ```
@@ -88,6 +88,47 @@
 //! assert_eq!(b"test", output.stdout.as_slice());
 //! ```
 //!
+//! # Windows argument splitting
+//!
+//! On Unix systems arguments are passed to a new process as an array of strings,
+//! but on Windows arguments are passed as a single commandline string and it is
+//! up to the child process to parse it into an array. Therefore the parent and
+//! child processes must agree on how the commandline string is encoded.
+//!
+//! Most programs use the standard C run-time `argv`, which in practice results
+//! in consistent argument handling. However some programs have their own way of
+//! parsing the commandline string. In these cases using [`arg`] or [`args`] may
+//! result in the child process seeing a different array of arguments then the
+//! parent process intended.
+//!
+//! Two ways of mitigating this are:
+//!
+//! * Validate untrusted input so that only a safe subset is allowed.
+//! * Use [`raw_arg`] to build a custom commandline. This bypasses the escaping
+//!   rules used by [`arg`] so should be used with due caution.
+//!
+//! `cmd.exe` and `.bat` files use non-standard argument parsing and are especially
+//! vulnerable to malicious input as they may be used to run arbitrary shell
+//! commands. Untrusted arguments should be restricted as much as possible.
+//! For examples on handling this see [`raw_arg`].
+//!
+//! ### Batch file special handling
+//!
+//! On Windows, `Command` uses the Windows API function [`CreateProcessW`] to
+//! spawn new processes. An undocumented feature of this function is that
+//! when given a `.bat` file as the application to run, it will automatically
+//! convert that into running `cmd.exe /c` with the batch file as the next argument.
+//!
+//! For historical reasons Rust currently preserves this behaviour when using
+//! [`Command::new`], and escapes the arguments according to `cmd.exe` rules.
+//! Due to the complexity of `cmd.exe` argument handling, it might not be
+//! possible to safely escape some special characters, and using them will result
+//! in an error being returned at process spawn. The set of unescapeable
+//! special characters might change between releases.
+//!
+//! Also note that running batch scripts in this way may be removed in the
+//! future and so should not be relied upon.
+//!
 //! [`spawn`]: Command::spawn
 //! [`output`]: Command::output
 //!
@@ -97,11 +138,17 @@
 //!
 //! [`Write`]: io::Write
 //! [`Read`]: io::Read
+//!
+//! [`arg`]: Command::arg
+//! [`args`]: Command::args
+//! [`raw_arg`]: crate::os::windows::process::CommandExt::raw_arg
+//!
+//! [`CreateProcessW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 
 #![stable(feature = "process", since = "1.0.0")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx"))))]
+#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx", target_os = "xous"))))]
 mod tests;
 
 use crate::io::prelude::*;
@@ -110,8 +157,8 @@ use crate::convert::Infallible;
 use crate::ffi::OsStr;
 use crate::fmt;
 use crate::fs;
-use crate::io::{self, IoSlice, IoSliceMut};
-use crate::num::NonZeroI32;
+use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
+use crate::num::NonZero;
 use crate::path::Path;
 use crate::str;
 use crate::sys::pipe::{read2, AnonPipe};
@@ -154,12 +201,11 @@ use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 /// use std::process::Command;
 ///
 /// let mut child = Command::new("/bin/cat")
-///                         .arg("file.txt")
-///                         .spawn()
-///                         .expect("failed to execute child");
+///     .arg("file.txt")
+///     .spawn()
+///     .expect("failed to execute child");
 ///
-/// let ecode = child.wait()
-///                  .expect("failed to wait on child");
+/// let ecode = child.wait().expect("failed to wait on child");
 ///
 /// assert!(ecode.success());
 /// ```
@@ -172,7 +218,7 @@ pub struct Child {
     /// The handle for writing to the child's standard input (stdin), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stdin = child.stdin.take().unwrap();
     /// ```
     ///
@@ -184,7 +230,7 @@ pub struct Child {
     /// The handle for reading from the child's standard output (stdout), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stdout = child.stdout.take().unwrap();
     /// ```
     ///
@@ -196,7 +242,7 @@ pub struct Child {
     /// The handle for reading from the child's standard error (stderr), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stderr = child.stderr.take().unwrap();
     /// ```
     ///
@@ -211,6 +257,7 @@ pub struct Child {
 impl crate::sealed::Sealed for Child {}
 
 impl AsInner<imp::Process> for Child {
+    #[inline]
     fn as_inner(&self) -> &imp::Process {
         &self.handle
     }
@@ -279,6 +326,7 @@ impl Write for ChildStdin {
         io::Write::is_write_vectored(&&*self)
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         (&*self).flush()
     }
@@ -298,12 +346,14 @@ impl Write for &ChildStdin {
         self.inner.is_write_vectored()
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
 impl AsInner<AnonPipe> for ChildStdin {
+    #[inline]
     fn as_inner(&self) -> &AnonPipe {
         &self.inner
     }
@@ -354,6 +404,10 @@ impl Read for ChildStdout {
         self.inner.read(buf)
     }
 
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.inner.read_buf(buf)
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.inner.read_vectored(bufs)
     }
@@ -369,6 +423,7 @@ impl Read for ChildStdout {
 }
 
 impl AsInner<AnonPipe> for ChildStdout {
+    #[inline]
     fn as_inner(&self) -> &AnonPipe {
         &self.inner
     }
@@ -419,6 +474,10 @@ impl Read for ChildStderr {
         self.inner.read(buf)
     }
 
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.inner.read_buf(buf)
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.inner.read_vectored(bufs)
     }
@@ -427,9 +486,14 @@ impl Read for ChildStderr {
     fn is_read_vectored(&self) -> bool {
         self.inner.is_read_vectored()
     }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        self.inner.read_to_end(buf)
+    }
 }
 
 impl AsInner<AnonPipe> for ChildStderr {
+    #[inline]
     fn as_inner(&self) -> &AnonPipe {
         &self.inner
     }
@@ -467,15 +531,15 @@ impl fmt::Debug for ChildStderr {
 ///
 /// let output = if cfg!(target_os = "windows") {
 ///     Command::new("cmd")
-///             .args(["/C", "echo hello"])
-///             .output()
-///             .expect("failed to execute process")
+///         .args(["/C", "echo hello"])
+///         .output()
+///         .expect("failed to execute process")
 /// } else {
 ///     Command::new("sh")
-///             .arg("-c")
-///             .arg("echo hello")
-///             .output()
-///             .expect("failed to execute process")
+///         .arg("-c")
+///         .arg("echo hello")
+///         .output()
+///         .expect("failed to execute process")
 /// };
 ///
 /// let hello = output.stdout;
@@ -488,8 +552,7 @@ impl fmt::Debug for ChildStderr {
 /// use std::process::Command;
 ///
 /// let mut echo_hello = Command::new("sh");
-/// echo_hello.arg("-c")
-///           .arg("echo hello");
+/// echo_hello.arg("-c").arg("echo hello");
 /// let hello_1 = echo_hello.output().expect("failed to execute process");
 /// let hello_2 = echo_hello.output().expect("failed to execute process");
 /// ```
@@ -514,6 +577,7 @@ impl fmt::Debug for ChildStderr {
 /// list_dir.status().expect("process failed to execute");
 /// ```
 #[stable(feature = "process", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Command")]
 pub struct Command {
     inner: imp::Command,
 }
@@ -546,6 +610,14 @@ impl Command {
     /// but this has some implementation limitations on Windows
     /// (see issue #37519).
     ///
+    /// # Platform-specific behavior
+    ///
+    /// Note on Windows: For executable files with the .exe extension,
+    /// it can be omitted when specifying the program for this Command.
+    /// However, if the file has a different extension,
+    /// a filename including the extension needs to be provided,
+    /// otherwise the file won't be found.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -554,8 +626,8 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("sh")
-    ///         .spawn()
-    ///         .expect("sh command failed to start");
+    ///     .spawn()
+    ///     .expect("sh command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
@@ -587,8 +659,27 @@ impl Command {
     ///
     /// Note that the argument is not passed through a shell, but given
     /// literally to the program. This means that shell syntax like quotes,
-    /// escaped characters, word splitting, glob patterns, substitution, etc.
-    /// have no effect.
+    /// escaped characters, word splitting, glob patterns, variable substitution,
+    /// etc. have no effect.
+    ///
+    /// <div class="warning">
+    ///
+    /// On Windows, use caution with untrusted inputs. Most applications use the
+    /// standard convention for decoding arguments passed to them. These are safe to
+    /// use with `arg`. However, some applications such as `cmd.exe` and `.bat` files
+    /// use a non-standard way of decoding arguments. They are therefore vulnerable
+    /// to malicious input.
+    ///
+    /// In the case of `cmd.exe` this is especially important because a malicious
+    /// argument can potentially run arbitrary shell commands.
+    ///
+    /// See [Windows argument splitting][windows-args] for more details
+    /// or [`raw_arg`] for manually implementing non-standard argument encoding.
+    ///
+    /// [`raw_arg`]: crate::os::windows::process::CommandExt::raw_arg
+    /// [windows-args]: crate::process#windows-argument-splitting
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -598,10 +689,10 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .arg("-l")
-    ///         .arg("-a")
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .arg("-l")
+    ///     .arg("-a")
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command {
@@ -617,8 +708,27 @@ impl Command {
     ///
     /// Note that the arguments are not passed through a shell, but given
     /// literally to the program. This means that shell syntax like quotes,
-    /// escaped characters, word splitting, glob patterns, substitution, etc.
+    /// escaped characters, word splitting, glob patterns, variable substitution, etc.
     /// have no effect.
+    ///
+    /// <div class="warning">
+    ///
+    /// On Windows, use caution with untrusted inputs. Most applications use the
+    /// standard convention for decoding arguments passed to them. These are safe to
+    /// use with `arg`. However, some applications such as `cmd.exe` and `.bat` files
+    /// use a non-standard way of decoding arguments. They are therefore vulnerable
+    /// to malicious input.
+    ///
+    /// In the case of `cmd.exe` this is especially important because a malicious
+    /// argument can potentially run arbitrary shell commands.
+    ///
+    /// See [Windows argument splitting][windows-args] for more details
+    /// or [`raw_arg`] for manually implementing non-standard argument encoding.
+    ///
+    /// [`raw_arg`]: crate::os::windows::process::CommandExt::raw_arg
+    /// [windows-args]: crate::process#windows-argument-splitting
+    ///
+    /// </div>
     ///
     /// # Examples
     ///
@@ -628,9 +738,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .args(["-l", "-a"])
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .args(["-l", "-a"])
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn args<I, S>(&mut self, args: I) -> &mut Command
@@ -644,10 +754,19 @@ impl Command {
         self
     }
 
-    /// Inserts or updates an environment variable mapping.
+    /// Inserts or updates an explicit environment variable mapping.
     ///
-    /// Note that environment variable names are case-insensitive (but case-preserving) on Windows,
-    /// and case-sensitive on all other platforms.
+    /// This method allows you to add an environment variable mapping to the spawned process or
+    /// overwrite a previously set value. You can use [`Command::envs`] to set multiple environment
+    /// variables simultaneously.
+    ///
+    /// Child processes will inherit environment variables from their parent process by default.
+    /// Environment variables explicitly set using [`Command::env`] take precedence over inherited
+    /// variables. You can disable environment variable inheritance entirely using
+    /// [`Command::env_clear`] or for a single key using [`Command::env_remove`].
+    ///
+    /// Note that environment variable names are case-insensitive (but
+    /// case-preserving) on Windows and case-sensitive on all other platforms.
     ///
     /// # Examples
     ///
@@ -657,9 +776,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .env("PATH", "/bin")
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .env("PATH", "/bin")
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Command
@@ -671,7 +790,19 @@ impl Command {
         self
     }
 
-    /// Adds or updates multiple environment variable mappings.
+    /// Inserts or updates multiple explicit environment variable mappings.
+    ///
+    /// This method allows you to add multiple environment variable mappings to the spawned process
+    /// or overwrite previously set values. You can use [`Command::env`] to set a single environment
+    /// variable.
+    ///
+    /// Child processes will inherit environment variables from their parent process by default.
+    /// Environment variables explicitly set using [`Command::envs`] take precedence over inherited
+    /// variables. You can disable environment variable inheritance entirely using
+    /// [`Command::env_clear`] or for a single key using [`Command::env_remove`].
+    ///
+    /// Note that environment variable names are case-insensitive (but case-preserving) on Windows
+    /// and case-sensitive on all other platforms.
     ///
     /// # Examples
     ///
@@ -688,12 +819,12 @@ impl Command {
     ///     ).collect();
     ///
     /// Command::new("printenv")
-    ///         .stdin(Stdio::null())
-    ///         .stdout(Stdio::inherit())
-    ///         .env_clear()
-    ///         .envs(&filtered_env)
-    ///         .spawn()
-    ///         .expect("printenv failed to start");
+    ///     .stdin(Stdio::null())
+    ///     .stdout(Stdio::inherit())
+    ///     .env_clear()
+    ///     .envs(&filtered_env)
+    ///     .spawn()
+    ///     .expect("printenv failed to start");
     /// ```
     #[stable(feature = "command_envs", since = "1.19.0")]
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Command
@@ -708,7 +839,18 @@ impl Command {
         self
     }
 
-    /// Removes an environment variable mapping.
+    /// Removes an explicitly set environment variable and prevents inheriting it from a parent
+    /// process.
+    ///
+    /// This method will remove the explicit value of an environment variable set via
+    /// [`Command::env`] or [`Command::envs`]. In addition, it will prevent the spawned child
+    /// process from inheriting that environment variable from its parent process.
+    ///
+    /// After calling [`Command::env_remove`], the value associated with its key from
+    /// [`Command::get_envs`] will be [`None`].
+    ///
+    /// To clear all explicitly set environment variables and disable all environment variable
+    /// inheritance, you can use [`Command::env_clear`].
     ///
     /// # Examples
     ///
@@ -718,9 +860,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .env_remove("PATH")
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .env_remove("PATH")
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Command {
@@ -728,7 +870,17 @@ impl Command {
         self
     }
 
-    /// Clears the entire environment map for the child process.
+    /// Clears all explicitly set environment variables and prevents inheriting any parent process
+    /// environment variables.
+    ///
+    /// This method will remove all explicitly added environment variables set via [`Command::env`]
+    /// or [`Command::envs`]. In addition, it will prevent the spawned child process from inheriting
+    /// any environment variable from its parent process.
+    ///
+    /// After calling [`Command::env_clear`], the iterator from [`Command::get_envs`] will be
+    /// empty.
+    ///
+    /// You can use [`Command::env_remove`] to clear a single mapping.
     ///
     /// # Examples
     ///
@@ -738,9 +890,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .env_clear()
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .env_clear()
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn env_clear(&mut self) -> &mut Command {
@@ -766,9 +918,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .current_dir("/bin")
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .current_dir("/bin")
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     ///
     /// [`canonicalize`]: crate::fs::canonicalize
@@ -797,9 +949,9 @@ impl Command {
     /// use std::process::{Command, Stdio};
     ///
     /// Command::new("ls")
-    ///         .stdin(Stdio::null())
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .stdin(Stdio::null())
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
@@ -826,9 +978,9 @@ impl Command {
     /// use std::process::{Command, Stdio};
     ///
     /// Command::new("ls")
-    ///         .stdout(Stdio::null())
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .stdout(Stdio::null())
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
@@ -855,9 +1007,9 @@ impl Command {
     /// use std::process::{Command, Stdio};
     ///
     /// Command::new("ls")
-    ///         .stderr(Stdio::null())
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .stderr(Stdio::null())
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
@@ -877,8 +1029,8 @@ impl Command {
     /// use std::process::Command;
     ///
     /// Command::new("ls")
-    ///         .spawn()
-    ///         .expect("ls command failed to start");
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn spawn(&mut self) -> io::Result<Child> {
@@ -899,9 +1051,9 @@ impl Command {
     /// use std::process::Command;
     /// use std::io::{self, Write};
     /// let output = Command::new("/bin/cat")
-    ///                      .arg("file.txt")
-    ///                      .output()
-    ///                      .expect("failed to execute process");
+    ///     .arg("file.txt")
+    ///     .output()
+    ///     .expect("failed to execute process");
     ///
     /// println!("status: {}", output.status);
     /// io::stdout().write_all(&output.stdout).unwrap();
@@ -926,9 +1078,9 @@ impl Command {
     /// use std::process::Command;
     ///
     /// let status = Command::new("/bin/cat")
-    ///                      .arg("file.txt")
-    ///                      .status()
-    ///                      .expect("failed to execute process");
+    ///     .arg("file.txt")
+    ///     .status()
+    ///     .expect("failed to execute process");
     ///
     /// println!("process finished with: {status}");
     ///
@@ -980,17 +1132,21 @@ impl Command {
         CommandArgs { inner: self.inner.get_args() }
     }
 
-    /// Returns an iterator of the environment variables that will be set when
-    /// the process is spawned.
+    /// Returns an iterator of the environment variables explicitly set for the child process.
     ///
-    /// Each element is a tuple `(&OsStr, Option<&OsStr>)`, where the first
-    /// value is the key, and the second is the value, which is [`None`] if
-    /// the environment variable is to be explicitly removed.
+    /// Environment variables explicitly set using [`Command::env`], [`Command::envs`], and
+    /// [`Command::env_remove`] can be retrieved with this method.
     ///
-    /// This only includes environment variables explicitly set with
-    /// [`Command::env`], [`Command::envs`], and [`Command::env_remove`]. It
-    /// does not include environment variables that will be inherited by the
-    /// child process.
+    /// Note that this output does not include environment variables inherited from the parent
+    /// process.
+    ///
+    /// Each element is a tuple key/value pair `(&OsStr, Option<&OsStr>)`. A [`None`] value
+    /// indicates its key was explicitly removed via [`Command::env_remove`]. The associated key for
+    /// the [`None`] value will no longer inherit from its parent process.
+    ///
+    /// An empty iterator can indicate that no explicit mappings were added or that
+    /// [`Command::env_clear`] was called. After calling [`Command::env_clear`], the child process
+    /// will not inherit any environment variables from its parent process.
     ///
     /// # Examples
     ///
@@ -1041,7 +1197,7 @@ impl fmt::Debug for Command {
     ///
     /// The default format approximates a shell invocation of the program along with its
     /// arguments. It does not include most of the other command properties. The output is not guaranteed to work
-    /// (e.g. due to lack of shell-escaping or differences in path resolution)
+    /// (e.g. due to lack of shell-escaping or differences in path resolution).
     /// On some platforms you can use [the alternate syntax] to show more fields.
     ///
     /// Note that the debug implementation is platform-specific.
@@ -1053,12 +1209,14 @@ impl fmt::Debug for Command {
 }
 
 impl AsInner<imp::Command> for Command {
+    #[inline]
     fn as_inner(&self) -> &imp::Command {
         &self.inner
     }
 }
 
 impl AsInnerMut<imp::Command> for Command {
+    #[inline]
     fn as_inner_mut(&mut self) -> &mut imp::Command {
         &mut self.inner
     }
@@ -1416,7 +1574,7 @@ impl From<fs::File> for Stdio {
     /// use std::fs::File;
     /// use std::process::Command;
     ///
-    /// // With the `foo.txt` file containing `Hello, world!"
+    /// // With the `foo.txt` file containing "Hello, world!"
     /// let file = File::open("foo.txt").unwrap();
     ///
     /// let reverse = Command::new("rev")
@@ -1428,6 +1586,66 @@ impl From<fs::File> for Stdio {
     /// ```
     fn from(file: fs::File) -> Stdio {
         Stdio::from_inner(file.into_inner().into())
+    }
+}
+
+#[stable(feature = "stdio_from_stdio", since = "1.74.0")]
+impl From<io::Stdout> for Stdio {
+    /// Redirect command stdout/stderr to our stdout
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(exit_status_error)]
+    /// use std::io;
+    /// use std::process::Command;
+    ///
+    /// # fn test() -> Result<(), Box<dyn std::error::Error>> {
+    /// let output = Command::new("whoami")
+    // "whoami" is a command which exists on both Unix and Windows,
+    // and which succeeds, producing some stdout output but no stderr.
+    ///     .stdout(io::stdout())
+    ///     .output()?;
+    /// output.status.exit_ok()?;
+    /// assert!(output.stdout.is_empty());
+    /// # Ok(())
+    /// # }
+    /// #
+    /// # if cfg!(unix) {
+    /// #     test().unwrap();
+    /// # }
+    /// ```
+    fn from(inherit: io::Stdout) -> Stdio {
+        Stdio::from_inner(inherit.into())
+    }
+}
+
+#[stable(feature = "stdio_from_stdio", since = "1.74.0")]
+impl From<io::Stderr> for Stdio {
+    /// Redirect command stdout/stderr to our stderr
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(exit_status_error)]
+    /// use std::io;
+    /// use std::process::Command;
+    ///
+    /// # fn test() -> Result<(), Box<dyn std::error::Error>> {
+    /// let output = Command::new("whoami")
+    ///     .stdout(io::stderr())
+    ///     .output()?;
+    /// output.status.exit_ok()?;
+    /// assert!(output.stdout.is_empty());
+    /// # Ok(())
+    /// # }
+    /// #
+    /// # if cfg!(unix) {
+    /// #     test().unwrap();
+    /// # }
+    /// ```
+    fn from(inherit: io::Stderr) -> Stdio {
+        Stdio::from_inner(inherit.into())
     }
 }
 
@@ -1464,6 +1682,15 @@ impl From<fs::File> for Stdio {
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ExitStatus(imp::ExitStatus);
 
+/// The default value is one which indicates successful completion.
+#[stable(feature = "process_exitstatus_default", since = "1.73.0")]
+impl Default for ExitStatus {
+    fn default() -> Self {
+        // Ideally this would be done by ExitCode::default().into() but that is complicated.
+        ExitStatus::from_inner(imp::ExitStatus::default())
+    }
+}
+
 /// Allows extension traits within `std`.
 #[unstable(feature = "sealed", issue = "none")]
 impl crate::sealed::Sealed for ExitStatus {}
@@ -1479,9 +1706,9 @@ impl ExitStatus {
     /// use std::process::Command;
     ///
     /// let status = Command::new("ls")
-    ///                      .arg("/dev/nonexistent")
-    ///                      .status()
-    ///                      .expect("ls could not be executed");
+    ///     .arg("/dev/nonexistent")
+    ///     .status()
+    ///     .expect("ls could not be executed");
     ///
     /// println!("ls: {status}");
     /// status.exit_ok().expect_err("/dev/nonexistent could be listed!");
@@ -1501,9 +1728,9 @@ impl ExitStatus {
     /// use std::process::Command;
     ///
     /// let status = Command::new("mkdir")
-    ///                      .arg("projects")
-    ///                      .status()
-    ///                      .expect("failed to execute mkdir");
+    ///     .arg("projects")
+    ///     .status()
+    ///     .expect("failed to execute mkdir");
     ///
     /// if status.success() {
     ///     println!("'projects/' directory created");
@@ -1534,13 +1761,13 @@ impl ExitStatus {
     /// use std::process::Command;
     ///
     /// let status = Command::new("mkdir")
-    ///                      .arg("projects")
-    ///                      .status()
-    ///                      .expect("failed to execute mkdir");
+    ///     .arg("projects")
+    ///     .status()
+    ///     .expect("failed to execute mkdir");
     ///
     /// match status.code() {
     ///     Some(code) => println!("Exited with status code: {code}"),
-    ///     None       => println!("Process terminated by signal")
+    ///     None => println!("Process terminated by signal")
     /// }
     /// ```
     #[must_use]
@@ -1551,6 +1778,7 @@ impl ExitStatus {
 }
 
 impl AsInner<imp::ExitStatus> for ExitStatus {
+    #[inline]
     fn as_inner(&self) -> &imp::ExitStatus {
         &self.0
     }
@@ -1636,9 +1864,9 @@ impl ExitStatusError {
         self.code_nonzero().map(Into::into)
     }
 
-    /// Reports the exit code, if applicable, from an `ExitStatusError`, as a `NonZero`
+    /// Reports the exit code, if applicable, from an `ExitStatusError`, as a [`NonZero`].
     ///
-    /// This is exactly like [`code()`](Self::code), except that it returns a `NonZeroI32`.
+    /// This is exactly like [`code()`](Self::code), except that it returns a <code>[NonZero]<[i32]></code>.
     ///
     /// Plain `code`, returning a plain integer, is provided because it is often more convenient.
     /// The returned value from `code()` is indeed also nonzero; use `code_nonzero()` when you want
@@ -1648,16 +1876,17 @@ impl ExitStatusError {
     ///
     /// ```
     /// #![feature(exit_status_error)]
+    ///
     /// # if cfg!(unix) {
-    /// use std::num::NonZeroI32;
+    /// use std::num::NonZero;
     /// use std::process::Command;
     ///
     /// let bad = Command::new("false").status().unwrap().exit_ok().unwrap_err();
-    /// assert_eq!(bad.code_nonzero().unwrap(), NonZeroI32::try_from(1).unwrap());
+    /// assert_eq!(bad.code_nonzero().unwrap(), NonZero::new(1).unwrap());
     /// # } // cfg!(unix)
     /// ```
     #[must_use]
-    pub fn code_nonzero(&self) -> Option<NonZeroI32> {
+    pub fn code_nonzero(&self) -> Option<NonZero<i32>> {
         self.0.code()
     }
 
@@ -1669,9 +1898,9 @@ impl ExitStatusError {
 }
 
 #[unstable(feature = "exit_status_error", issue = "84908")]
-impl Into<ExitStatus> for ExitStatusError {
-    fn into(self) -> ExitStatus {
-        ExitStatus(self.0.into())
+impl From<ExitStatusError> for ExitStatus {
+    fn from(error: ExitStatusError) -> Self {
+        Self(error.0.into())
     }
 }
 
@@ -1781,7 +2010,7 @@ impl ExitCode {
     /// # use std::fmt;
     /// # enum UhOhError { GenericProblem, Specific, WithCode { exit_code: ExitCode, _x: () } }
     /// # impl fmt::Display for UhOhError {
-    /// #     fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result { unimplemented!() }
+    /// #     fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { unimplemented!() }
     /// # }
     /// // there's no way to gracefully recover from an UhOhError, so we just
     /// // print a message and exit
@@ -1821,6 +2050,14 @@ impl ExitCode {
     }
 }
 
+/// The default value is [`ExitCode::SUCCESS`]
+#[stable(feature = "process_exitcode_default", since = "1.75.0")]
+impl Default for ExitCode {
+    fn default() -> Self {
+        ExitCode::SUCCESS
+    }
+}
+
 #[stable(feature = "process_exitcode", since = "1.61.0")]
 impl From<u8> for ExitCode {
     /// Construct an `ExitCode` from an arbitrary u8 value.
@@ -1830,6 +2067,7 @@ impl From<u8> for ExitCode {
 }
 
 impl AsInner<imp::ExitCode> for ExitCode {
+    #[inline]
     fn as_inner(&self) -> &imp::ExitCode {
         &self.0
     }
@@ -1842,8 +2080,8 @@ impl FromInner<imp::ExitCode> for ExitCode {
 }
 
 impl Child {
-    /// Forces the child process to exit. If the child has already exited, an [`InvalidInput`]
-    /// error is returned.
+    /// Forces the child process to exit. If the child has already exited, `Ok(())`
+    /// is returned.
     ///
     /// The mapping to [`ErrorKind`]s is not part of the compatibility contract of the function.
     ///
@@ -1858,7 +2096,7 @@ impl Child {
     ///
     /// let mut command = Command::new("yes");
     /// if let Ok(mut child) = command.spawn() {
-    ///     child.kill().expect("command wasn't running");
+    ///     child.kill().expect("command couldn't be killed");
     /// } else {
     ///     println!("yes command didn't start");
     /// }
@@ -2057,6 +2295,7 @@ impl Child {
 /// process::exit(0x0100);
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "process_exit")]
 pub fn exit(code: i32) -> ! {
     crate::rt::cleanup();
     crate::sys::os::exit(code)
@@ -2162,7 +2401,7 @@ pub fn id() -> u32 {
 /// of the `main` function, this trait is likely to be available only on
 /// standard library's runtime for convenience. Other runtimes are not required
 /// to provide similar functionality.
-#[cfg_attr(not(test), lang = "termination")]
+#[cfg_attr(not(any(test, doctest)), lang = "termination")]
 #[stable(feature = "termination_trait_lib", since = "1.61.0")]
 #[rustc_on_unimplemented(on(
     cause = "MainFunctionType",

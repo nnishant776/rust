@@ -1,4 +1,4 @@
-// build-pass
+//@ build-pass
 
 // Check that a reservation impl does not force other impls to follow
 // a lattice discipline.
@@ -29,6 +29,12 @@
 // approach.
 //
 // [ii]: https://smallcultfollowing.com/babysteps/blog/2016/09/24/intersection-impls/
+
+
+// check that reservation impls can't be used as normal impls in positive reasoning.
+
+//@ revisions: old next
+//@[next] compile-flags: -Znext-solver
 
 #![feature(rustc_attrs, never_type)]
 

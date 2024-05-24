@@ -1,9 +1,9 @@
-// ignore-lldb
+//@ ignore-lldb
 
 // GDB changed the way that it formatted Foreign types
-// min-gdb-version: 9.2
+//@ min-gdb-version: 9.2
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -175,7 +175,6 @@
 // 0-sized structs appear to be optimized away in some cases, so only check the structs that do
 // actually appear.
 // cdb-command:dv /t *_struct
-// cdb-check:struct type_names::GenericStruct<enum2$<type_names::mod1::Enum2>,f64> mut_generic_struct = [...]
 
 // ENUMS
 // cdb-command:dv /t *_enum_*

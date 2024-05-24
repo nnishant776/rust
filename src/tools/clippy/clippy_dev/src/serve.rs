@@ -2,13 +2,13 @@ use std::ffi::OsStr;
 use std::num::ParseIntError;
 use std::path::Path;
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, SystemTime};
+use std::{env, thread};
 
 /// # Panics
 ///
 /// Panics if the python commands could not be spawned
-pub fn run(port: u16, lint: Option<&String>) -> ! {
+pub fn run(port: u16, lint: Option<String>) -> ! {
     let mut url = Some(match lint {
         None => format!("http://localhost:{port}"),
         Some(lint) => format!("http://localhost:{port}/#{lint}"),
@@ -16,7 +16,7 @@ pub fn run(port: u16, lint: Option<&String>) -> ! {
 
     loop {
         if mtime("util/gh-pages/lints.json") < mtime("clippy_lints/src") {
-            Command::new("cargo")
+            Command::new(env::var("CARGO").unwrap_or("cargo".into()))
                 .arg("collect-metadata")
                 .spawn()
                 .unwrap()

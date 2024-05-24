@@ -1,8 +1,111 @@
 // The goal of this test is to ensure the color of the text is the one expected.
 
+include: "utils.goml"
+
+define-function: (
+    "check-search-color",
+    [
+        theme, count_color, desc_color, path_color, bottom_border_color, keyword_color,
+        struct_color, associatedtype_color, tymethod_color, method_color, structfield_color,
+        structfield_hover_color, macro_color, fn_color, hover_path_color, hover_background, grey
+    ],
+    block {
+        call-function: ("switch-theme", {"theme": |theme|})
+
+        // Waiting for the search results to appear...
+        wait-for: "#search-tabs"
+        assert-css: (
+            "#search-tabs > button > .count",
+            {"color": |count_color|},
+            ALL,
+        )
+        assert-css: (
+            "//*[@class='desc'][text()='Just a normal struct.']",
+            {"color": |desc_color|},
+        )
+        assert-css: (
+            "//*[@class='result-name']//*[text()='test_docs::']",
+            {"color": |path_color|},
+        )
+
+        // Checking the color of the bottom border.
+        assert-css: (
+            ".search-results > a",
+            {"border-bottom-color": |bottom_border_color|}
+        )
+
+        store-value: (entry_color, |path_color|) // color of the search entry
+        store-value: (hover_entry_color, |hover_path_color|) // color of the hovered/focused search entry
+        store-value: (background_color, "transparent")
+        store-value: (hover_background_color, |hover_background|)
+        store-value: (grey, |grey|)
+
+        call-function: ("check-result-color", {
+            "result_kind": "keyword",
+            "color": |keyword_color|,
+            "hover_color": |keyword_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "struct",
+            "color": |struct_color|,
+            "hover_color": |struct_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "associatedtype",
+            "color": |associatedtype_color|,
+            "hover_color": |associatedtype_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "tymethod",
+            "color": |tymethod_color|,
+            "hover_color": |tymethod_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "method",
+            "color": |method_color|,
+            "hover_color": |method_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "structfield",
+            "color": |structfield_color|,
+            "hover_color": |structfield_hover_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "macro",
+            "color": |macro_color|,
+            "hover_color": |macro_color|,
+        })
+        call-function: ("check-result-color", {
+            "result_kind": "fn",
+            "color": |fn_color|,
+            "hover_color": |fn_color|,
+        })
+
+        // Checking the `<a>` container.
+        move-cursor-to: ".search-input"
+        focus: ".search-input" // To ensure the `<a>` container isn't focused or hovered.
+        assert-css: (
+            "//*[@class='result-name']//*[text()='test_docs::']/ancestor::a",
+            {"color": |path_color|, "background-color": "transparent"},
+            ALL,
+        )
+
+        // Checking color and background on hover.
+        move-cursor-to: "//*[@class='desc'][text()='Just a normal struct.']"
+        assert-css: (
+            "//*[@class='result-name']//*[text()='test_docs::']",
+            {"color": |hover_path_color|},
+        )
+        assert-css: (
+            "//*[@class='result-name']//*[text()='test_docs::']/ancestor::a",
+            {"color": |hover_path_color|, "background-color": |hover_background|},
+        )
+    }
+)
+
 define-function: (
     "check-result-color",
-    (result_kind, color, hover_color),
+    [result_kind, color, hover_color],
     block {
         assert-css: (".result-" + |result_kind| + " ." + |result_kind|, {"color": |color|}, ALL)
         assert-css: (
@@ -28,374 +131,115 @@ define-function: (
             ".result-" + |result_kind| + ":focus ." + |result_kind|,
             {"color": |hover_color|},
         )
+        // color of the typename (struct, module, method, ...) before search results
+        assert-css: (
+            ".result-name .typename",
+            {"color": |grey|},
+            ALL,
+        )
     },
 )
 
-goto: "file://" + |DOC_PATH| + "/test_docs/index.html?search=coo"
+go-to: "file://" + |DOC_PATH| + "/test_docs/index.html?search=coo"
 
 // This is needed so that the text color is computed.
 show-text: true
 
 // Ayu theme
-local-storage: {
-    "rustdoc-theme": "ayu",
-    "rustdoc-use-system-theme": "false",
-}
-reload:
-
-// Waiting for the search results to appear...
-wait-for: "#search-tabs"
-assert-css: (
-    "#search-tabs > button > .count",
-    {"color": "rgb(136, 136, 136)"},
-    ALL,
-)
-assert-css: (
-    "//*[@class='desc'][text()='Just a normal struct.']",
-    {"color": "rgb(197, 197, 197)"},
-)
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']",
-    {"color": "rgb(0, 150, 207)"},
-)
-
-// Checking the color of the bottom border.
-assert-css: (
-    ".search-results > a",
-    {"border-bottom-color": "rgba(170, 170, 170, 0.2)"}
-)
-
-// Checking the color of "keyword" text.
-assert-css: (
-    "//*[@class='result-name']//*[text()='(keyword)']",
-    {"color": "rgb(120, 135, 151)"},
-)
-
-store-value: (entry_color, "rgb(0, 150, 207)") // color of the search entry
-store-value: (hover_entry_color, "rgb(255, 255, 255)") // color of the hovered/focused search entry
-store-value: (background_color, "rgba(0, 0, 0, 0)") // background color
-store-value: (hover_background_color, "rgb(60, 60, 60)") // hover background color
-
-call-function: (
-    "check-result-color", (
-        "keyword", // item kind
-        "rgb(57, 175, 215)", // color of item kind
-        "rgb(57, 175, 215)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "struct", // item kind
-        "rgb(255, 160, 165)", // color of item kind
-        "rgb(255, 160, 165)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "associatedtype", // item kind
-        "rgb(57, 175, 215)", // color of item kind
-        "rgb(57, 175, 215)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "tymethod", // item kind
-        "rgb(253, 214, 135)", // color of item kind
-        "rgb(253, 214, 135)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "method", // item kind
-        "rgb(253, 214, 135)", // color of item kind
-        "rgb(253, 214, 135)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "structfield", // item kind
-        "rgb(0, 150, 207)", // color of item kind
-        "rgb(255, 255, 255)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "macro", // item kind
-        "rgb(163, 122, 204)", // color of item kind
-        "rgb(163, 122, 204)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "fn", // item kind
-        "rgb(253, 214, 135)", // color of item kind
-        "rgb(253, 214, 135)", // color of hovered/focused item kind
-    ),
-)
-
-// Checking the `<a>` container.
-move-cursor-to: ".search-input"
-focus: ".search-input" // To ensure the `<a>` container isnt focus or hover.
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']/ancestor::a",
-    {"color": "rgb(0, 150, 207)", "background-color": "rgba(0, 0, 0, 0)"},
-    ALL,
-)
-
-// Checking color and background on hover.
-move-cursor-to: "//*[@class='desc'][text()='Just a normal struct.']"
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']",
-    {"color": "rgb(255, 255, 255)"},
-)
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']/ancestor::a",
-    {"color": "rgb(255, 255, 255)", "background-color": "rgb(60, 60, 60)"},
-)
+call-function: ("check-search-color", {
+    "theme": "ayu",
+    "count_color": "#888",
+    "desc_color": "#c5c5c5",
+    "path_color": "#0096cf",
+    "bottom_border_color": "#aaa3",
+    "keyword_color": "#39afd7",
+    "struct_color": "#ffa0a5",
+    "associatedtype_color": "#39afd7",
+    "tymethod_color": "#fdd687",
+    "method_color": "#fdd687",
+    "structfield_color": "#0096cf",
+    "structfield_hover_color": "#fff",
+    "macro_color": "#a37acc",
+    "fn_color": "#fdd687",
+    "hover_path_color": "#fff",
+    "hover_background": "#3c3c3c",
+    "grey": "#999",
+})
 
 // Dark theme
-local-storage: {
-    "rustdoc-theme": "dark",
-    "rustdoc-use-system-theme": "false",
-}
-reload:
-
-// Waiting for the search results to appear...
-wait-for: "#search-tabs"
-assert-css: (
-    "#search-tabs > button > .count",
-    {"color": "rgb(136, 136, 136)"},
-    ALL,
-)
-assert-css: (
-    "//*[@class='desc'][text()='Just a normal struct.']",
-    {"color": "rgb(221, 221, 221)"},
-)
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']",
-    {"color": "rgb(221, 221, 221)"},
-)
-
-// Checking the color of the bottom border.
-assert-css: (
-    ".search-results > a",
-    {"border-bottom-color": "rgba(170, 170, 170, 0.2)"}
-)
-
-// Checking the color for "keyword" text.
-assert-css: (
-    "//*[@class='result-name']//*[text()='(keyword)']",
-    {"color": "rgb(221, 221, 221)"},
-)
-
-store-value: (entry_color, "rgb(221, 221, 221)") // color of the search entry
-store-value: (hover_entry_color, "rgb(221, 221, 221)") // color of the hovered/focused search entry
-store-value: (background_color, "rgba(0, 0, 0, 0)") // background color
-store-value: (hover_background_color, "rgb(97, 97, 97)") // hover background color
-
-call-function: (
-    "check-result-color", (
-        "keyword", // item kind
-        "rgb(210, 153, 29)", // color of item kind
-        "rgb(210, 153, 29)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "struct", // item kind
-        "rgb(45, 191, 184)", // color of item kind
-        "rgb(45, 191, 184)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "associatedtype", // item kind
-        "rgb(210, 153, 29)", // color of item kind
-        "rgb(210, 153, 29)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "tymethod", // item kind
-        "rgb(43, 171, 99)", // color of item kind
-        "rgb(43, 171, 99)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "method", // item kind
-        "rgb(43, 171, 99)", // color of item kind
-        "rgb(43, 171, 99)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "structfield", // item kind
-        "rgb(221, 221, 221)", // color of item kind
-        "rgb(221, 221, 221)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "macro", // item kind
-        "rgb(9, 189, 0)", // color of item kind
-        "rgb(9, 189, 0)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "fn", // item kind
-        "rgb(43, 171, 99)", // color of item kind
-        "rgb(43, 171, 99)", // color of hovered/focused item kind
-    ),
-)
-
-// Checking the `<a>` container.
-move-cursor-to: ".search-input"
-focus: ".search-input" // To ensure the `<a>` container isnt focus or hover.
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']/ancestor::a",
-    {"color": "rgb(221, 221, 221)", "background-color": "rgba(0, 0, 0, 0)"},
-)
+call-function: ("check-search-color", {
+    "theme": "dark",
+    "count_color": "#888",
+    "desc_color": "#ddd",
+    "path_color": "#ddd",
+    "bottom_border_color": "#aaa3",
+    "keyword_color": "#d2991d",
+    "struct_color": "#2dbfb8",
+    "associatedtype_color": "#d2991d",
+    "tymethod_color": "#2bab63",
+    "method_color": "#2bab63",
+    "structfield_color": "#ddd",
+    "structfield_hover_color": "#ddd",
+    "macro_color": "#09bd00",
+    "fn_color": "#2bab63",
+    "hover_path_color": "#ddd",
+    "hover_background": "#616161",
+    "grey": "#ccc",
+})
 
 // Light theme
-local-storage: {"rustdoc-theme": "light", "rustdoc-use-system-theme": "false"}
-reload:
-
-// Waiting for the search results to appear...
-wait-for: "#search-tabs"
-assert-css: (
-    "#search-tabs > button > .count",
-    {"color": "rgb(136, 136, 136)"},
-    ALL,
-)
-assert-css: (
-    "//*[@class='desc'][text()='Just a normal struct.']",
-    {"color": "rgb(0, 0, 0)"},
-)
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']",
-    {"color": "rgb(0, 0, 0)"},
-)
-
-// Checking the color of the bottom border.
-assert-css: (
-    ".search-results > a",
-    {"border-bottom-color": "rgba(170, 170, 170, 0.2)"}
-)
-
-// Checking the color for "keyword" text.
-assert-css: (
-    "//*[@class='result-name']//*[text()='(keyword)']",
-    {"color": "rgb(0, 0, 0)"},
-)
-
-store-value: (entry_color, "rgb(0, 0, 0)") // color of the search entry
-store-value: (hover_entry_color, "rgb(0, 0, 0)") // color of the hovered/focused search entry
-store-value: (background_color, "rgba(0, 0, 0, 0)") // background color
-store-value: (hover_background_color, "rgb(204, 204, 204)") // hover background color
-
-call-function: (
-    "check-result-color", (
-        "keyword", // item kind
-        "rgb(56, 115, 173)", // color of item kind
-        "rgb(56, 115, 173)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "struct", // item kind
-        "rgb(173, 55, 138)", // color of item kind
-        "rgb(173, 55, 138)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "associatedtype", // item kind
-        "rgb(56, 115, 173)", // color of item kind
-        "rgb(56, 115, 173)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "tymethod", // item kind
-        "rgb(173, 124, 55)", // color of item kind
-        "rgb(173, 124, 55)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "method", // item kind
-        "rgb(173, 124, 55)", // color of item kind
-        "rgb(173, 124, 55)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "structfield", // item kind
-        "rgb(0, 0, 0)", // color of item kind
-        "rgb(0, 0, 0)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "macro", // item kind
-        "rgb(6, 128, 0)", // color of item kind
-        "rgb(6, 128, 0)", // color of hovered/focused item kind
-    ),
-)
-call-function: (
-    "check-result-color", (
-        "fn", // item kind
-        "rgb(173, 124, 55)", // color of item kind
-        "rgb(173, 124, 55)", // color of hovered/focused item kind
-    ),
-)
-
-// Checking the `<a>` container.
-move-cursor-to: ".search-input"
-focus: ".search-input" // To ensure the `<a>` container isnt focus or hover.
-assert-css: (
-    "//*[@class='result-name']/*[text()='test_docs::']/ancestor::a",
-    {"color": "rgb(0, 0, 0)", "background-color": "rgba(0, 0, 0, 0)"},
-)
+call-function: ("check-search-color", {
+    "theme": "light",
+    "count_color": "#888",
+    "desc_color": "#000",
+    "path_color": "#000",
+    "bottom_border_color": "#aaa3",
+    "keyword_color": "#3873ad",
+    "struct_color": "#ad378a",
+    "associatedtype_color": "#3873ad",
+    "tymethod_color": "#ad7c37",
+    "method_color": "#ad7c37",
+    "structfield_color": "#000",
+    "structfield_hover_color": "#000",
+    "macro_color": "#068000",
+    "fn_color": "#ad7c37",
+    "hover_path_color": "#000",
+    "hover_background": "#ccc",
+    "grey": "#999",
+})
 
 // Check the alias.
-goto: "file://" + |DOC_PATH| + "/test_docs/index.html"
-// If the text isn't displayed, the browser doesn't compute color style correctly...
-show-text: true
+go-to: "file://" + |DOC_PATH| + "/test_docs/index.html"
+
+write-into: (".search-input", "thisisanalias")
+// To be SURE that the search will be run.
+press-key: 'Enter'
+// Waiting for the search results to appear...
+wait-for: "#search-tabs"
 
 define-function: (
     "check-alias",
-    (theme, alias, grey),
+    [theme, alias, grey],
     block {
-        local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
-        reload:
-        write: (".search-input", "thisisanalias")
-        // To be SURE that the search will be run.
-        press-key: 'Enter'
-        // Waiting for the search results to appear...
-        wait-for: "#search-tabs"
+        call-function: ("switch-theme", {"theme": |theme|})
         // Checking that the colors for the alias element are the ones expected.
-        assert-css: (".result-name > .alias", {"color": |alias|})
-        assert-css: (".result-name > .alias > .grey", {"color": |grey|})
-        // Leave the search results to prevent reloading with an already filled search input.
-        press-key: "Escape"
+        assert-css: (".result-name .path .alias", {"color": |alias|})
+        assert-css: (".result-name .path .alias > .grey", {"color": |grey|})
     },
 )
 
 call-function: ("check-alias", {
     "theme": "ayu",
-    "alias": "rgb(197, 197, 197)",
-    "grey": "rgb(153, 153, 153)",
+    "alias": "#c5c5c5",
+    "grey": "#999",
 })
 call-function: ("check-alias", {
     "theme": "dark",
-    "alias": "rgb(255, 255, 255)",
-    "grey": "rgb(204, 204, 204)",
+    "alias": "#fff",
+    "grey": "#ccc",
 })
 call-function: ("check-alias", {
     "theme": "light",
-    "alias": "rgb(0, 0, 0)",
-    "grey": "rgb(153, 153, 153)",
+    "alias": "#000",
+    "grey": "#999",
 })

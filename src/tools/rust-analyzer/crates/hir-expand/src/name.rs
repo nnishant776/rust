@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use syntax::{ast, utils::is_raw_identifier, SmolStr};
+use syntax::{ast, format_smolstr, utils::is_raw_identifier, SmolStr};
 
 /// `Name` is a wrapper around string, which is used in hir for both references
 /// and declarations. In theory, names should also carry hygiene info, but we are
@@ -24,28 +24,7 @@ enum Repr {
     TupleField(usize),
 }
 
-impl fmt::Display for Name {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Repr::Text(text) => fmt::Display::fmt(&text, f),
-            Repr::TupleField(idx) => fmt::Display::fmt(&idx, f),
-        }
-    }
-}
-
-impl<'a> fmt::Display for UnescapedName<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 .0 {
-            Repr::Text(text) => {
-                let text = text.strip_prefix("r#").unwrap_or(text);
-                fmt::Display::fmt(&text, f)
-            }
-            Repr::TupleField(idx) => fmt::Display::fmt(&idx, f),
-        }
-    }
-}
-
-impl<'a> UnescapedName<'a> {
+impl UnescapedName<'_> {
     /// Returns the textual representation of this name as a [`SmolStr`]. Prefer using this over
     /// [`ToString::to_string`] if possible as this conversion is cheaper in the general case.
     pub fn to_smol_str(&self) -> SmolStr {
@@ -60,6 +39,11 @@ impl<'a> UnescapedName<'a> {
             Repr::TupleField(it) => SmolStr::new(it.to_string()),
         }
     }
+
+    pub fn display(&self, db: &dyn crate::db::ExpandDatabase) -> impl fmt::Display + '_ {
+        _ = db;
+        UnescapedDisplay { name: self }
+    }
 }
 
 impl Name {
@@ -67,6 +51,12 @@ impl Name {
     /// Hopefully, this should allow us to integrate hygiene cleaner in the
     /// future, and to switch to interned representation of names.
     const fn new_text(text: SmolStr) -> Name {
+        Name(Repr::Text(text))
+    }
+
+    // FIXME: See above, unfortunately some places really need this right now
+    #[doc(hidden)]
+    pub const fn new_text_dont_use(text: SmolStr) -> Name {
         Name(Repr::Text(text))
     }
 
@@ -78,9 +68,9 @@ impl Name {
         Self::new_text(lt.text().into())
     }
 
-    /// Shortcut to create inline plain text name
-    const fn new_inline(text: &str) -> Name {
-        Name::new_text(SmolStr::new_inline(text))
+    /// Shortcut to create a name from a string literal.
+    const fn new_static(text: &'static str) -> Name {
+        Name::new_text(SmolStr::new_static(text))
     }
 
     /// Resolve a name from the text of token.
@@ -93,7 +83,7 @@ impl Name {
             // Rust, e.g. "try" in Rust 2015. Even in such cases, we keep track of them in their
             // escaped form.
             None if is_raw_identifier(raw_text) => {
-                Name::new_text(SmolStr::from_iter(["r#", raw_text]))
+                Name::new_text(format_smolstr!("r#{}", raw_text))
             }
             _ => Name::new_text(raw_text.into()),
         }
@@ -109,7 +99,23 @@ impl Name {
     /// name is equal only to itself. It's not clear how to implement this in
     /// salsa though, so we punt on that bit for a moment.
     pub const fn missing() -> Name {
-        Name::new_inline("[missing name]")
+        Name::new_static("[missing name]")
+    }
+
+    /// Returns true if this is a fake name for things missing in the source code. See
+    /// [`missing()`][Self::missing] for details.
+    ///
+    /// Use this method instead of comparing with `Self::missing()` as missing names
+    /// (ideally should) have a `gensym` semantics.
+    pub fn is_missing(&self) -> bool {
+        self == &Name::missing()
+    }
+
+    /// Generates a new name that attempts to be unique. Should only be used when body lowering and
+    /// creating desugared locals and labels. The caller is responsible for picking an index
+    /// that is stable across re-executions
+    pub fn generate_new_name(idx: usize) -> Name {
+        Name::new_text(format_smolstr!("<ra@gennew>{idx}"))
     }
 
     /// Returns the tuple index this name represents if it is a tuple field.
@@ -154,6 +160,40 @@ impl Name {
         match &self.0 {
             Repr::Text(it) => it.starts_with("r#"),
             Repr::TupleField(_) => false,
+        }
+    }
+
+    pub fn display<'a>(&'a self, db: &dyn crate::db::ExpandDatabase) -> impl fmt::Display + 'a {
+        _ = db;
+        Display { name: self }
+    }
+}
+
+struct Display<'a> {
+    name: &'a Name,
+}
+
+impl fmt::Display for Display<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name.0 {
+            Repr::Text(text) => fmt::Display::fmt(&text, f),
+            Repr::TupleField(idx) => fmt::Display::fmt(&idx, f),
+        }
+    }
+}
+
+struct UnescapedDisplay<'a> {
+    name: &'a UnescapedName<'a>,
+}
+
+impl fmt::Display for UnescapedDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name.0 .0 {
+            Repr::Text(text) => {
+                let text = text.strip_prefix("r#").unwrap_or(text);
+                fmt::Display::fmt(&text, f)
+            }
+            Repr::TupleField(idx) => fmt::Display::fmt(&idx, f),
         }
     }
 }
@@ -216,7 +256,7 @@ pub mod known {
             $(
                 #[allow(bad_style)]
                 pub const $ident: super::Name =
-                    super::Name::new_inline(stringify!($ident));
+                    super::Name::new_static(stringify!($ident));
             )*
         };
     }
@@ -253,15 +293,32 @@ pub mod known {
         alloc,
         iter,
         ops,
+        fmt,
         future,
         result,
+        string,
         boxed,
         option,
         prelude,
         rust_2015,
         rust_2018,
         rust_2021,
+        rust_2024,
         v1,
+        new_display,
+        new_debug,
+        new_lower_exp,
+        new_upper_exp,
+        new_octal,
+        new_pointer,
+        new_binary,
+        new_lower_hex,
+        new_upper_hex,
+        from_usize,
+        panic_2015,
+        panic_2021,
+        unreachable_2015,
+        unreachable_2021,
         // Components of known path (type name)
         Iterator,
         IntoIterator,
@@ -282,17 +339,28 @@ pub mod known {
         RangeToInclusive,
         RangeTo,
         Range,
+        String,
         Neg,
         Not,
         None,
         Index,
+        Left,
+        Right,
+        Center,
+        Unknown,
+        Is,
+        Param,
+        Implied,
         // Components of known path (function name)
         filter_map,
         next,
         iter_mut,
         len,
         is_empty,
+        as_str,
         new,
+        new_v1_formatted,
+        none,
         // Builtin macros
         asm,
         assert,
@@ -305,6 +373,7 @@ pub mod known {
         core_panic,
         env,
         file,
+        format,
         format_args_nl,
         format_args,
         global_asm,
@@ -316,6 +385,7 @@ pub mod known {
         log_syntax,
         module_path,
         option_env,
+        quote,
         std_panic,
         stringify,
         trace_macros,
@@ -336,19 +406,26 @@ pub mod known {
         cfg_eval,
         crate_type,
         derive,
+        derive_const,
         global_allocator,
+        no_core,
+        no_std,
         test,
         test_case,
         recursion_limit,
         feature,
         // known methods of lang items
         call_once,
+        call_mut,
+        call,
         eq,
         ne,
         ge,
         gt,
         le,
         lt,
+        // known fields of lang items
+        pieces,
         // lang items
         add_assign,
         add,
@@ -363,6 +440,7 @@ pub mod known {
         deref,
         div_assign,
         div,
+        drop,
         fn_mut,
         fn_once,
         future_trait,
@@ -390,10 +468,11 @@ pub mod known {
     );
 
     // self/Self cannot be used as an identifier
-    pub const SELF_PARAM: super::Name = super::Name::new_inline("self");
-    pub const SELF_TYPE: super::Name = super::Name::new_inline("Self");
+    pub const SELF_PARAM: super::Name = super::Name::new_static("self");
+    pub const SELF_TYPE: super::Name = super::Name::new_static("Self");
 
-    pub const STATIC_LIFETIME: super::Name = super::Name::new_inline("'static");
+    pub const STATIC_LIFETIME: super::Name = super::Name::new_static("'static");
+    pub const DOLLAR_CRATE: super::Name = super::Name::new_static("$crate");
 
     #[macro_export]
     macro_rules! name {

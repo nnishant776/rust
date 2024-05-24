@@ -1,6 +1,7 @@
-// build-pass
+//@ build-pass
 #![allow(dead_code)]
 #![allow(unused_variables)]
+#![allow(unconditional_panic)]
 const A: [u32; 1] = [0];
 
 fn test() {

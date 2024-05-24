@@ -45,22 +45,22 @@
 use core::error::Error;
 use core::fmt;
 use core::hash;
-use core::iter::FusedIterator;
 #[cfg(not(no_global_oom_handling))]
-use core::iter::{from_fn, FromIterator};
+use core::iter::from_fn;
+use core::iter::FusedIterator;
 #[cfg(not(no_global_oom_handling))]
 use core::ops::Add;
 #[cfg(not(no_global_oom_handling))]
 use core::ops::AddAssign;
 #[cfg(not(no_global_oom_handling))]
 use core::ops::Bound::{Excluded, Included, Unbounded};
-use core::ops::{self, Index, IndexMut, Range, RangeBounds};
+use core::ops::{self, Range, RangeBounds};
 use core::ptr;
 use core::slice;
 use core::str::pattern::Pattern;
-#[cfg(not(no_global_oom_handling))]
-use core::str::Utf8Chunks;
 
+#[cfg(not(no_global_oom_handling))]
+use crate::alloc::Allocator;
 #[cfg(not(no_global_oom_handling))]
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
@@ -72,9 +72,9 @@ use crate::vec::Vec;
 
 /// A UTF-8–encoded, growable string.
 ///
-/// The `String` type is the most common string type that has ownership over the
-/// contents of the string. It has a close relationship with its borrowed
-/// counterpart, the primitive [`str`].
+/// `String` is the most common string type. It has ownership over the contents
+/// of the string, stored in a heap-allocated buffer (see [Representation](#representation)).
+/// It is closely related to its borrowed counterpart, the primitive [`str`].
 ///
 /// # Examples
 ///
@@ -260,7 +260,7 @@ use crate::vec::Vec;
 /// # Representation
 ///
 /// A `String` is made up of three components: a pointer to some bytes, a
-/// length, and a capacity. The pointer points to an internal buffer `String`
+/// length, and a capacity. The pointer points to the internal buffer which `String`
 /// uses to store its data. The length is the number of bytes currently stored
 /// in the buffer, and the capacity is the size of the buffer in bytes. As such,
 /// the length will always be less than or equal to the capacity.
@@ -359,7 +359,7 @@ use crate::vec::Vec;
 /// [Deref]: core::ops::Deref "ops::Deref"
 /// [`Deref`]: core::ops::Deref "ops::Deref"
 /// [`as_str()`]: String::as_str
-#[derive(PartialOrd, Eq, Ord)]
+#[derive(PartialEq, PartialOrd, Eq, Ord)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), lang = "String")]
 pub struct String {
@@ -388,8 +388,6 @@ pub struct String {
 ///
 /// # Examples
 ///
-/// Basic usage:
-///
 /// ```
 /// // some invalid bytes, in a vector
 /// let bytes = vec![0, 159];
@@ -412,9 +410,8 @@ pub struct FromUtf8Error {
 /// This type is the error type for the [`from_utf16`] method on [`String`].
 ///
 /// [`from_utf16`]: String::from_utf16
-/// # Examples
 ///
-/// Basic usage:
+/// # Examples
 ///
 /// ```
 /// // 𝄞mu<invalid>ic
@@ -440,8 +437,6 @@ impl String {
     /// [`with_capacity`]: String::with_capacity
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s = String::new();
@@ -472,8 +467,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::with_capacity(10);
     ///
@@ -497,6 +490,19 @@ impl String {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> String {
         String { vec: Vec::with_capacity(capacity) }
+    }
+
+    /// Creates a new empty `String` with at least the specified capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Err`] if the capacity exceeds `isize::MAX` bytes,
+    /// or if the memory allocator reports failure.
+    ///
+    #[inline]
+    #[unstable(feature = "try_with_capacity", issue = "91913")]
+    pub fn try_with_capacity(capacity: usize) -> Result<String, TryReserveError> {
+        Ok(String { vec: Vec::try_with_capacity(capacity)? })
     }
 
     // HACK(japaric): with cfg(test) the inherent `[T]::to_vec` method, which is
@@ -627,7 +633,7 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf8_lossy(v: &[u8]) -> Cow<'_, str> {
-        let mut iter = Utf8Chunks::new(v);
+        let mut iter = v.utf8_chunks();
 
         let first_valid = if let Some(chunk) = iter.next() {
             let valid = chunk.valid();
@@ -660,8 +666,6 @@ impl String {
     /// if `v` contains any invalid data.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // 𝄞music
@@ -704,8 +708,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// // 𝄞mus<invalid>ic<invalid>
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075,
@@ -725,7 +727,157 @@ impl String {
             .collect()
     }
 
-    /// Decomposes a `String` into its raw components.
+    /// Decode a UTF-16LE–encoded vector `v` into a `String`, returning [`Err`]
+    /// if `v` contains any invalid data.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(str_from_utf16_endian)]
+    /// // 𝄞music
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x73, 0x00, 0x69, 0x00, 0x63, 0x00];
+    /// assert_eq!(String::from("𝄞music"),
+    ///            String::from_utf16le(v).unwrap());
+    ///
+    /// // 𝄞mu<invalid>ic
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x00, 0xD8, 0x69, 0x00, 0x63, 0x00];
+    /// assert!(String::from_utf16le(v).is_err());
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "str_from_utf16_endian", issue = "116258")]
+    pub fn from_utf16le(v: &[u8]) -> Result<String, FromUtf16Error> {
+        if v.len() % 2 != 0 {
+            return Err(FromUtf16Error(()));
+        }
+        match (cfg!(target_endian = "little"), unsafe { v.align_to::<u16>() }) {
+            (true, ([], v, [])) => Self::from_utf16(v),
+            _ => char::decode_utf16(v.array_chunks::<2>().copied().map(u16::from_le_bytes))
+                .collect::<Result<_, _>>()
+                .map_err(|_| FromUtf16Error(())),
+        }
+    }
+
+    /// Decode a UTF-16LE–encoded slice `v` into a `String`, replacing
+    /// invalid data with [the replacement character (`U+FFFD`)][U+FFFD].
+    ///
+    /// Unlike [`from_utf8_lossy`] which returns a [`Cow<'a, str>`],
+    /// `from_utf16le_lossy` returns a `String` since the UTF-16 to UTF-8
+    /// conversion requires a memory allocation.
+    ///
+    /// [`from_utf8_lossy`]: String::from_utf8_lossy
+    /// [`Cow<'a, str>`]: crate::borrow::Cow "borrow::Cow"
+    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(str_from_utf16_endian)]
+    /// // 𝄞mus<invalid>ic<invalid>
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x73, 0x00, 0x1E, 0xDD, 0x69, 0x00, 0x63, 0x00,
+    ///           0x34, 0xD8];
+    ///
+    /// assert_eq!(String::from("𝄞mus\u{FFFD}ic\u{FFFD}"),
+    ///            String::from_utf16le_lossy(v));
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "str_from_utf16_endian", issue = "116258")]
+    pub fn from_utf16le_lossy(v: &[u8]) -> String {
+        match (cfg!(target_endian = "little"), unsafe { v.align_to::<u16>() }) {
+            (true, ([], v, [])) => Self::from_utf16_lossy(v),
+            (true, ([], v, [_remainder])) => Self::from_utf16_lossy(v) + "\u{FFFD}",
+            _ => {
+                let mut iter = v.array_chunks::<2>();
+                let string = char::decode_utf16(iter.by_ref().copied().map(u16::from_le_bytes))
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect();
+                if iter.remainder().is_empty() { string } else { string + "\u{FFFD}" }
+            }
+        }
+    }
+
+    /// Decode a UTF-16BE–encoded vector `v` into a `String`, returning [`Err`]
+    /// if `v` contains any invalid data.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(str_from_utf16_endian)]
+    /// // 𝄞music
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0x00, 0x73, 0x00, 0x69, 0x00, 0x63];
+    /// assert_eq!(String::from("𝄞music"),
+    ///            String::from_utf16be(v).unwrap());
+    ///
+    /// // 𝄞mu<invalid>ic
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0xD8, 0x00, 0x00, 0x69, 0x00, 0x63];
+    /// assert!(String::from_utf16be(v).is_err());
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "str_from_utf16_endian", issue = "116258")]
+    pub fn from_utf16be(v: &[u8]) -> Result<String, FromUtf16Error> {
+        if v.len() % 2 != 0 {
+            return Err(FromUtf16Error(()));
+        }
+        match (cfg!(target_endian = "big"), unsafe { v.align_to::<u16>() }) {
+            (true, ([], v, [])) => Self::from_utf16(v),
+            _ => char::decode_utf16(v.array_chunks::<2>().copied().map(u16::from_be_bytes))
+                .collect::<Result<_, _>>()
+                .map_err(|_| FromUtf16Error(())),
+        }
+    }
+
+    /// Decode a UTF-16BE–encoded slice `v` into a `String`, replacing
+    /// invalid data with [the replacement character (`U+FFFD`)][U+FFFD].
+    ///
+    /// Unlike [`from_utf8_lossy`] which returns a [`Cow<'a, str>`],
+    /// `from_utf16le_lossy` returns a `String` since the UTF-16 to UTF-8
+    /// conversion requires a memory allocation.
+    ///
+    /// [`from_utf8_lossy`]: String::from_utf8_lossy
+    /// [`Cow<'a, str>`]: crate::borrow::Cow "borrow::Cow"
+    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(str_from_utf16_endian)]
+    /// // 𝄞mus<invalid>ic<invalid>
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0x00, 0x73, 0xDD, 0x1E, 0x00, 0x69, 0x00, 0x63,
+    ///           0xD8, 0x34];
+    ///
+    /// assert_eq!(String::from("𝄞mus\u{FFFD}ic\u{FFFD}"),
+    ///            String::from_utf16be_lossy(v));
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "str_from_utf16_endian", issue = "116258")]
+    pub fn from_utf16be_lossy(v: &[u8]) -> String {
+        match (cfg!(target_endian = "big"), unsafe { v.align_to::<u16>() }) {
+            (true, ([], v, [])) => Self::from_utf16_lossy(v),
+            (true, ([], v, [_remainder])) => Self::from_utf16_lossy(v) + "\u{FFFD}",
+            _ => {
+                let mut iter = v.array_chunks::<2>();
+                let string = char::decode_utf16(iter.by_ref().copied().map(u16::from_be_bytes))
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect();
+                if iter.remainder().is_empty() { string } else { string + "\u{FFFD}" }
+            }
+        }
+    }
+
+    /// Decomposes a `String` into its raw components: `(pointer, length, capacity)`.
     ///
     /// Returns the raw pointer to the underlying data, the length of
     /// the string (in bytes), and the allocated capacity of the data
@@ -757,7 +909,7 @@ impl String {
         self.vec.into_raw_parts()
     }
 
-    /// Creates a new `String` from a length, capacity, and pointer.
+    /// Creates a new `String` from a pointer, a length and a capacity.
     ///
     /// # Safety
     ///
@@ -783,8 +935,6 @@ impl String {
     /// function.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// use std::mem;
@@ -827,8 +977,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// // some bytes, in a vector
     /// let sparkle_heart = vec![240, 159, 146, 150];
@@ -852,8 +1000,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = String::from("hello");
     /// let bytes = s.into_bytes();
@@ -871,8 +1017,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = String::from("foo");
     ///
@@ -888,8 +1032,6 @@ impl String {
     /// Converts a `String` into a mutable string slice.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut s = String::from("foobar");
@@ -910,8 +1052,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("foo");
     ///
@@ -922,6 +1062,7 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("append", "push")]
     pub fn push_str(&mut self, string: &str) {
         self.vec.extend_from_slice(string.as_bytes())
     }
@@ -965,8 +1106,6 @@ impl String {
     /// Returns this `String`'s capacity, in bytes.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s = String::with_capacity(10);
@@ -1157,8 +1296,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("foo");
     ///
@@ -1206,8 +1343,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("abc");
     ///
@@ -1235,8 +1370,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = String::from("hello");
     ///
@@ -1251,7 +1384,7 @@ impl String {
 
     /// Shortens this `String` to the specified length.
     ///
-    /// If `new_len` is greater than the string's current length, this has no
+    /// If `new_len` is greater than or equal to the string's current length, this has no
     /// effect.
     ///
     /// Note that this method has no effect on the allocated capacity
@@ -1262,8 +1395,6 @@ impl String {
     /// Panics if `new_len` does not lie on a [`char`] boundary.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut s = String::from("hello");
@@ -1287,14 +1418,12 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
-    /// let mut s = String::from("foo");
+    /// let mut s = String::from("abč");
     ///
-    /// assert_eq!(s.pop(), Some('o'));
-    /// assert_eq!(s.pop(), Some('o'));
-    /// assert_eq!(s.pop(), Some('f'));
+    /// assert_eq!(s.pop(), Some('č'));
+    /// assert_eq!(s.pop(), Some('b'));
+    /// assert_eq!(s.pop(), Some('a'));
     ///
     /// assert_eq!(s.pop(), None);
     /// ```
@@ -1321,17 +1450,16 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
-    /// let mut s = String::from("foo");
+    /// let mut s = String::from("abç");
     ///
-    /// assert_eq!(s.remove(0), 'f');
-    /// assert_eq!(s.remove(1), 'o');
-    /// assert_eq!(s.remove(0), 'o');
+    /// assert_eq!(s.remove(0), 'a');
+    /// assert_eq!(s.remove(1), 'ç');
+    /// assert_eq!(s.remove(0), 'b');
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("delete", "take")]
     pub fn remove(&mut self, idx: usize) -> char {
         let ch = match self[idx..].chars().next() {
             Some(ch) => ch,
@@ -1514,8 +1642,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::with_capacity(3);
     ///
@@ -1528,6 +1654,7 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("set")]
     pub fn insert(&mut self, idx: usize, ch: char) {
         assert!(self.is_char_boundary(idx));
         let mut bits = [0; 4];
@@ -1563,8 +1690,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("bar");
     ///
@@ -1595,8 +1720,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("hello");
     ///
@@ -1620,8 +1743,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let a = String::from("foo");
     /// assert_eq!(a.len(), 3);
@@ -1633,6 +1754,7 @@ impl String {
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("length", "size")]
     pub fn len(&self) -> usize {
         self.vec.len()
     }
@@ -1640,8 +1762,6 @@ impl String {
     /// Returns `true` if this `String` has a length of zero, and `false` otherwise.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut v = String::new();
@@ -1697,8 +1817,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("foo");
     ///
@@ -1733,8 +1851,6 @@ impl String {
     /// including characters outside the range.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut s = String::from("α is alpha, β is beta");
@@ -1784,8 +1900,6 @@ impl String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let mut s = String::from("α is alpha, β is beta");
     /// let beta_offset = s.find('β').unwrap_or(s.len());
@@ -1828,13 +1942,13 @@ impl String {
 
     /// Converts this `String` into a <code>[Box]<[str]></code>.
     ///
-    /// This will drop any excess capacity.
+    /// Before doing the conversion, this method discards excess capacity like [`shrink_to_fit`].
+    /// Note that this call may reallocate and copy the bytes of the string.
     ///
+    /// [`shrink_to_fit`]: String::shrink_to_fit
     /// [str]: prim@str "str"
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s = String::from("hello");
@@ -1851,30 +1965,29 @@ impl String {
     }
 
     /// Consumes and leaks the `String`, returning a mutable reference to the contents,
-    /// `&'static mut str`.
+    /// `&'a mut str`.
     ///
-    /// This is mainly useful for data that lives for the remainder of
-    /// the program's life. Dropping the returned reference will cause a memory
-    /// leak.
+    /// The caller has free choice over the returned lifetime, including `'static`. Indeed,
+    /// this function is ideally used for data that lives for the remainder of the program's life,
+    /// as dropping the returned reference will cause a memory leak.
     ///
-    /// It does not reallocate or shrink the `String`,
-    /// so the leaked allocation may include unused capacity that is not part
-    /// of the returned slice.
+    /// It does not reallocate or shrink the `String`, so the leaked allocation may include unused
+    /// capacity that is not part of the returned slice. If you want to discard excess capacity,
+    /// call [`into_boxed_str`], and then [`Box::leak`] instead. However, keep in mind that
+    /// trimming the capacity may result in a reallocation and copy.
+    ///
+    /// [`into_boxed_str`]: Self::into_boxed_str
     ///
     /// # Examples
     ///
-    /// Simple usage:
-    ///
     /// ```
-    /// #![feature(string_leak)]
-    ///
     /// let x = String::from("bucket");
     /// let static_ref: &'static mut str = x.leak();
     /// assert_eq!(static_ref, "bucket");
     /// ```
-    #[unstable(feature = "string_leak", issue = "102929")]
+    #[stable(feature = "string_leak", since = "1.72.0")]
     #[inline]
-    pub fn leak(self) -> &'static mut str {
+    pub fn leak<'a>(self) -> &'a mut str {
         let slice = self.vec.leak();
         unsafe { from_utf8_unchecked_mut(slice) }
     }
@@ -1884,8 +1997,6 @@ impl FromUtf8Error {
     /// Returns a slice of [`u8`]s bytes that were attempted to convert to a `String`.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // some invalid bytes, in a vector
@@ -1908,8 +2019,6 @@ impl FromUtf8Error {
     /// does not need to be made.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // some invalid bytes, in a vector
@@ -1936,8 +2045,6 @@ impl FromUtf8Error {
     /// [`&str`]: prim@str "&str"
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // some invalid bytes, in a vector
@@ -1992,6 +2099,10 @@ impl Clone for String {
         String { vec: self.vec.clone() }
     }
 
+    /// Clones the contents of `source` into `self`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
     fn clone_from(&mut self, source: &Self) {
         self.vec.clone_from(&source.vec);
     }
@@ -2048,8 +2159,8 @@ impl FromIterator<String> for String {
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
-impl FromIterator<Box<str>> for String {
-    fn from_iter<I: IntoIterator<Item = Box<str>>>(iter: I) -> String {
+impl<A: Allocator> FromIterator<Box<str, A>> for String {
+    fn from_iter<I: IntoIterator<Item = Box<str, A>>>(iter: I) -> String {
         let mut buf = String::new();
         buf.extend(iter);
         buf
@@ -2130,8 +2241,8 @@ impl<'a> Extend<&'a str> for String {
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
-impl Extend<Box<str>> for String {
-    fn extend<I: IntoIterator<Item = Box<str>>>(&mut self, iter: I) {
+impl<A: Allocator> Extend<Box<str, A>> for String {
+    fn extend<I: IntoIterator<Item = Box<str, A>>>(&mut self, iter: I) {
         iter.into_iter().for_each(move |s| self.push_str(&s));
     }
 }
@@ -2207,18 +2318,6 @@ impl<'a, 'b> Pattern<'a> for &'b String {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
-impl PartialEq for String {
-    #[inline]
-    fn eq(&self, other: &String) -> bool {
-        PartialEq::eq(&self[..], &other[..])
-    }
-    #[inline]
-    fn ne(&self, other: &String) -> bool {
-        PartialEq::ne(&self[..], &other[..])
-    }
-}
-
 macro_rules! impl_eq {
     ($lhs:ty, $rhs: ty) => {
         #[stable(feature = "rust1", since = "1.0.0")]
@@ -2259,8 +2358,7 @@ impl_eq! { Cow<'a, str>, &'b str }
 impl_eq! { Cow<'a, str>, String }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
-impl const Default for String {
+impl Default for String {
     /// Creates an empty `String`.
     #[inline]
     fn default() -> String {
@@ -2354,100 +2452,26 @@ impl AddAssign<&str> for String {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::Range<usize>> for String {
-    type Output = str;
+impl<I> ops::Index<I> for String
+where
+    I: slice::SliceIndex<str>,
+{
+    type Output = I::Output;
 
     #[inline]
-    fn index(&self, index: ops::Range<usize>) -> &str {
-        &self[..][index]
+    fn index(&self, index: I) -> &I::Output {
+        index.index(self.as_str())
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeTo<usize>> for String {
-    type Output = str;
-
+impl<I> ops::IndexMut<I> for String
+where
+    I: slice::SliceIndex<str>,
+{
     #[inline]
-    fn index(&self, index: ops::RangeTo<usize>) -> &str {
-        &self[..][index]
-    }
-}
-#[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeFrom<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeFrom<usize>) -> &str {
-        &self[..][index]
-    }
-}
-#[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeFull> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, _index: ops::RangeFull) -> &str {
-        unsafe { str::from_utf8_unchecked(&self.vec) }
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::Index<ops::RangeInclusive<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeInclusive<usize>) -> &str {
-        Index::index(&**self, index)
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::Index<ops::RangeToInclusive<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeToInclusive<usize>) -> &str {
-        Index::index(&**self, index)
-    }
-}
-
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::Range<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::Range<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeTo<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeTo<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeFrom<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeFrom<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeFull> for String {
-    #[inline]
-    fn index_mut(&mut self, _index: ops::RangeFull) -> &mut str {
-        unsafe { str::from_utf8_unchecked_mut(&mut *self.vec) }
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::IndexMut<ops::RangeInclusive<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeInclusive<usize>) -> &mut str {
-        IndexMut::index_mut(&mut **self, index)
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::IndexMut<ops::RangeToInclusive<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeToInclusive<usize>) -> &mut str {
-        IndexMut::index_mut(&mut **self, index)
+    fn index_mut(&mut self, index: I) -> &mut I::Output {
+        index.index_mut(self.as_mut_str())
     }
 }
 
@@ -2460,6 +2484,9 @@ impl ops::Deref for String {
         unsafe { str::from_utf8_unchecked(&self.vec) }
     }
 }
+
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl ops::DerefPure for String {}
 
 #[stable(feature = "derefmut_for_string", since = "1.3.0")]
 impl ops::DerefMut for String {
@@ -2502,8 +2529,6 @@ pub trait ToString {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let i = 5;
     /// let five = String::from("5");
@@ -2512,6 +2537,7 @@ pub trait ToString {
     /// ```
     #[rustc_conversion_suggestion]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "to_string_method")]
     fn to_string(&self) -> String;
 }
 
@@ -2539,6 +2565,17 @@ impl<T: fmt::Display + ?Sized> ToString for T {
     }
 }
 
+#[doc(hidden)]
+#[cfg(not(no_global_oom_handling))]
+#[unstable(feature = "ascii_char", issue = "110998")]
+impl ToString for core::ascii::Char {
+    #[inline]
+    fn to_string(&self) -> String {
+        self.as_str().to_owned()
+    }
+}
+
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "char_to_string_specialization", since = "1.46.0")]
 impl ToString for char {
@@ -2548,6 +2585,7 @@ impl ToString for char {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "bool_to_string_specialization", since = "1.68.0")]
 impl ToString for bool {
@@ -2557,6 +2595,7 @@ impl ToString for bool {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "u8_to_string_specialization", since = "1.54.0")]
 impl ToString for u8 {
@@ -2577,6 +2616,7 @@ impl ToString for u8 {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "i8_to_string_specialization", since = "1.54.0")]
 impl ToString for i8 {
@@ -2600,6 +2640,7 @@ impl ToString for i8 {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "str_to_string_specialization", since = "1.9.0")]
 impl ToString for str {
@@ -2609,6 +2650,7 @@ impl ToString for str {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_str_to_string_specialization", since = "1.17.0")]
 impl ToString for Cow<'_, str> {
@@ -2618,12 +2660,23 @@ impl ToString for Cow<'_, str> {
     }
 }
 
+#[doc(hidden)]
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "string_to_string_specialization", since = "1.17.0")]
 impl ToString for String {
     #[inline]
     fn to_string(&self) -> String {
         self.to_owned()
+    }
+}
+
+#[doc(hidden)]
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "fmt_arguments_to_string_specialization", since = "1.71.0")]
+impl ToString for fmt::Arguments<'_> {
+    #[inline]
+    fn to_string(&self) -> String {
+        crate::fmt::format(*self)
     }
 }
 
@@ -2696,8 +2749,6 @@ impl From<Box<str>> for String {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s1: String = String::from("hello world");
     /// let s2: Box<str> = s1.into_boxed_str();
@@ -2716,8 +2767,6 @@ impl From<String> for Box<str> {
     /// Converts the given [`String`] to a boxed `str` slice that is owned.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s1: String = String::from("hello world");
@@ -2745,7 +2794,7 @@ impl<'a> From<Cow<'a, str>> for String {
     /// ```
     /// # use std::borrow::Cow;
     /// // If the string is not owned...
-    /// let cow: Cow<str> = Cow::Borrowed("eggplant");
+    /// let cow: Cow<'_, str> = Cow::Borrowed("eggplant");
     /// // It will allocate on the heap and copy the string.
     /// let owned: String = String::from(cow);
     /// assert_eq!(&owned[..], "eggplant");
@@ -2850,8 +2899,6 @@ impl From<String> for Vec<u8> {
     /// Converts the given [`String`] to a vector [`Vec`] that holds values of type [`u8`].
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s1 = String::from("hello world");

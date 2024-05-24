@@ -1,6 +1,6 @@
-// run-pass
-// ignore-emscripten no threads
-// ignore-sgx no processes
+//@ run-pass
+//@ needs-threads
+//@ ignore-sgx no processes
 
 use std::thread;
 use std::env;
@@ -19,7 +19,7 @@ fn main() {
     if args.len() == 1 {
         let out = Command::new(&args[0]).arg("test").output().unwrap();
         let stderr = std::str::from_utf8(&out.stderr).unwrap();
-        assert!(stderr.contains("panicked at 'explicit panic'"),
+        assert!(stderr.contains("explicit panic"),
                 "bad failure message:\n{}\n", stderr);
     } else {
         // TLS dtors are not always run on process exit

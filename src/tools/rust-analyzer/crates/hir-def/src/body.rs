@@ -1,295 +1,62 @@
 //! Defines `Body`: a lowered representation of bodies of functions, statics and
 //! consts.
 mod lower;
+mod pretty;
+pub mod scope;
 #[cfg(test)]
 mod tests;
-pub mod scope;
-mod pretty;
 
-use std::{ops::Index, sync::Arc};
+use std::ops::Index;
 
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
-use drop_bomb::DropBomb;
-use either::Either;
-use hir_expand::{
-    attrs::RawAttrs, hygiene::Hygiene, ExpandError, ExpandResult, HirFileId, InFile, MacroCallId,
-};
+use hir_expand::{name::Name, InFile};
 use la_arena::{Arena, ArenaMap};
-use limit::Limit;
-use profile::Count;
 use rustc_hash::FxHashMap;
-use syntax::{ast, AstPtr, SyntaxNode, SyntaxNodePtr};
+use span::MacroFileId;
+use syntax::{ast, AstPtr, SyntaxNodePtr};
+use triomphe::Arc;
 
 use crate::{
-    attr::Attrs,
     db::DefDatabase,
-    expr::{dummy_expr_id, Expr, ExprId, Label, LabelId, Pat, PatId},
-    item_scope::BuiltinShadowMode,
-    macro_id_to_def_id,
+    expander::Expander,
+    hir::{
+        dummy_expr_id, Binding, BindingId, Expr, ExprId, Label, LabelId, Pat, PatId, RecordFieldPat,
+    },
     nameres::DefMap,
     path::{ModPath, Path},
-    src::{HasChildSource, HasSource},
-    AsMacroCall, BlockId, DefWithBodyId, HasModule, LocalModuleId, Lookup, MacroId, ModuleId,
-    UnresolvedMacro,
+    src::HasSource,
+    BlockId, DefWithBodyId, HasModule, Lookup,
 };
-
-pub use lower::LowerCtx;
-
-/// A subset of Expander that only deals with cfg attributes. We only need it to
-/// avoid cyclic queries in crate def map during enum processing.
-#[derive(Debug)]
-pub(crate) struct CfgExpander {
-    cfg_options: CfgOptions,
-    hygiene: Hygiene,
-    krate: CrateId,
-}
-
-#[derive(Debug)]
-pub struct Expander {
-    cfg_expander: CfgExpander,
-    def_map: Arc<DefMap>,
-    current_file_id: HirFileId,
-    module: LocalModuleId,
-    /// `recursion_depth == usize::MAX` indicates that the recursion limit has been reached.
-    recursion_depth: usize,
-}
-
-impl CfgExpander {
-    pub(crate) fn new(
-        db: &dyn DefDatabase,
-        current_file_id: HirFileId,
-        krate: CrateId,
-    ) -> CfgExpander {
-        let hygiene = Hygiene::new(db.upcast(), current_file_id);
-        let cfg_options = db.crate_graph()[krate].cfg_options.clone();
-        CfgExpander { cfg_options, hygiene, krate }
-    }
-
-    pub(crate) fn parse_attrs(&self, db: &dyn DefDatabase, owner: &dyn ast::HasAttrs) -> Attrs {
-        Attrs::filter(db, self.krate, RawAttrs::new(db.upcast(), owner, &self.hygiene))
-    }
-
-    pub(crate) fn is_cfg_enabled(&self, db: &dyn DefDatabase, owner: &dyn ast::HasAttrs) -> bool {
-        let attrs = self.parse_attrs(db, owner);
-        attrs.is_cfg_enabled(&self.cfg_options)
-    }
-}
-
-impl Expander {
-    pub fn new(db: &dyn DefDatabase, current_file_id: HirFileId, module: ModuleId) -> Expander {
-        let cfg_expander = CfgExpander::new(db, current_file_id, module.krate);
-        let def_map = module.def_map(db);
-        Expander {
-            cfg_expander,
-            def_map,
-            current_file_id,
-            module: module.local_id,
-            recursion_depth: 0,
-        }
-    }
-
-    pub fn enter_expand<T: ast::AstNode>(
-        &mut self,
-        db: &dyn DefDatabase,
-        macro_call: ast::MacroCall,
-    ) -> Result<ExpandResult<Option<(Mark, T)>>, UnresolvedMacro> {
-        let mut unresolved_macro_err = None;
-
-        let result = self.within_limit(db, |this| {
-            let macro_call = InFile::new(this.current_file_id, &macro_call);
-
-            let resolver =
-                |path| this.resolve_path_as_macro(db, &path).map(|it| macro_id_to_def_id(db, it));
-
-            let mut err = None;
-            let call_id = match macro_call.as_call_id_with_errors(
-                db,
-                this.def_map.krate(),
-                resolver,
-                &mut |e| {
-                    err.get_or_insert(e);
-                },
-            ) {
-                Ok(call_id) => call_id,
-                Err(resolve_err) => {
-                    unresolved_macro_err = Some(resolve_err);
-                    return ExpandResult { value: None, err: None };
-                }
-            };
-            ExpandResult { value: call_id.ok(), err }
-        });
-
-        if let Some(err) = unresolved_macro_err {
-            Err(err)
-        } else {
-            Ok(result)
-        }
-    }
-
-    pub fn enter_expand_id<T: ast::AstNode>(
-        &mut self,
-        db: &dyn DefDatabase,
-        call_id: MacroCallId,
-    ) -> ExpandResult<Option<(Mark, T)>> {
-        self.within_limit(db, |_this| ExpandResult::ok(Some(call_id)))
-    }
-
-    fn enter_expand_inner(
-        db: &dyn DefDatabase,
-        call_id: MacroCallId,
-        mut err: Option<ExpandError>,
-    ) -> ExpandResult<Option<(HirFileId, SyntaxNode)>> {
-        if err.is_none() {
-            err = db.macro_expand_error(call_id);
-        }
-
-        let file_id = call_id.as_file();
-
-        let raw_node = match db.parse_or_expand(file_id) {
-            Some(it) => it,
-            None => {
-                // Only `None` if the macro expansion produced no usable AST.
-                if err.is_none() {
-                    tracing::warn!("no error despite `parse_or_expand` failing");
-                }
-
-                return ExpandResult::only_err(err.unwrap_or_else(|| {
-                    ExpandError::Other("failed to parse macro invocation".into())
-                }));
-            }
-        };
-
-        ExpandResult { value: Some((file_id, raw_node)), err }
-    }
-
-    pub fn exit(&mut self, db: &dyn DefDatabase, mut mark: Mark) {
-        self.cfg_expander.hygiene = Hygiene::new(db.upcast(), mark.file_id);
-        self.current_file_id = mark.file_id;
-        if self.recursion_depth == usize::MAX {
-            // Recursion limit has been reached somewhere in the macro expansion tree. Reset the
-            // depth only when we get out of the tree.
-            if !self.current_file_id.is_macro() {
-                self.recursion_depth = 0;
-            }
-        } else {
-            self.recursion_depth -= 1;
-        }
-        mark.bomb.defuse();
-    }
-
-    pub(crate) fn to_source<T>(&self, value: T) -> InFile<T> {
-        InFile { file_id: self.current_file_id, value }
-    }
-
-    pub(crate) fn parse_attrs(&self, db: &dyn DefDatabase, owner: &dyn ast::HasAttrs) -> Attrs {
-        self.cfg_expander.parse_attrs(db, owner)
-    }
-
-    pub(crate) fn cfg_options(&self) -> &CfgOptions {
-        &self.cfg_expander.cfg_options
-    }
-
-    pub fn current_file_id(&self) -> HirFileId {
-        self.current_file_id
-    }
-
-    fn parse_path(&mut self, db: &dyn DefDatabase, path: ast::Path) -> Option<Path> {
-        let ctx = LowerCtx::with_hygiene(db, &self.cfg_expander.hygiene);
-        Path::from_src(path, &ctx)
-    }
-
-    fn resolve_path_as_macro(&self, db: &dyn DefDatabase, path: &ModPath) -> Option<MacroId> {
-        self.def_map.resolve_path(db, self.module, path, BuiltinShadowMode::Other).0.take_macros()
-    }
-
-    fn recursion_limit(&self, db: &dyn DefDatabase) -> Limit {
-        let limit = db.crate_limits(self.cfg_expander.krate).recursion_limit as _;
-
-        #[cfg(not(test))]
-        return Limit::new(limit);
-
-        // Without this, `body::tests::your_stack_belongs_to_me` stack-overflows in debug
-        #[cfg(test)]
-        return Limit::new(std::cmp::min(32, limit));
-    }
-
-    fn within_limit<F, T: ast::AstNode>(
-        &mut self,
-        db: &dyn DefDatabase,
-        op: F,
-    ) -> ExpandResult<Option<(Mark, T)>>
-    where
-        F: FnOnce(&mut Self) -> ExpandResult<Option<MacroCallId>>,
-    {
-        if self.recursion_depth == usize::MAX {
-            // Recursion limit has been reached somewhere in the macro expansion tree. We should
-            // stop expanding other macro calls in this tree, or else this may result in
-            // exponential number of macro expansions, leading to a hang.
-            //
-            // The overflow error should have been reported when it occurred (see the next branch),
-            // so don't return overflow error here to avoid diagnostics duplication.
-            cov_mark::hit!(overflow_but_not_me);
-            return ExpandResult::only_err(ExpandError::RecursionOverflowPosioned);
-        } else if self.recursion_limit(db).check(self.recursion_depth + 1).is_err() {
-            self.recursion_depth = usize::MAX;
-            cov_mark::hit!(your_stack_belongs_to_me);
-            return ExpandResult::only_err(ExpandError::Other(
-                "reached recursion limit during macro expansion".into(),
-            ));
-        }
-
-        let ExpandResult { value, err } = op(self);
-        let Some(call_id) = value else {
-            return ExpandResult { value: None, err };
-        };
-
-        Self::enter_expand_inner(db, call_id, err).map(|value| {
-            value.and_then(|(new_file_id, node)| {
-                let node = T::cast(node)?;
-
-                self.recursion_depth += 1;
-                self.cfg_expander.hygiene = Hygiene::new(db.upcast(), new_file_id);
-                let old_file_id = std::mem::replace(&mut self.current_file_id, new_file_id);
-                let mark =
-                    Mark { file_id: old_file_id, bomb: DropBomb::new("expansion mark dropped") };
-                Some((mark, node))
-            })
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct Mark {
-    file_id: HirFileId,
-    bomb: DropBomb,
-}
 
 /// The body of an item (function, const etc.).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Body {
     pub exprs: Arena<Expr>,
     pub pats: Arena<Pat>,
-    pub or_pats: FxHashMap<PatId, Arc<[PatId]>>,
+    pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
+    /// Id of the closure/coroutine that owns the corresponding binding. If a binding is owned by the
+    /// top level expression, it will not be listed in here.
+    pub binding_owners: FxHashMap<BindingId, ExprId>,
     /// The patterns for the function's parameters. While the parameter types are
     /// part of the function signature, the patterns are not (they don't change
     /// the external type of the function).
     ///
     /// If this `Body` is for the body of a constant, this will just be
     /// empty.
-    pub params: Vec<PatId>,
+    pub params: Box<[PatId]>,
+    pub self_param: Option<BindingId>,
     /// The `ExprId` of the actual body expression.
     pub body_expr: ExprId,
     /// Block expressions in this body that may contain inner items.
     block_scopes: Vec<BlockId>,
-    _c: Count<Self>,
 }
 
 pub type ExprPtr = AstPtr<ast::Expr>;
 pub type ExprSource = InFile<ExprPtr>;
 
-pub type PatPtr = Either<AstPtr<ast::Pat>, AstPtr<ast::SelfParam>>;
+pub type PatPtr = AstPtr<ast::Pat>;
 pub type PatSource = InFile<PatPtr>;
 
 pub type LabelPtr = AstPtr<ast::Label>;
@@ -297,6 +64,9 @@ pub type LabelSource = InFile<LabelPtr>;
 
 pub type FieldPtr = AstPtr<ast::RecordExprField>;
 pub type FieldSource = InFile<FieldPtr>;
+
+pub type PatFieldPtr = AstPtr<ast::RecordPatField>;
+pub type PatFieldSource = InFile<PatFieldPtr>;
 
 /// An item body together with the mapping from syntax nodes to HIR expression
 /// IDs. This is needed to go from e.g. a position in a file to the HIR
@@ -320,12 +90,16 @@ pub struct BodySourceMap {
     label_map: FxHashMap<LabelSource, LabelId>,
     label_map_back: ArenaMap<LabelId, LabelSource>,
 
+    self_param: Option<InFile<AstPtr<ast::SelfParam>>>,
+
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
-    field_map: FxHashMap<FieldSource, ExprId>,
     field_map_back: FxHashMap<ExprId, FieldSource>,
+    pat_field_map_back: FxHashMap<PatId, PatFieldSource>,
 
-    expansions: FxHashMap<InFile<AstPtr<ast::MacroCall>>, HirFileId>,
+    format_args_template_map: FxHashMap<ExprId, Vec<(syntax::TextRange, Name)>>,
+
+    expansions: FxHashMap<InFile<AstPtr<ast::MacroCall>>, MacroFileId>,
 
     /// Diagnostics accumulated during body lowering. These contain `AstPtr`s and so are stored in
     /// the source map (since they're just as volatile).
@@ -341,6 +115,8 @@ pub enum BodyDiagnostic {
     MacroError { node: InFile<AstPtr<ast::MacroCall>>, message: String },
     UnresolvedProcMacro { node: InFile<AstPtr<ast::MacroCall>>, krate: CrateId },
     UnresolvedMacroCall { node: InFile<AstPtr<ast::MacroCall>>, path: ModPath },
+    UnreachableLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
+    UndeclaredLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
 }
 
 impl Body {
@@ -348,49 +124,57 @@ impl Body {
         db: &dyn DefDatabase,
         def: DefWithBodyId,
     ) -> (Arc<Body>, Arc<BodySourceMap>) {
-        let _p = profile::span("body_with_source_map_query");
+        let _p = tracing::span!(tracing::Level::INFO, "body_with_source_map_query").entered();
         let mut params = None;
 
-        let (file_id, module, body) = match def {
-            DefWithBodyId::FunctionId(f) => {
-                let f = f.lookup(db);
-                let src = f.source(db);
-                params = src.value.param_list().map(|param_list| {
-                    let item_tree = f.id.item_tree(db);
-                    let func = &item_tree[f.id.value];
-                    let krate = f.container.module(db).krate;
-                    let crate_graph = db.crate_graph();
-                    (
-                        param_list,
-                        func.params.clone().map(move |param| {
-                            item_tree
-                                .attrs(db, krate, param.into())
-                                .is_cfg_enabled(&crate_graph[krate].cfg_options)
-                        }),
-                    )
-                });
-                (src.file_id, f.module(db), src.value.body().map(ast::Expr::from))
-            }
-            DefWithBodyId::ConstId(c) => {
-                let c = c.lookup(db);
-                let src = c.source(db);
-                (src.file_id, c.module(db), src.value.body())
-            }
-            DefWithBodyId::StaticId(s) => {
-                let s = s.lookup(db);
-                let src = s.source(db);
-                (src.file_id, s.module(db), src.value.body())
-            }
-            DefWithBodyId::VariantId(v) => {
-                let e = v.parent.lookup(db);
-                let src = v.parent.child_source(db);
-                let variant = &src.value[v.local_id];
-                (src.file_id, e.container, variant.expr())
+        let mut is_async_fn = false;
+        let InFile { file_id, value: body } = {
+            match def {
+                DefWithBodyId::FunctionId(f) => {
+                    let data = db.function_data(f);
+                    let f = f.lookup(db);
+                    let src = f.source(db);
+                    params = src.value.param_list().map(|param_list| {
+                        let item_tree = f.id.item_tree(db);
+                        let func = &item_tree[f.id.value];
+                        let krate = f.container.module(db).krate;
+                        let crate_graph = db.crate_graph();
+                        (
+                            param_list,
+                            func.params.clone().map(move |param| {
+                                item_tree
+                                    .attrs(db, krate, param.into())
+                                    .is_cfg_enabled(&crate_graph[krate].cfg_options)
+                            }),
+                        )
+                    });
+                    is_async_fn = data.has_async_kw();
+                    src.map(|it| it.body().map(ast::Expr::from))
+                }
+                DefWithBodyId::ConstId(c) => {
+                    let c = c.lookup(db);
+                    let src = c.source(db);
+                    src.map(|it| it.body())
+                }
+                DefWithBodyId::StaticId(s) => {
+                    let s = s.lookup(db);
+                    let src = s.source(db);
+                    src.map(|it| it.body())
+                }
+                DefWithBodyId::VariantId(v) => {
+                    let s = v.lookup(db);
+                    let src = s.source(db);
+                    src.map(|it| it.expr())
+                }
+                DefWithBodyId::InTypeConstId(c) => c.lookup(db).id.map(|_| c.source(db).expr()),
             }
         };
+        let module = def.module(db);
         let expander = Expander::new(db, file_id, module);
-        let (mut body, source_map) = Body::new(db, expander, params, body);
+        let (mut body, mut source_map) =
+            Body::new(db, def, expander, params, body, module.krate, is_async_fn);
         body.shrink_to_fit();
+        source_map.shrink_to_fit();
 
         (Arc::new(body), Arc::new(source_map))
     }
@@ -404,44 +188,105 @@ impl Body {
         &'a self,
         db: &'a dyn DefDatabase,
     ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + '_ {
-        self.block_scopes
-            .iter()
-            .map(move |&block| (block, db.block_def_map(block).expect("block ID without DefMap")))
-    }
-
-    pub fn pattern_representative(&self, pat: PatId) -> PatId {
-        self.or_pats.get(&pat).and_then(|pats| pats.first().copied()).unwrap_or(pat)
-    }
-
-    /// Retrieves all ident patterns this pattern shares the ident with.
-    pub fn ident_patterns_for<'slf>(&'slf self, pat: &'slf PatId) -> &'slf [PatId] {
-        match self.or_pats.get(pat) {
-            Some(pats) => pats,
-            None => std::slice::from_ref(pat),
-        }
+        self.block_scopes.iter().map(move |&block| (block, db.block_def_map(block)))
     }
 
     pub fn pretty_print(&self, db: &dyn DefDatabase, owner: DefWithBodyId) -> String {
         pretty::print_body_hir(db, self, owner)
     }
 
+    pub fn pretty_print_expr(
+        &self,
+        db: &dyn DefDatabase,
+        owner: DefWithBodyId,
+        expr: ExprId,
+    ) -> String {
+        pretty::print_expr_hir(db, self, owner, expr)
+    }
+
     fn new(
         db: &dyn DefDatabase,
+        owner: DefWithBodyId,
         expander: Expander,
         params: Option<(ast::ParamList, impl Iterator<Item = bool>)>,
         body: Option<ast::Expr>,
+        krate: CrateId,
+        is_async_fn: bool,
     ) -> (Body, BodySourceMap) {
-        lower::lower(db, expander, params, body)
+        lower::lower(db, owner, expander, params, body, krate, is_async_fn)
     }
 
     fn shrink_to_fit(&mut self) {
-        let Self { _c: _, body_expr: _, block_scopes, or_pats, exprs, labels, params, pats } = self;
+        let Self {
+            body_expr: _,
+            params: _,
+            self_param: _,
+            block_scopes,
+            exprs,
+            labels,
+            pats,
+            bindings,
+            binding_owners,
+        } = self;
         block_scopes.shrink_to_fit();
-        or_pats.shrink_to_fit();
         exprs.shrink_to_fit();
         labels.shrink_to_fit();
-        params.shrink_to_fit();
         pats.shrink_to_fit();
+        bindings.shrink_to_fit();
+        binding_owners.shrink_to_fit();
+    }
+
+    pub fn walk_bindings_in_pat(&self, pat_id: PatId, mut f: impl FnMut(BindingId)) {
+        self.walk_pats(pat_id, &mut |pat| {
+            if let Pat::Bind { id, .. } = &self[pat] {
+                f(*id);
+            }
+        });
+    }
+
+    pub fn walk_pats_shallow(&self, pat_id: PatId, mut f: impl FnMut(PatId)) {
+        let pat = &self[pat_id];
+        match pat {
+            Pat::Range { .. }
+            | Pat::Lit(..)
+            | Pat::Path(..)
+            | Pat::ConstBlock(..)
+            | Pat::Wild
+            | Pat::Missing => {}
+            &Pat::Bind { subpat, .. } => {
+                if let Some(subpat) = subpat {
+                    f(subpat);
+                }
+            }
+            Pat::Or(args) | Pat::Tuple { args, .. } | Pat::TupleStruct { args, .. } => {
+                args.iter().copied().for_each(f);
+            }
+            Pat::Ref { pat, .. } => f(*pat),
+            Pat::Slice { prefix, slice, suffix } => {
+                let total_iter = prefix.iter().chain(slice.iter()).chain(suffix.iter());
+                total_iter.copied().for_each(f);
+            }
+            Pat::Record { args, .. } => {
+                args.iter().for_each(|RecordFieldPat { pat, .. }| f(*pat));
+            }
+            Pat::Box { inner } => f(*inner),
+        }
+    }
+
+    pub fn walk_pats(&self, pat_id: PatId, f: &mut impl FnMut(PatId)) {
+        f(pat_id);
+        self.walk_pats_shallow(pat_id, |p| self.walk_pats(p, f));
+    }
+
+    pub fn is_binding_upvar(&self, binding: BindingId, relative_to: ExprId) -> bool {
+        match self.binding_owners.get(&binding) {
+            Some(it) => {
+                // We assign expression ids in a way that outer closures will receive
+                // a lower id
+                it.into_raw() < relative_to.into_raw()
+            }
+            None => true,
+        }
     }
 }
 
@@ -451,11 +296,12 @@ impl Default for Body {
             body_expr: dummy_expr_id(),
             exprs: Default::default(),
             pats: Default::default(),
-            or_pats: Default::default(),
+            bindings: Default::default(),
             labels: Default::default(),
             params: Default::default(),
             block_scopes: Default::default(),
-            _c: Default::default(),
+            binding_owners: Default::default(),
+            self_param: Default::default(),
         }
     }
 }
@@ -484,6 +330,14 @@ impl Index<LabelId> for Body {
     }
 }
 
+impl Index<BindingId> for Body {
+    type Output = Binding;
+
+    fn index(&self, b: BindingId) -> &Binding {
+        &self.bindings[b]
+    }
+}
+
 // FIXME: Change `node_` prefix to something more reasonable.
 // Perhaps `expr_syntax` and `expr_id`?
 impl BodySourceMap {
@@ -496,27 +350,31 @@ impl BodySourceMap {
         self.expr_map.get(&src).cloned()
     }
 
-    pub fn node_macro_file(&self, node: InFile<&ast::MacroCall>) -> Option<HirFileId> {
+    pub fn node_macro_file(&self, node: InFile<&ast::MacroCall>) -> Option<MacroFileId> {
         let src = node.map(AstPtr::new);
         self.expansions.get(&src).cloned()
+    }
+
+    pub fn macro_calls(
+        &self,
+    ) -> impl Iterator<Item = (InFile<AstPtr<ast::MacroCall>>, MacroFileId)> + '_ {
+        self.expansions.iter().map(|(&a, &b)| (a, b))
     }
 
     pub fn pat_syntax(&self, pat: PatId) -> Result<PatSource, SyntheticSyntax> {
         self.pat_map_back.get(pat).cloned().ok_or(SyntheticSyntax)
     }
 
-    pub fn node_pat(&self, node: InFile<&ast::Pat>) -> Option<PatId> {
-        let src = node.map(|it| Either::Left(AstPtr::new(it)));
-        self.pat_map.get(&src).cloned()
+    pub fn self_param_syntax(&self) -> Option<InFile<AstPtr<ast::SelfParam>>> {
+        self.self_param
     }
 
-    pub fn node_self_param(&self, node: InFile<&ast::SelfParam>) -> Option<PatId> {
-        let src = node.map(|it| Either::Right(AstPtr::new(it)));
-        self.pat_map.get(&src).cloned()
+    pub fn node_pat(&self, node: InFile<&ast::Pat>) -> Option<PatId> {
+        self.pat_map.get(&node.map(AstPtr::new)).cloned()
     }
 
     pub fn label_syntax(&self, label: LabelId) -> LabelSource {
-        self.label_map_back[label].clone()
+        self.label_map_back[label]
     }
 
     pub fn node_label(&self, node: InFile<&ast::Label>) -> Option<LabelId> {
@@ -525,12 +383,11 @@ impl BodySourceMap {
     }
 
     pub fn field_syntax(&self, expr: ExprId) -> FieldSource {
-        self.field_map_back[&expr].clone()
+        self.field_map_back[&expr]
     }
 
-    pub fn node_field(&self, node: InFile<&ast::RecordExprField>) -> Option<ExprId> {
-        let src = node.map(AstPtr::new);
-        self.field_map.get(&src).cloned()
+    pub fn pat_field_syntax(&self, pat: PatId) -> PatFieldSource {
+        self.pat_field_map_back[&pat]
     }
 
     pub fn macro_expansion_expr(&self, node: InFile<&ast::MacroExpr>) -> Option<ExprId> {
@@ -538,8 +395,44 @@ impl BodySourceMap {
         self.expr_map.get(&src).copied()
     }
 
+    pub fn implicit_format_args(
+        &self,
+        node: InFile<&ast::FormatArgsExpr>,
+    ) -> Option<&[(syntax::TextRange, Name)]> {
+        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
+        self.format_args_template_map.get(self.expr_map.get(&src)?).map(std::ops::Deref::deref)
+    }
+
     /// Get a reference to the body source map's diagnostics.
     pub fn diagnostics(&self) -> &[BodyDiagnostic] {
         &self.diagnostics
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let Self {
+            self_param: _,
+            expr_map,
+            expr_map_back,
+            pat_map,
+            pat_map_back,
+            label_map,
+            label_map_back,
+            field_map_back,
+            pat_field_map_back,
+            expansions,
+            format_args_template_map,
+            diagnostics,
+        } = self;
+        format_args_template_map.shrink_to_fit();
+        expr_map.shrink_to_fit();
+        expr_map_back.shrink_to_fit();
+        pat_map.shrink_to_fit();
+        pat_map_back.shrink_to_fit();
+        label_map.shrink_to_fit();
+        label_map_back.shrink_to_fit();
+        field_map_back.shrink_to_fit();
+        pat_field_map_back.shrink_to_fit();
+        expansions.shrink_to_fit();
+        diagnostics.shrink_to_fit();
     }
 }

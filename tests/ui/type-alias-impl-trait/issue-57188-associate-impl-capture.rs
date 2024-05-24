@@ -1,8 +1,8 @@
 // Regression test for #57188
 
-// check-pass
+//@ check-pass
 
-#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 struct Baz<'a> {
     source: &'a str,

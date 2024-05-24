@@ -1,6 +1,5 @@
-// compile-flags: -O
-// only-x86_64
-// ignore-debug: the debug assertions get in the way
+//@ compile-flags: -O
+//@ only-x86_64
 
 #![crate_type = "lib"]
 
@@ -16,7 +15,7 @@ type KeccakBuffer = [[u64; 5]; 5];
 // CHECK-LABEL: @swap_basic
 #[no_mangle]
 pub fn swap_basic(x: &mut KeccakBuffer, y: &mut KeccakBuffer) {
-// CHECK: alloca [5 x [5 x i64]]
+// CHECK: alloca [200 x i8]
 
     // SAFETY: exclusive references are always valid to read/write,
     // are non-overlapping, and nothing here panics so it's drop-safe.
@@ -83,9 +82,9 @@ pub struct BigButHighlyAligned([u8; 64 * 3]);
 #[no_mangle]
 pub fn swap_big_aligned(x: &mut BigButHighlyAligned, y: &mut BigButHighlyAligned) {
 // CHECK-NOT: call void @llvm.memcpy
-// CHECK: call void @llvm.memcpy.{{.+}}({{i8\*|ptr}} noundef nonnull align 64 dereferenceable(192)
-// CHECK: call void @llvm.memcpy.{{.+}}({{i8\*|ptr}} noundef nonnull align 64 dereferenceable(192)
-// CHECK: call void @llvm.memcpy.{{.+}}({{i8\*|ptr}} noundef nonnull align 64 dereferenceable(192)
+// CHECK: call void @llvm.memcpy.{{.+}}(ptr noundef nonnull align 64 dereferenceable(192)
+// CHECK: call void @llvm.memcpy.{{.+}}(ptr noundef nonnull align 64 dereferenceable(192)
+// CHECK: call void @llvm.memcpy.{{.+}}(ptr noundef nonnull align 64 dereferenceable(192)
 // CHECK-NOT: call void @llvm.memcpy
     swap(x, y)
 }

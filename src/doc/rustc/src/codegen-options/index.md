@@ -31,8 +31,8 @@ Supported values can also be discovered by running `rustc --print code-models`.
 
 ## codegen-units
 
-This flag controls how many code generation units the crate is split into. It
-takes an integer greater than 0.
+This flag controls the maximum number of code generation units the crate is
+split into. It takes an integer greater than 0.
 
 When a crate is split into multiple codegen units, LLVM is able to process
 them in parallel. Increasing parallelism may speed up compile times, but may
@@ -41,6 +41,18 @@ generated code, but may be slower to compile.
 
 The default value, if not specified, is 16 for non-incremental builds. For
 incremental builds the default is 256 which allows caching to be more granular.
+
+## collapse-macro-debuginfo
+
+This flag controls whether code locations from a macro definition are collapsed into a single
+location associated with that macro's call site, when generating debuginfo for this crate.
+
+This option, if passed, overrides both default collapsing behavior and `#[collapse_debuginfo]`
+attributes in code.
+
+* `y`, `yes`, `on`, `true`: collapse code locations in debuginfo.
+* `n`, `no`, `off` or `false`: do not collapse code locations in debuginfo.
+* `external`: collapse code locations in debuginfo only if the macro comes from a different crate.
 
 ## control-flow-guard
 
@@ -71,9 +83,11 @@ If not specified, debug assertions are automatically enabled only if the
 This flag controls the generation of debug information. It takes one of the
 following values:
 
-* `0`: no debug info at all (the default).
-* `1`: line tables only.
-* `2`: full debug info.
+* `0` or `none`: no debug info at all (the default).
+* `line-directives-only`: line info directives only. For the nvptx* targets this enables [profiling](https://reviews.llvm.org/D46061). For other use cases, `line-tables-only` is the better, more compatible choice.
+* `line-tables-only`: line tables only. Generates the minimal amount of debug info for backtraces with filename/line number info, but not anything else, i.e. no variable or function parameter info.
+* `1` or `limited`: debug info without type or variable-level information.
+* `2` or `full`: full debug info.
 
 Note: The [`-g` flag][option-g-debug] is an alias for `-C debuginfo=2`.
 
@@ -82,11 +96,19 @@ Note: The [`-g` flag][option-g-debug] is an alias for `-C debuginfo=2`.
 This flag controls whether or not the linker includes its default libraries.
 It takes one of the following values:
 
-* `y`, `yes`, `on`, `true` or no value: include default libraries (the default).
-* `n`, `no`, `off` or `false`: exclude default libraries.
+* `y`, `yes`, `on`, `true`: include default libraries.
+* `n`, `no`, `off` or `false` or no value: exclude default libraries (the default).
 
 For example, for gcc flavor linkers, this issues the `-nodefaultlibs` flag to
 the linker.
+
+## dlltool
+
+On `windows-gnu` targets, this flag controls which dlltool `rustc` invokes to
+generate import libraries when using the [`raw-dylib` link kind](../../reference/items/external-blocks.md#the-link-attribute).
+It takes a path to [the dlltool executable](https://sourceware.org/binutils/docs/binutils/dlltool.html).
+If this flag is not specified, a dlltool executable will be inferred based on
+the host environment and target.
 
 ## embed-bitcode
 
@@ -211,7 +233,7 @@ metrics.
 ## link-self-contained
 
 On `windows-gnu`, `linux-musl`, and `wasi` targets, this flag controls whether the
-linker will use libraries and objects shipped with Rust instead or those in the system.
+linker will use libraries and objects shipped with Rust instead of those in the system.
 It takes one of the following values:
 
 * no value: rustc will use heuristic to disable self-contained mode if system has necessary tools.
@@ -239,11 +261,6 @@ flavor. Valid options are:
 * `gcc`: use the `cc` executable, which is typically gcc or clang on many systems.
 * `ld`: use the `ld` executable.
 * `msvc`: use the `link.exe` executable from Microsoft Visual Studio MSVC.
-* `ptx-linker`: use
-  [`rust-ptx-linker`](https://github.com/denzp/rust-ptx-linker) for Nvidia
-  NVPTX GPGPU support.
-* `bpf-linker`: use
-  [`bpf-linker`](https://github.com/alessandrod/bpf-linker) for eBPF support.
 * `wasm-ld`: use the [`wasm-ld`](https://lld.llvm.org/WebAssembly.html)
   executable, a port of LLVM `lld` for WebAssembly.
 * `ld64.lld`: use the LLVM `lld` executable with the [`-flavor darwin`
@@ -253,7 +270,7 @@ flavor. Valid options are:
 * `lld-link`: use the LLVM `lld` executable with the [`-flavor link`
   flag][lld-flavor] for Microsoft's `link.exe`.
 
-[lld-flavor]: https://lld.llvm.org/Driver.html
+[lld-flavor]: https://releases.llvm.org/12.0.0/tools/lld/docs/Driver.html
 
 ## linker-plugin-lto
 
@@ -474,6 +491,26 @@ then `-C target-feature=+crt-static` "wins" over `-C relocation-model=pic`,
 and the linker is instructed (`-static`) to produce a statically linked
 but not position-independent executable.
 
+## relro-level
+
+This flag controls what level of RELRO (Relocation Read-Only) is enabled. RELRO is an exploit
+mitigation which makes the Global Offset Table (GOT) read-only.
+
+Supported values for this option are:
+
+- `off`: Dynamically linked functions are resolved lazily and the GOT is writable.
+- `partial`: Dynamically linked functions are resolved lazily and written into the Procedure
+  Linking Table (PLT) part of the GOT (`.got.plt`). The non-PLT part of the GOT (`.got`) is made
+  read-only and both are moved to prevent writing from buffer overflows.
+- `full`: Dynamically linked functions are resolved at the start of program execution and the
+  Global Offset Table (`.got`/`.got.plt`) is populated eagerly and then made read-only. The GOT is
+  also moved to prevent writing from buffer overflows. Full RELRO uses more memory and increases
+  process startup time.
+
+This flag is ignored on platforms where RELRO is not supported (targets which do not use the ELF
+binary format), such as Windows or macOS. Each rustc target has its own default for RELRO. rustc
+enables Full RELRO by default on platforms where it is supported.
+
 ## remark
 
 This flag lets you print remarks for optimization passes.
@@ -543,14 +580,23 @@ data from binaries during linking.
 
 Supported values for this option are:
 
-- `none` - debuginfo and symbols (if they exist) are copied to the produced
-  binary or separate files depending on the target (e.g. `.pdb` files in case
-  of MSVC).
+- `none` - debuginfo and symbols are not modified.
 - `debuginfo` - debuginfo sections and debuginfo symbols from the symbol table
-  section are stripped at link time and are not copied to the produced binary
-  or separate files.
+  section are stripped at link time and are not copied to the produced binary.
+  This should leave backtraces mostly-intact but may make using a debugger like
+  gdb or lldb ineffectual. Prior to 1.79, this unintentionally disabled the
+  generation of `*.pdb` files on MSVC, resulting in the absence of symbols.
 - `symbols` - same as `debuginfo`, but the rest of the symbol table section is
-  stripped as well if the linker supports it.
+  stripped as well, depending on platform support. On platforms which depend on
+  this symbol table for backtraces, profiling, and similar, this can affect
+  them so negatively as to make the trace incomprehensible. Programs which may
+  be combined with others, such as CLI pipelines and developer tooling, or even
+  anything which wants crash-reporting, should usually avoid `-Cstrip=symbols`.
+
+Note that, at any level, removing debuginfo only necessarily impacts "friendly"
+introspection. `-Cstrip` cannot be relied on as a meaningful security or
+obfuscation measure, as disassemblers and decompilers can extract considerable
+information even in the absence of symbols.
 
 ## symbol-mangling-version
 
@@ -559,20 +605,23 @@ for the purpose of generating object code and linking.
 
 Supported values for this option are:
 
-* `v0` — The "v0" mangling scheme. The specific format is not specified at
-  this time.
+* `v0` — The "v0" mangling scheme.
 
 The default, if not specified, will use a compiler-chosen default which may
 change in the future.
 
+See the [Symbol Mangling] chapter for details on symbol mangling and the mangling format.
+
 [name mangling]: https://en.wikipedia.org/wiki/Name_mangling
+[Symbol Mangling]: ../symbol-mangling/index.md
 
 ## target-cpu
 
 This instructs `rustc` to generate code specifically for a particular processor.
 
 You can run `rustc --print target-cpus` to see the valid options to pass
-here. Each target has a default base CPU. Special values include:
+and the default target CPU for the current build target.
+Each target has a default base CPU. Special values include:
 
 * `native` can be passed to use the processor of the host machine.
 * `generic` refers to an LLVM target with minimal features but modern tuning.

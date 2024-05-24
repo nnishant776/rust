@@ -1,16 +1,15 @@
-use crate::convert::{TryFrom, TryInto};
-use crate::intrinsics::assert_unsafe_precondition;
-use crate::num::NonZeroUsize;
+use crate::num::NonZero;
+#[cfg(debug_assertions)]
+use crate::ub_checks::assert_unsafe_precondition;
 use crate::{cmp, fmt, hash, mem, num};
 
 /// A type storing a `usize` which is a power of two, and thus
-/// represents a possible alignment in the rust abstract machine.
+/// represents a possible alignment in the Rust abstract machine.
 ///
 /// Note that particularly large alignments, while representable in this type,
 /// are likely not to be supported by actual allocators and linkers.
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-#[derive(Copy, Clone, Eq)]
-#[derive_const(PartialEq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Alignment(AlignmentEnum);
 
@@ -41,8 +40,9 @@ impl Alignment {
     /// Returns the alignment for a type.
     ///
     /// This provides the same numerical value as [`mem::align_of`],
-    /// but in an `Alignment` instead of a `usize.
+    /// but in an `Alignment` instead of a `usize`.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn of<T>() -> Self {
         // SAFETY: rustc ensures that type alignment is always a power of two.
@@ -54,6 +54,7 @@ impl Alignment {
     ///
     /// Note that `0` is not a power of two, nor a valid alignment.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn new(align: usize) -> Option<Self> {
         if align.is_power_of_two() {
@@ -76,20 +77,19 @@ impl Alignment {
     #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const unsafe fn new_unchecked(align: usize) -> Self {
-        // SAFETY: Precondition passed to the caller.
-        unsafe {
-            assert_unsafe_precondition!(
-               "Alignment::new_unchecked requires a power of two",
-                (align: usize) => align.is_power_of_two()
-            )
-        };
+        #[cfg(debug_assertions)]
+        assert_unsafe_precondition!(
+            check_language_ub,
+            "Alignment::new_unchecked requires a power of two",
+            (align: usize = align) => align.is_power_of_two()
+        );
 
         // SAFETY: By precondition, this must be a power of two, and
         // our variants encompass all possible powers of two.
         unsafe { mem::transmute::<usize, Alignment>(align) }
     }
 
-    /// Returns the alignment as a [`usize`]
+    /// Returns the alignment as a [`usize`].
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
@@ -97,12 +97,13 @@ impl Alignment {
         self.0 as usize
     }
 
-    /// Returns the alignment as a [`NonZeroUsize`]
+    /// Returns the alignment as a <code>[NonZero]<[usize]></code>.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
-    pub const fn as_nonzero(self) -> NonZeroUsize {
+    pub const fn as_nonzero(self) -> NonZero<usize> {
         // SAFETY: All the discriminants are non-zero.
-        unsafe { NonZeroUsize::new_unchecked(self.as_usize()) }
+        unsafe { NonZero::new_unchecked(self.as_usize()) }
     }
 
     /// Returns the base-2 logarithm of the alignment.
@@ -119,9 +120,41 @@ impl Alignment {
     /// assert_eq!(Alignment::new(1024).unwrap().log2(), 10);
     /// ```
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
-    pub fn log2(self) -> u32 {
+    pub const fn log2(self) -> u32 {
         self.as_nonzero().trailing_zeros()
+    }
+
+    /// Returns a bit mask that can be used to match this alignment.
+    ///
+    /// This is equivalent to `!(self.as_usize() - 1)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(ptr_alignment_type)]
+    /// #![feature(ptr_mask)]
+    /// use std::ptr::{Alignment, NonNull};
+    ///
+    /// #[repr(align(1))] struct Align1(u8);
+    /// #[repr(align(2))] struct Align2(u16);
+    /// #[repr(align(4))] struct Align4(u32);
+    /// let one = <NonNull<Align1>>::dangling().as_ptr();
+    /// let two = <NonNull<Align2>>::dangling().as_ptr();
+    /// let four = <NonNull<Align4>>::dangling().as_ptr();
+    ///
+    /// assert_eq!(four.mask(Alignment::of::<Align1>().mask()), four);
+    /// assert_eq!(four.mask(Alignment::of::<Align2>().mask()), four);
+    /// assert_eq!(four.mask(Alignment::of::<Align4>().mask()), four);
+    /// assert_ne!(one.mask(Alignment::of::<Align4>().mask()), one);
+    /// ```
+    #[unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
+    #[inline]
+    pub const fn mask(self) -> usize {
+        // SAFETY: The alignment is always nonzero, and therefore decrementing won't overflow.
+        !(unsafe { self.as_usize().unchecked_sub(1) })
     }
 }
 
@@ -133,11 +166,11 @@ impl fmt::Debug for Alignment {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl TryFrom<NonZeroUsize> for Alignment {
+impl TryFrom<NonZero<usize>> for Alignment {
     type Error = num::TryFromIntError;
 
     #[inline]
-    fn try_from(align: NonZeroUsize) -> Result<Alignment, Self::Error> {
+    fn try_from(align: NonZero<usize>) -> Result<Alignment, Self::Error> {
         align.get().try_into()
     }
 }
@@ -153,9 +186,9 @@ impl TryFrom<usize> for Alignment {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl From<Alignment> for NonZeroUsize {
+impl From<Alignment> for NonZero<usize> {
     #[inline]
-    fn from(align: Alignment) -> NonZeroUsize {
+    fn from(align: Alignment) -> NonZero<usize> {
         align.as_nonzero()
     }
 }
@@ -170,7 +203,7 @@ impl From<Alignment> for usize {
 
 #[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl const cmp::Ord for Alignment {
+impl cmp::Ord for Alignment {
     #[inline]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.as_nonzero().get().cmp(&other.as_nonzero().get())
@@ -179,7 +212,7 @@ impl const cmp::Ord for Alignment {
 
 #[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl const cmp::PartialOrd for Alignment {
+impl cmp::PartialOrd for Alignment {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
@@ -194,17 +227,18 @@ impl hash::Hash for Alignment {
     }
 }
 
-#[cfg(target_pointer_width = "16")]
-type AlignmentEnum = AlignmentEnum16;
-#[cfg(target_pointer_width = "32")]
-type AlignmentEnum = AlignmentEnum32;
-#[cfg(target_pointer_width = "64")]
-type AlignmentEnum = AlignmentEnum64;
+/// Returns [`Alignment::MIN`], which is valid for any type.
+#[unstable(feature = "ptr_alignment_type", issue = "102070")]
+impl Default for Alignment {
+    fn default() -> Alignment {
+        Alignment::MIN
+    }
+}
 
-#[derive(Copy, Clone, Eq)]
-#[derive_const(PartialEq)]
+#[cfg(target_pointer_width = "16")]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u16)]
-enum AlignmentEnum16 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,
@@ -223,10 +257,10 @@ enum AlignmentEnum16 {
     _Align1Shl15 = 1 << 15,
 }
 
-#[derive(Copy, Clone, Eq)]
-#[derive_const(PartialEq)]
+#[cfg(target_pointer_width = "32")]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
-enum AlignmentEnum32 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,
@@ -261,10 +295,10 @@ enum AlignmentEnum32 {
     _Align1Shl31 = 1 << 31,
 }
 
-#[derive(Copy, Clone, Eq)]
-#[derive_const(PartialEq)]
+#[cfg(target_pointer_width = "64")]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u64)]
-enum AlignmentEnum64 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,

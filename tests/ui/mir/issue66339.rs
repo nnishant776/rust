@@ -1,11 +1,11 @@
-// compile-flags: -Z mir-opt-level=3
-// build-pass
+//@ compile-flags: -Z mir-opt-level=3
+//@ build-pass
 
 // This used to ICE in const-prop
 
 fn foo() {
     let bar = |_| { };
-    let _ = bar("a");
+    bar("a");
 }
 
 fn main() {

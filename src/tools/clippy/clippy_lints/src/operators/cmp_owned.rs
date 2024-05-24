@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::path_def_id;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::{implements_trait, is_copy};
-use clippy_utils::{match_def_path, path_def_id, paths};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind, UnOp};
 use rustc_lint::LateContext;
@@ -49,10 +49,10 @@ fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool)
             (arg, arg.span)
         },
         ExprKind::Call(path, [arg])
-            if path_def_id(cx, path).map_or(false, |id| {
-                if match_def_path(cx, id, &paths::FROM_STR_METHOD) {
+            if path_def_id(cx, path).map_or(false, |did| {
+                if cx.tcx.is_diagnostic_item(sym::from_str_method, did) {
                     true
-                } else if cx.tcx.lang_items().from_fn() == Some(id) {
+                } else if cx.tcx.is_diagnostic_item(sym::from_fn, did) {
                     !is_copy(cx, typeck.expr_ty(expr))
                 } else {
                     false
@@ -70,7 +70,7 @@ fn check_op(cx: &LateContext<'_>, expr: &Expr<'_>, other: &Expr<'_>, left: bool)
     let without_deref = symmetric_partial_eq(cx, arg_ty, other_ty).unwrap_or_default();
     let with_deref = arg_ty
         .builtin_deref(true)
-        .and_then(|tam| symmetric_partial_eq(cx, tam.ty, other_ty))
+        .and_then(|ty| symmetric_partial_eq(cx, ty, other_ty))
         .unwrap_or_default();
 
     if !with_deref.is_implemented() && !without_deref.is_implemented() {

@@ -114,7 +114,7 @@ fn test_buffered_reader_seek() {
 
     assert_eq!(reader.seek(SeekFrom::Start(3)).ok(), Some(3));
     assert_eq!(reader.fill_buf().ok(), Some(&[0, 1][..]));
-    assert_eq!(reader.seek(SeekFrom::Current(0)).ok(), Some(3));
+    assert_eq!(reader.stream_position().ok(), Some(3));
     assert_eq!(reader.fill_buf().ok(), Some(&[0, 1][..]));
     assert_eq!(reader.seek(SeekFrom::Current(1)).ok(), Some(4));
     assert_eq!(reader.fill_buf().ok(), Some(&[1, 2][..]));
@@ -230,6 +230,9 @@ fn test_buffered_reader_seek_underflow() {
             Ok(len)
         }
     }
+    // note: this implementation of `Seek` is "broken" due to position
+    // wrapping, so calling `reader.seek(Current(0))` is semantically different
+    // than `reader.stream_position()`
     impl Seek for PositionReader {
         fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
             match pos {
@@ -374,7 +377,7 @@ fn test_buffered_writer_seek() {
     let mut w = BufWriter::with_capacity(3, io::Cursor::new(Vec::new()));
     w.write_all(&[0, 1, 2, 3, 4, 5]).unwrap();
     w.write_all(&[6, 7]).unwrap();
-    assert_eq!(w.seek(SeekFrom::Current(0)).ok(), Some(8));
+    assert_eq!(w.stream_position().ok(), Some(8));
     assert_eq!(&w.get_ref().get_ref()[..], &[0, 1, 2, 3, 4, 5, 6, 7][..]);
     assert_eq!(w.seek(SeekFrom::Start(2)).ok(), Some(2));
     w.write_all(&[8, 9]).unwrap();
@@ -831,9 +834,9 @@ fn partial_line_buffered_after_line_write() {
     assert_eq!(&writer.get_ref().buffer, b"Line 1\nLine 2\nLine 3");
 }
 
-/// Test that, given a partial line that exceeds the length of
-/// LineBuffer's buffer (that is, without a trailing newline), that that
-/// line is written to the inner writer
+/// Test that for calls to LineBuffer::write where the passed bytes do not contain
+/// a newline and on their own are greater in length than the internal buffer, the
+/// passed bytes are immediately written to the inner writer.
 #[test]
 fn long_line_flushed() {
     let writer = ProgrammableSink::default();
@@ -844,9 +847,10 @@ fn long_line_flushed() {
 }
 
 /// Test that, given a very long partial line *after* successfully
-/// flushing a complete line, that that line is buffered unconditionally,
-/// and no additional writes take place. This assures the property that
-/// `write` should make at-most-one attempt to write new data.
+/// flushing a complete line, the very long partial line is buffered
+/// unconditionally, and no additional writes take place. This assures
+/// the property that `write` should make at-most-one attempt to write
+/// new data.
 #[test]
 fn line_long_tail_not_flushed() {
     let writer = ProgrammableSink::default();

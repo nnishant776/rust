@@ -1,5 +1,4 @@
-// run-pass
-// ignore-pretty issue #37195
+//@ run-pass
 
 // Testing that a plain .rs file can load modules from other source files
 

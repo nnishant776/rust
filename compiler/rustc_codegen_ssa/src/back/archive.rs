@@ -1,4 +1,4 @@
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::memmap::Mmap;
 use rustc_session::cstore::DllImport;
 use rustc_session::Session;
@@ -13,7 +13,7 @@ use object::read::macho::FatArch;
 use tempfile::Builder as TempFileBuilder;
 
 use std::error::Error;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub use crate::errors::{ArchiveBuildFailure, ExtractBundledLibsError, UnknownArchiveKind};
 
 pub trait ArchiveBuilderBuilder {
-    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder<'a> + 'a>;
+    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder + 'a>;
 
     /// Creates a DLL Import Library <https://docs.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-creation#creating-an-import-library>.
     /// and returns the path on disk to that import library.
@@ -41,7 +41,7 @@ pub trait ArchiveBuilderBuilder {
         &'a self,
         rlib: &'a Path,
         outdir: &Path,
-        bundled_lib_file_names: &FxHashSet<Symbol>,
+        bundled_lib_file_names: &FxIndexSet<Symbol>,
     ) -> Result<(), ExtractBundledLibsError<'_>> {
         let archive_map = unsafe {
             Mmap::map(
@@ -74,7 +74,7 @@ pub trait ArchiveBuilderBuilder {
     }
 }
 
-pub trait ArchiveBuilder<'a> {
+pub trait ArchiveBuilder {
     fn add_file(&mut self, path: &Path);
 
     fn add_archive(
@@ -167,7 +167,7 @@ pub fn try_extract_macho_fat_archive(
     }
 }
 
-impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
+impl<'a> ArchiveBuilder for ArArchiveBuilder<'a> {
     fn add_archive(
         &mut self,
         archive_path: &Path,
@@ -175,8 +175,7 @@ impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
     ) -> io::Result<()> {
         let mut archive_path = archive_path.to_path_buf();
         if self.sess.target.llvm_target.contains("-apple-macosx") {
-            if let Some(new_archive_path) =
-                try_extract_macho_fat_archive(&self.sess, &archive_path)?
+            if let Some(new_archive_path) = try_extract_macho_fat_archive(self.sess, &archive_path)?
             {
                 archive_path = new_archive_path
             }
@@ -221,7 +220,7 @@ impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
         let sess = self.sess;
         match self.build_inner(output) {
             Ok(any_members) => any_members,
-            Err(e) => sess.emit_fatal(ArchiveBuildFailure { error: e }),
+            Err(e) => sess.dcx().emit_fatal(ArchiveBuildFailure { error: e }),
         }
     }
 }
@@ -232,9 +231,14 @@ impl<'a> ArArchiveBuilder<'a> {
             "gnu" => ArchiveKind::Gnu,
             "bsd" => ArchiveKind::Bsd,
             "darwin" => ArchiveKind::Darwin,
-            "coff" => ArchiveKind::Coff,
+            "coff" => {
+                // FIXME: ar_archive_writer doesn't support COFF archives yet.
+                // https://github.com/rust-lang/ar_archive_writer/issues/9
+                ArchiveKind::Gnu
+            }
+            "aix_big" => ArchiveKind::AixBig,
             kind => {
-                self.sess.emit_fatal(UnknownArchiveKind { kind });
+                self.sess.dcx().emit_fatal(UnknownArchiveKind { kind });
             }
         };
 
@@ -276,19 +280,21 @@ impl<'a> ArArchiveBuilder<'a> {
         // This prevents programs (including rustc) from attempting to read a partial archive.
         // It also enables writing an archive with the same filename as a dependency on Windows as
         // required by a test.
-        let mut archive_tmpfile = TempFileBuilder::new()
+        // The tempfile crate currently uses 0o600 as mode for the temporary files and directories
+        // it creates. We need it to be the default mode for back compat reasons however. (See
+        // #107495) To handle this we are telling tempfile to create a temporary directory instead
+        // and then inside this directory create a file using File::create.
+        let archive_tmpdir = TempFileBuilder::new()
             .suffix(".temp-archive")
-            .tempfile_in(output.parent().unwrap_or_else(|| Path::new("")))
-            .map_err(|err| io_error_context("couldn't create a temp file", err))?;
+            .tempdir_in(output.parent().unwrap_or_else(|| Path::new("")))
+            .map_err(|err| {
+                io_error_context("couldn't create a directory for the temp file", err)
+            })?;
+        let archive_tmpfile_path = archive_tmpdir.path().join("tmp.a");
+        let mut archive_tmpfile = File::create_new(&archive_tmpfile_path)
+            .map_err(|err| io_error_context("couldn't create the temp file", err))?;
 
-        write_archive_to_stream(
-            archive_tmpfile.as_file_mut(),
-            &entries,
-            true,
-            archive_kind,
-            true,
-            false,
-        )?;
+        write_archive_to_stream(&mut archive_tmpfile, &entries, archive_kind, false)?;
 
         let any_entries = !entries.is_empty();
         drop(entries);
@@ -296,9 +302,11 @@ impl<'a> ArArchiveBuilder<'a> {
         // output archive to the same location as an input archive on Windows.
         drop(self.src_archives);
 
-        archive_tmpfile
-            .persist(output)
-            .map_err(|err| io_error_context("failed to rename archive file", err.error))?;
+        fs::rename(archive_tmpfile_path, output)
+            .map_err(|err| io_error_context("failed to rename archive file", err))?;
+        archive_tmpdir
+            .close()
+            .map_err(|err| io_error_context("failed to remove temporary directory", err))?;
 
         Ok(any_entries)
     }

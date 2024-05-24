@@ -3,10 +3,10 @@
 use rustc_ast::InlineAsmOptions;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ExprKind, InlineAsmOperand, StmtKind};
-use rustc_middle::ty::query::Providers;
+use rustc_hir::{ExprKind, HirIdSet, InlineAsmOperand, StmtKind};
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint::builtin::UNDEFINED_NAKED_FUNCTION_ABI;
 use rustc_span::symbol::sym;
@@ -23,19 +23,19 @@ pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { check_mod_naked_functions, ..*providers };
 }
 
-fn check_mod_naked_functions(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
+fn check_mod_naked_functions(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     let items = tcx.hir_module_items(module_def_id);
     for def_id in items.definitions() {
         if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
             continue;
         }
 
-        let naked = tcx.has_attr(def_id.to_def_id(), sym::naked);
+        let naked = tcx.has_attr(def_id, sym::naked);
         if !naked {
             continue;
         }
 
-        let (fn_header, body_id) = match tcx.hir().get_by_def_id(def_id) {
+        let (fn_header, body_id) = match tcx.hir_node_by_def_id(def_id) {
             hir::Node::Item(hir::Item { kind: hir::ItemKind::Fn(sig, _, body_id), .. })
             | hir::Node::TraitItem(hir::TraitItem {
                 kind: hir::TraitItemKind::Fn(sig, hir::TraitFn::Provided(body_id)),
@@ -59,18 +59,18 @@ fn check_mod_naked_functions(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
 
 /// Check that the function isn't inlined.
 fn check_inline(tcx: TyCtxt<'_>, def_id: LocalDefId) {
-    let attrs = tcx.get_attrs(def_id.to_def_id(), sym::inline);
+    let attrs = tcx.get_attrs(def_id, sym::inline);
     for attr in attrs {
-        tcx.sess.emit_err(CannotInlineNakedFunction { span: attr.span });
+        tcx.dcx().emit_err(CannotInlineNakedFunction { span: attr.span });
     }
 }
 
 /// Checks that function uses non-Rust ABI.
 fn check_abi(tcx: TyCtxt<'_>, def_id: LocalDefId, abi: Abi) {
     if abi == Abi::Rust {
-        let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
+        let hir_id = tcx.local_def_id_to_hir_id(def_id);
         let span = tcx.def_span(def_id);
-        tcx.emit_spanned_lint(
+        tcx.emit_node_span_lint(
             UNDEFINED_NAKED_FUNCTION_ABI,
             hir_id,
             span,
@@ -83,10 +83,9 @@ fn check_abi(tcx: TyCtxt<'_>, def_id: LocalDefId, abi: Abi) {
 fn check_no_patterns(tcx: TyCtxt<'_>, params: &[hir::Param<'_>]) {
     for param in params {
         match param.pat.kind {
-            hir::PatKind::Wild
-            | hir::PatKind::Binding(hir::BindingAnnotation::NONE, _, _, None) => {}
+            hir::PatKind::Wild | hir::PatKind::Binding(hir::BindingMode::NONE, _, _, None) => {}
             _ => {
-                tcx.sess.emit_err(NoPatterns { span: param.pat.span });
+                tcx.dcx().emit_err(NoPatterns { span: param.pat.span });
             }
         }
     }
@@ -94,7 +93,7 @@ fn check_no_patterns(tcx: TyCtxt<'_>, params: &[hir::Param<'_>]) {
 
 /// Checks that function parameters aren't used in the function body.
 fn check_no_parameters_use<'tcx>(tcx: TyCtxt<'tcx>, body: &'tcx hir::Body<'tcx>) {
-    let mut params = hir::HirIdSet::default();
+    let mut params = HirIdSet::default();
     for param in body.params {
         param.pat.each_binding(|_binding_mode, hir_id, _span, _ident| {
             params.insert(hir_id);
@@ -105,7 +104,7 @@ fn check_no_parameters_use<'tcx>(tcx: TyCtxt<'tcx>, body: &'tcx hir::Body<'tcx>)
 
 struct CheckParameters<'tcx> {
     tcx: TyCtxt<'tcx>,
-    params: hir::HirIdSet,
+    params: HirIdSet,
 }
 
 impl<'tcx> Visitor<'tcx> for CheckParameters<'tcx> {
@@ -116,7 +115,7 @@ impl<'tcx> Visitor<'tcx> for CheckParameters<'tcx> {
         )) = expr.kind
         {
             if self.params.contains(var_hir_id) {
-                self.tcx.sess.emit_err(ParamsNotAllowed { span: expr.span });
+                self.tcx.dcx().emit_err(ParamsNotAllowed { span: expr.span });
                 return;
             }
         }
@@ -155,7 +154,7 @@ fn check_asm<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &'tcx hir::Body<
         // errors, then don't show an additional error. This allows for appending/prepending
         // `compile_error!("...")` statements and reduces error noise.
         if must_show_error || !has_err {
-            tcx.sess.emit_err(NakedFunctionsAsmBlock {
+            tcx.dcx().emit_err(NakedFunctionsAsmBlock {
                 span: tcx.def_span(def_id),
                 multiple_asms,
                 non_asms,
@@ -179,8 +178,7 @@ enum ItemKind {
 impl<'tcx> CheckInlineAssembly<'tcx> {
     fn check_expr(&mut self, expr: &'tcx hir::Expr<'tcx>, span: Span) {
         match expr.kind {
-            ExprKind::Box(..)
-            | ExprKind::ConstBlock(..)
+            ExprKind::ConstBlock(..)
             | ExprKind::Array(..)
             | ExprKind::Call(..)
             | ExprKind::MethodCall(..)
@@ -204,13 +202,15 @@ impl<'tcx> CheckInlineAssembly<'tcx> {
             | ExprKind::Break(..)
             | ExprKind::Continue(..)
             | ExprKind::Ret(..)
+            | ExprKind::OffsetOf(..)
+            | ExprKind::Become(..)
             | ExprKind::Struct(..)
             | ExprKind::Repeat(..)
             | ExprKind::Yield(..) => {
                 self.items.push((ItemKind::NonAsm, span));
             }
 
-            ExprKind::InlineAsm(ref asm) => {
+            ExprKind::InlineAsm(asm) => {
                 self.items.push((ItemKind::Asm, span));
                 self.check_inline_asm(asm, span);
             }
@@ -219,7 +219,7 @@ impl<'tcx> CheckInlineAssembly<'tcx> {
                 hir::intravisit::walk_expr(self, expr);
             }
 
-            ExprKind::Err => {
+            ExprKind::Err(_) => {
                 self.items.push((ItemKind::Err, span));
             }
         }
@@ -236,11 +236,12 @@ impl<'tcx> CheckInlineAssembly<'tcx> {
                 InlineAsmOperand::In { .. }
                 | InlineAsmOperand::Out { .. }
                 | InlineAsmOperand::InOut { .. }
-                | InlineAsmOperand::SplitInOut { .. } => Some(op_sp),
+                | InlineAsmOperand::SplitInOut { .. }
+                | InlineAsmOperand::Label { .. } => Some(op_sp),
             })
             .collect();
         if !unsupported_operands.is_empty() {
-            self.tcx.sess.emit_err(NakedFunctionsOperands { unsupported_operands });
+            self.tcx.dcx().emit_err(NakedFunctionsOperands { unsupported_operands });
         }
 
         let unsupported_options: Vec<&'static str> = [
@@ -256,7 +257,7 @@ impl<'tcx> CheckInlineAssembly<'tcx> {
         .collect();
 
         if !unsupported_options.is_empty() {
-            self.tcx.sess.emit_err(NakedFunctionsAsmOptions {
+            self.tcx.dcx().emit_err(NakedFunctionsAsmOptions {
                 span,
                 unsupported_options: unsupported_options.join(", "),
             });
@@ -269,7 +270,7 @@ impl<'tcx> CheckInlineAssembly<'tcx> {
                 .map_or_else(|| asm.template_strs.last().unwrap().2, |op| op.1)
                 .shrink_to_hi();
 
-            self.tcx.sess.emit_err(NakedFunctionsMustUseNoreturn { span, last_span });
+            self.tcx.dcx().emit_err(NakedFunctionsMustUseNoreturn { span, last_span });
         }
     }
 }
@@ -278,16 +279,16 @@ impl<'tcx> Visitor<'tcx> for CheckInlineAssembly<'tcx> {
     fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) {
         match stmt.kind {
             StmtKind::Item(..) => {}
-            StmtKind::Local(..) => {
+            StmtKind::Let(..) => {
                 self.items.push((ItemKind::NonAsm, stmt.span));
             }
-            StmtKind::Expr(ref expr) | StmtKind::Semi(ref expr) => {
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
                 self.check_expr(expr, stmt.span);
             }
         }
     }
 
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-        self.check_expr(&expr, expr.span);
+        self.check_expr(expr, expr.span);
     }
 }

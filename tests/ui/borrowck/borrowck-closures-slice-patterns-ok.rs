@@ -1,8 +1,9 @@
 // Check that closure captures for slice patterns are inferred correctly
 
 #![allow(unused_variables)]
+#![allow(dropping_references)]
 
-// run-pass
+//@ run-pass
 
 fn arr_by_ref(x: [String; 3]) {
     let r = &x;

@@ -1,5 +1,5 @@
 use crate::io::{self, BufWriter, IoSlice, Write};
-use crate::sys_common::memchr;
+use core::slice::memchr;
 
 /// Private helper struct for implementing the line-buffered writing logic.
 /// This shim temporarily wraps a BufWriter, and uses its internals to
@@ -11,11 +11,11 @@ use crate::sys_common::memchr;
 /// `BufWriters` to be temporarily given line-buffering logic; this is what
 /// enables Stdout to be alternately in line-buffered or block-buffered mode.
 #[derive(Debug)]
-pub struct LineWriterShim<'a, W: Write> {
+pub struct LineWriterShim<'a, W: ?Sized + Write> {
     buffer: &'a mut BufWriter<W>,
 }
 
-impl<'a, W: Write> LineWriterShim<'a, W> {
+impl<'a, W: ?Sized + Write> LineWriterShim<'a, W> {
     pub fn new(buffer: &'a mut BufWriter<W>) -> Self {
         Self { buffer }
     }
@@ -49,7 +49,7 @@ impl<'a, W: Write> LineWriterShim<'a, W> {
     }
 }
 
-impl<'a, W: Write> Write for LineWriterShim<'a, W> {
+impl<'a, W: ?Sized + Write> Write for LineWriterShim<'a, W> {
     /// Write some data into this BufReader with line buffering. This means
     /// that, if any newlines are present in the data, the data up to the last
     /// newline is sent directly to the underlying writer, and data after it
@@ -175,6 +175,10 @@ impl<'a, W: Write> Write for LineWriterShim<'a, W> {
         }
 
         // Find the buffer containing the last newline
+        // FIXME: This is overly slow if there are very many bufs and none contain
+        // newlines. e.g. writev() on Linux only writes up to 1024 slices, so
+        // scanning the rest is wasted effort. This makes write_all_vectored()
+        // quadratic.
         let last_newline_buf_idx = bufs
             .iter()
             .enumerate()
@@ -215,9 +219,14 @@ impl<'a, W: Write> Write for LineWriterShim<'a, W> {
 
         // Don't try to reconstruct the exact amount written; just bail
         // in the event of a partial write
-        let lines_len = lines.iter().map(|buf| buf.len()).sum();
-        if flushed < lines_len {
-            return Ok(flushed);
+        let mut lines_len: usize = 0;
+        for buf in lines {
+            // With overlapping/duplicate slices the total length may in theory
+            // exceed usize::MAX
+            lines_len = lines_len.saturating_add(buf.len());
+            if flushed < lines_len {
+                return Ok(flushed);
+            }
         }
 
         // Now that the write has succeeded, buffer the rest (or as much of the

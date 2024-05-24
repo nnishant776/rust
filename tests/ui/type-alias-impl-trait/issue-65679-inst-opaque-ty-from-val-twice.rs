@@ -1,4 +1,4 @@
-// check-pass
+//@ check-pass
 
 #![feature(type_alias_impl_trait, rustc_attrs)]
 
@@ -11,7 +11,9 @@ type T = impl Sized;
 
 fn take(_: fn() -> T) {}
 
-fn main() {
+fn bop(_: T) {
     take(|| {});
     take(|| {});
 }
+
+fn main() {}

@@ -3,8 +3,7 @@
 
 # This script computes the new "current" toolstate for the toolstate repo (not to be
 # confused with publishing the test results, which happens in `src/bootstrap/toolstate.rs`).
-# It gets called from `src/ci/publish_toolstate.sh` when a new commit lands on `master`
-# (i.e., after it passed all checks on `auto`).
+# It gets called from `src/ci/publish_toolstate.sh` at the end of an `auto` build.
 
 from __future__ import print_function
 
@@ -22,7 +21,7 @@ except ImportError:
     import urllib.request as urllib2
     from urllib.error import HTTPError
 try:
-    import typing
+    import typing # noqa: F401 FIXME: py2
 except ImportError:
     pass
 
@@ -86,7 +85,7 @@ def gh_url():
     return os.environ['TOOLSTATE_ISSUES_API_URL']
 
 
-def maybe_delink(message):
+def maybe_remove_mention(message):
     # type: (str) -> str
     if os.environ.get('TOOLSTATE_SKIP_MENTIONS') is not None:
         return message.replace("@", "")
@@ -109,7 +108,7 @@ def issue(
     else:
         status_description = 'no longer builds'
     request = json.dumps({
-        'body': maybe_delink(textwrap.dedent('''\
+        'body': maybe_remove_mention(textwrap.dedent('''\
         Hello, this is your friendly neighborhood mergebot.
         After merging PR {}, I observed that the tool {} {}.
         A follow-up PR to the repository {} is needed to fix the fallout.
@@ -152,8 +151,8 @@ def update_latest(
         latest = json.load(f, object_pairs_hook=collections.OrderedDict)
 
         current_status = {
-            os: read_current_status(current_commit, 'history/' + os + '.tsv')
-            for os in ['windows', 'linux']
+            os_: read_current_status(current_commit, 'history/' + os_ + '.tsv')
+            for os_ in ['windows', 'linux']
         }
 
         slug = 'rust-lang/rust'
@@ -170,10 +169,10 @@ def update_latest(
             changed = False
             create_issue_for_status = None  # set to the status that caused the issue
 
-            for os, s in current_status.items():
-                old = status[os]
+            for os_, s in current_status.items():
+                old = status[os_]
                 new = s.get(tool, old)
-                status[os] = new
+                status[os_] = new
                 maintainers = ' '.join('@'+name for name in MAINTAINERS.get(tool, ()))
                 # comparing the strings, but they are ordered appropriately:
                 # "test-pass" > "test-fail" > "build-fail"
@@ -181,12 +180,12 @@ def update_latest(
                     # things got fixed or at least the status quo improved
                     changed = True
                     message += '🎉 {} on {}: {} → {} (cc {}).\n' \
-                        .format(tool, os, old, new, maintainers)
+                        .format(tool, os_, old, new, maintainers)
                 elif new < old:
                     # tests or builds are failing and were not failing before
                     changed = True
                     title = '💔 {} on {}: {} → {}' \
-                        .format(tool, os, old, new)
+                        .format(tool, os_, old, new)
                     message += '{} (cc {}).\n' \
                         .format(title, maintainers)
                     # See if we need to create an issue.
@@ -285,7 +284,7 @@ try:
     issue_url = gh_url() + '/{}/comments'.format(number)
     response = urllib2.urlopen(urllib2.Request(
         issue_url,
-        json.dumps({'body': maybe_delink(message)}).encode(),
+        json.dumps({'body': maybe_remove_mention(message)}).encode(),
         {
             'Authorization': 'token ' + github_token,
             'Content-Type': 'application/json',

@@ -4,19 +4,17 @@ use crate::errors::{ConsiderBorrowingParamHelp, RelationshipHelp, TraitImplDiff}
 use crate::infer::error_reporting::nice_region_error::NiceRegionError;
 use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::{Subtype, ValuePairs};
-use crate::traits::ObligationCauseCode::CompareImplItemObligation;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
 use rustc_middle::hir::nested_filter;
+use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::ExpectedFound;
 use rustc_middle::ty::print::RegionHighlightMode;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitor};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitor};
 use rustc_span::Span;
-
-use std::ops::ControlFlow;
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// Print the error message for lifetime errors when the `impl` doesn't conform to the `trait`.
@@ -33,16 +31,17 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             _,
         ) = error.clone()
             && let (Subtype(sup_trace), Subtype(sub_trace)) = (&sup_origin, &sub_origin)
-            && let CompareImplItemObligation { trait_item_def_id, .. } = sub_trace.cause.code()
+            && let ObligationCauseCode::CompareImplItem { trait_item_def_id, .. } =
+                sub_trace.cause.code()
             && sub_trace.values == sup_trace.values
-            && let ValuePairs::Sigs(ExpectedFound { expected, found }) = sub_trace.values
+            && let ValuePairs::PolySigs(ExpectedFound { expected, found }) = sub_trace.values
         {
             // FIXME(compiler-errors): Don't like that this needs `Ty`s, but
             // all of the region highlighting machinery only deals with those.
             let guar = self.emit_err(
                 var_origin.span(),
-                self.cx.tcx.mk_fn_ptr(ty::Binder::dummy(expected)),
-                self.cx.tcx.mk_fn_ptr(ty::Binder::dummy(found)),
+                Ty::new_fn_ptr(self.cx.tcx, expected),
+                Ty::new_fn_ptr(self.cx.tcx, found),
                 *trait_item_def_id,
             );
             return Some(guar);
@@ -67,30 +66,29 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         }
 
         impl<'tcx> HighlightBuilder<'tcx> {
-            fn build(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> RegionHighlightMode<'tcx> {
+            fn build(ty: Ty<'tcx>) -> RegionHighlightMode<'tcx> {
                 let mut builder =
-                    HighlightBuilder { highlight: RegionHighlightMode::new(tcx), counter: 1 };
+                    HighlightBuilder { highlight: RegionHighlightMode::default(), counter: 1 };
                 builder.visit_ty(ty);
                 builder.highlight
             }
         }
 
         impl<'tcx> ty::visit::TypeVisitor<TyCtxt<'tcx>> for HighlightBuilder<'tcx> {
-            fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
+            fn visit_region(&mut self, r: ty::Region<'tcx>) {
                 if !r.has_name() && self.counter <= 3 {
                     self.highlight.highlighting_region(r, self.counter);
                     self.counter += 1;
                 }
-                r.super_visit_with(self)
             }
         }
 
-        let expected_highlight = HighlightBuilder::build(self.tcx(), expected);
+        let expected_highlight = HighlightBuilder::build(expected);
         let expected = self
             .cx
             .extract_inference_diagnostics_data(expected.into(), Some(expected_highlight))
             .name;
-        let found_highlight = HighlightBuilder::build(self.tcx(), found);
+        let found_highlight = HighlightBuilder::build(found);
         let found =
             self.cx.extract_inference_diagnostics_data(found.into(), Some(found_highlight)).name;
 
@@ -101,7 +99,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             ty::AssocKind::Fn => {
                 let hir = self.tcx().hir();
                 if let Some(hir_id) =
-                    assoc_item.def_id.as_local().map(|id| hir.local_def_id_to_hir_id(id))
+                    assoc_item.def_id.as_local().map(|id| self.tcx().local_def_id_to_hir_id(id))
                 {
                     if let Some(decl) = hir.fn_decl_by_hir_id(hir_id) {
                         visitor.visit_fn_decl(decl);
@@ -121,7 +119,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             found,
         };
 
-        self.tcx().sess.emit_err(diag)
+        self.tcx().dcx().emit_err(diag)
     }
 }
 

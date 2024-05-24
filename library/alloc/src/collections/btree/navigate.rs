@@ -19,6 +19,12 @@ impl<'a, K: 'a, V: 'a> Clone for LeafRange<marker::Immut<'a>, K, V> {
     }
 }
 
+impl<B, K, V> Default for LeafRange<B, K, V> {
+    fn default() -> Self {
+        LeafRange { front: None, back: None }
+    }
+}
+
 impl<BorrowType, K, V> LeafRange<BorrowType, K, V> {
     pub fn none() -> Self {
         LeafRange { front: None, back: None }
@@ -122,6 +128,12 @@ impl<BorrowType, K, V> LazyLeafHandle<BorrowType, K, V> {
 pub struct LazyLeafRange<BorrowType, K, V> {
     front: Option<LazyLeafHandle<BorrowType, K, V>>,
     back: Option<LazyLeafHandle<BorrowType, K, V>>,
+}
+
+impl<B, K, V> Default for LazyLeafRange<B, K, V> {
+    fn default() -> Self {
+        LazyLeafRange { front: None, back: None }
+    }
 }
 
 impl<'a, K: 'a, V: 'a> Clone for LazyLeafRange<marker::Immut<'a>, K, V> {
@@ -643,7 +655,7 @@ impl<BorrowType: marker::BorrowType, K, V> NodeRef<BorrowType, K, V, marker::Lea
 pub enum Position<BorrowType, K, V> {
     Leaf(NodeRef<BorrowType, K, V, marker::Leaf>),
     Internal(NodeRef<BorrowType, K, V, marker::Internal>),
-    InternalKV(Handle<NodeRef<BorrowType, K, V, marker::Internal>, marker::KV>),
+    InternalKV,
 }
 
 impl<'a, K: 'a, V: 'a> NodeRef<marker::Immut<'a>, K, V, marker::LeafOrInternal> {
@@ -665,7 +677,7 @@ impl<'a, K: 'a, V: 'a> NodeRef<marker::Immut<'a>, K, V, marker::LeafOrInternal> 
                             visit(Position::Leaf(leaf));
                             match edge.next_kv() {
                                 Ok(kv) => {
-                                    visit(Position::InternalKV(kv));
+                                    visit(Position::InternalKV);
                                     kv.right_edge()
                                 }
                                 Err(_) => return,
@@ -687,7 +699,7 @@ impl<'a, K: 'a, V: 'a> NodeRef<marker::Immut<'a>, K, V, marker::LeafOrInternal> 
         self.visit_nodes_in_order(|pos| match pos {
             Position::Leaf(node) => result += node.len(),
             Position::Internal(node) => result += node.len(),
-            Position::InternalKV(_) => (),
+            Position::InternalKV => (),
         });
         result
     }

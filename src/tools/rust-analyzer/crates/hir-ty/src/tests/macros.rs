@@ -64,7 +64,7 @@ fn infer_macros_expanded() {
         "#,
         expect![[r#"
             !0..17 '{Foo(v...,2,])}': Foo
-            !1..4 'Foo': Foo({unknown}) -> Foo
+            !1..4 'Foo': extern "rust-call" Foo({unknown}) -> Foo
             !1..16 'Foo(vec![1,2,])': Foo
             !5..15 'vec![1,2,]': {unknown}
             155..181 '{     ...,2); }': ()
@@ -97,7 +97,7 @@ fn infer_legacy_textual_scoped_macros_expanded() {
         "#,
         expect![[r#"
             !0..17 '{Foo(v...,2,])}': Foo
-            !1..4 'Foo': Foo({unknown}) -> Foo
+            !1..4 'Foo': extern "rust-call" Foo({unknown}) -> Foo
             !1..16 'Foo(vec![1,2,])': Foo
             !5..15 'vec![1,2,]': {unknown}
             194..250 '{     ...,2); }': ()
@@ -140,6 +140,7 @@ fn infer_path_qualified_macros_expanded() {
 fn expr_macro_def_expanded_in_various_places() {
     check_infer(
         r#"
+        //- minicore: iterator
         macro spam() {
             1isize
         }
@@ -195,10 +196,21 @@ fn expr_macro_def_expanded_in_various_places() {
             !0..6 '1isize': isize
             39..442 '{     ...!(); }': ()
             73..94 'spam!(...am!())': {unknown}
+            100..119 'for _ ...!() {}': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
+            100..119 'for _ ...!() {}': IntoIterator::IntoIter<isize>
+            100..119 'for _ ...!() {}': !
+            100..119 'for _ ...!() {}': IntoIterator::IntoIter<isize>
+            100..119 'for _ ...!() {}': &'? mut IntoIterator::IntoIter<isize>
+            100..119 'for _ ...!() {}': fn next<IntoIterator::IntoIter<isize>>(&'? mut IntoIterator::IntoIter<isize>) -> Option<<IntoIterator::IntoIter<isize> as Iterator>::Item>
+            100..119 'for _ ...!() {}': Option<IntoIterator::Item<isize>>
             100..119 'for _ ...!() {}': ()
-            104..105 '_': {unknown}
+            100..119 'for _ ...!() {}': ()
+            100..119 'for _ ...!() {}': ()
+            104..105 '_': IntoIterator::Item<isize>
             117..119 '{}': ()
-            124..134 '|| spam!()': || -> isize
+            124..134 '|| spam!()': impl Fn() -> isize
+            140..156 'while ...!() {}': !
+            140..156 'while ...!() {}': ()
             140..156 'while ...!() {}': ()
             154..156 '{}': ()
             161..174 'break spam!()': !
@@ -209,7 +221,7 @@ fn expr_macro_def_expanded_in_various_places() {
             281..303 'Spam {...m!() }': {unknown}
             309..325 'spam!(...am!()]': {unknown}
             350..366 'spam!(... usize': usize
-            372..380 '&spam!()': &isize
+            372..380 '&spam!()': &'? isize
             386..394 '-spam!()': isize
             400..416 'spam!(...pam!()': {unknown}
             422..439 'spam!(...pam!()': isize
@@ -221,6 +233,7 @@ fn expr_macro_def_expanded_in_various_places() {
 fn expr_macro_rules_expanded_in_various_places() {
     check_infer(
         r#"
+        //- minicore: iterator
         macro_rules! spam {
             () => (1isize);
         }
@@ -276,10 +289,21 @@ fn expr_macro_rules_expanded_in_various_places() {
             !0..6 '1isize': isize
             53..456 '{     ...!(); }': ()
             87..108 'spam!(...am!())': {unknown}
+            114..133 'for _ ...!() {}': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
+            114..133 'for _ ...!() {}': IntoIterator::IntoIter<isize>
+            114..133 'for _ ...!() {}': !
+            114..133 'for _ ...!() {}': IntoIterator::IntoIter<isize>
+            114..133 'for _ ...!() {}': &'? mut IntoIterator::IntoIter<isize>
+            114..133 'for _ ...!() {}': fn next<IntoIterator::IntoIter<isize>>(&'? mut IntoIterator::IntoIter<isize>) -> Option<<IntoIterator::IntoIter<isize> as Iterator>::Item>
+            114..133 'for _ ...!() {}': Option<IntoIterator::Item<isize>>
             114..133 'for _ ...!() {}': ()
-            118..119 '_': {unknown}
+            114..133 'for _ ...!() {}': ()
+            114..133 'for _ ...!() {}': ()
+            118..119 '_': IntoIterator::Item<isize>
             131..133 '{}': ()
-            138..148 '|| spam!()': || -> isize
+            138..148 '|| spam!()': impl Fn() -> isize
+            154..170 'while ...!() {}': !
+            154..170 'while ...!() {}': ()
             154..170 'while ...!() {}': ()
             168..170 '{}': ()
             175..188 'break spam!()': !
@@ -290,7 +314,7 @@ fn expr_macro_rules_expanded_in_various_places() {
             295..317 'Spam {...m!() }': {unknown}
             323..339 'spam!(...am!()]': {unknown}
             364..380 'spam!(... usize': usize
-            386..394 '&spam!()': &isize
+            386..394 '&spam!()': &'? isize
             400..408 '-spam!()': isize
             414..430 'spam!(...pam!()': {unknown}
             436..453 'spam!(...pam!()': isize
@@ -515,7 +539,7 @@ fn test() {
     let msg = foo::Message(foo::MessageRef);
     let r = msg.deref();
     r;
-  //^ &MessageRef
+  //^ &'? MessageRef
 }
 
 //- /lib.rs crate:foo
@@ -660,9 +684,9 @@ fn infer_builtin_macros_line() {
         }
         "#,
         expect![[r#"
-            !0..1 '0': i32
+            !0..4 '0u32': u32
             63..87 '{     ...!(); }': ()
-            73..74 'x': i32
+            73..74 'x': u32
         "#]],
     );
 }
@@ -679,9 +703,9 @@ fn infer_builtin_macros_file() {
         }
         "#,
         expect![[r#"
-            !0..2 '""': &str
+            !0..2 '""': &'static str
             63..87 '{     ...!(); }': ()
-            73..74 'x': &str
+            73..74 'x': &'static str
         "#]],
     );
 }
@@ -698,9 +722,9 @@ fn infer_builtin_macros_column() {
         }
         "#,
         expect![[r#"
-            !0..1 '0': i32
+            !0..4 '0u32': u32
             65..91 '{     ...!(); }': ()
-            75..76 'x': i32
+            75..76 'x': u32
         "#]],
     );
 }
@@ -717,9 +741,9 @@ fn infer_builtin_macros_concat() {
         }
         "#,
         expect![[r#"
-            !0..13 '"helloworld!"': &str
+            !0..13 '"helloworld!"': &'static str
             65..121 '{     ...")); }': ()
-            75..76 'x': &str
+            75..76 'x': &'static str
         "#]],
     );
 }
@@ -796,7 +820,7 @@ macro_rules! include_str {() => {}}
 fn main() {
     let a = include_str!("foo.rs");
     a;
-} //^ &str
+} //^ &'static str
 
 //- /foo.rs
 hello
@@ -823,7 +847,7 @@ macro_rules! m {
 fn main() {
     let a = include_str!(m!(".rs"));
     a;
-} //^ &str
+} //^ &'static str
 
 //- /foo.rs
 hello
@@ -936,16 +960,16 @@ fn infer_builtin_macros_concat_with_lazy() {
         }
         "#,
         expect![[r#"
-            !0..13 '"helloworld!"': &str
+            !0..13 '"helloworld!"': &'static str
             103..160 '{     ...")); }': ()
-            113..114 'x': &str
+            113..114 'x': &'static str
         "#]],
     );
 }
 
 #[test]
 fn infer_builtin_macros_env() {
-    check_infer(
+    check_types(
         r#"
         //- /main.rs env:foo=bar
         #[rustc_builtin_macro]
@@ -953,13 +977,23 @@ fn infer_builtin_macros_env() {
 
         fn main() {
             let x = env!("foo");
+              //^ &'static str
         }
         "#,
-        expect![[r#"
-            !0..22 '"__RA_...TED__"': &str
-            62..90 '{     ...o"); }': ()
-            72..73 'x': &str
-        "#]],
+    );
+}
+
+#[test]
+fn infer_builtin_macros_option_env() {
+    check_types(
+        r#"
+//- minicore: env
+//- /main.rs env:foo=bar
+fn main() {
+    let x = option_env!("foo");
+      //^ Option<&'static str>
+}
+        "#,
     );
 }
 
@@ -968,6 +1002,21 @@ fn infer_derive_clone_simple() {
     check_types(
         r#"
 //- minicore: derive, clone
+#[derive(Clone)]
+struct S;
+fn test() {
+    S.clone();
+} //^^^^^^^^^ S
+"#,
+    );
+}
+
+#[test]
+fn infer_builtin_derive_resolves_with_core_module() {
+    check_types(
+        r#"
+//- minicore: derive, clone
+mod core {}
 #[derive(Clone)]
 struct S;
 fn test() {
@@ -1321,6 +1370,37 @@ trait Foo {
 #![crate_type="proc-macro"]
 #[proc_macro_attribute]
 pub fn attr_macro() {}
+"#,
+    );
+}
+
+#[test]
+fn clone_with_type_bound() {
+    check_types(
+        r#"
+//- minicore: derive, clone, builtin_impls
+#[derive(Clone)]
+struct Float;
+
+trait TensorKind: Clone {
+    /// The primitive type of the tensor.
+    type Primitive: Clone;
+}
+
+impl TensorKind for Float {
+    type Primitive = f64;
+}
+
+#[derive(Clone)]
+struct Tensor<K = Float> where K: TensorKind
+{
+    primitive: K::Primitive,
+}
+
+fn foo(t: Tensor) {
+    let x = t.clone();
+      //^ Tensor<Float>
+}
 "#,
     );
 }

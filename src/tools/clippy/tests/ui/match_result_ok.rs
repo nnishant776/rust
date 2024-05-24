@@ -1,7 +1,6 @@
-// run-rustfix
 #![warn(clippy::match_result_ok)]
 #![allow(dead_code)]
-#![allow(clippy::boxed_local, clippy::uninlined_format_args)]
+#![allow(clippy::boxed_local, clippy::uninlined_format_args, clippy::manual_unwrap_or_default)]
 
 // Checking `if` cases
 

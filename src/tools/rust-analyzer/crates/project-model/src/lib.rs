@@ -15,28 +15,30 @@
 //!   procedural macros).
 //! * Lowering of concrete model to a [`base_db::CrateGraph`]
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
-mod manifest_path;
-mod cargo_workspace;
-mod cfg_flag;
-mod project_json;
-mod sysroot;
-mod workspace;
-mod rustc_cfg;
 mod build_scripts;
+mod cargo_workspace;
+mod cfg;
+mod env;
+mod manifest_path;
+mod project_json;
+mod rustc_cfg;
+mod sysroot;
 pub mod target_data_layout;
+mod workspace;
 
 #[cfg(test)]
 mod tests;
 
 use std::{
+    fmt,
     fs::{self, read_dir, ReadDir},
     io,
     process::Command,
 };
 
-use anyhow::{bail, format_err, Context, Result};
+use anyhow::{bail, format_err, Context};
 use paths::{AbsPath, AbsPathBuf};
 use rustc_hash::FxHashSet;
 
@@ -44,34 +46,40 @@ pub use crate::{
     build_scripts::WorkspaceBuildScripts,
     cargo_workspace::{
         CargoConfig, CargoFeatures, CargoWorkspace, Package, PackageData, PackageDependency,
-        RustcSource, Target, TargetData, TargetKind, UnsetTestCrates,
+        RustLibSource, Target, TargetData, TargetKind,
     },
+    cfg::CfgOverrides,
     manifest_path::ManifestPath,
     project_json::{ProjectJson, ProjectJsonData},
     sysroot::Sysroot,
-    workspace::{CfgOverrides, PackageRoot, ProjectWorkspace},
+    workspace::{FileLoader, PackageRoot, ProjectWorkspace, ProjectWorkspaceKind},
 };
+pub use cargo_metadata::Metadata;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum ProjectManifest {
     ProjectJson(ManifestPath),
     CargoToml(ManifestPath),
+    CargoScript(ManifestPath),
 }
 
 impl ProjectManifest {
-    pub fn from_manifest_file(path: AbsPathBuf) -> Result<ProjectManifest> {
+    pub fn from_manifest_file(path: AbsPathBuf) -> anyhow::Result<ProjectManifest> {
         let path = ManifestPath::try_from(path)
-            .map_err(|path| format_err!("bad manifest path: {}", path.display()))?;
+            .map_err(|path| format_err!("bad manifest path: {path}"))?;
         if path.file_name().unwrap_or_default() == "rust-project.json" {
             return Ok(ProjectManifest::ProjectJson(path));
         }
         if path.file_name().unwrap_or_default() == "Cargo.toml" {
             return Ok(ProjectManifest::CargoToml(path));
         }
-        bail!("project root must point to Cargo.toml or rust-project.json: {}", path.display());
+        if path.extension().unwrap_or_default() == "rs" {
+            return Ok(ProjectManifest::CargoScript(path));
+        }
+        bail!("project root must point to a Cargo.toml, rust-project.json or <script>.rs file: {path}");
     }
 
-    pub fn discover_single(path: &AbsPath) -> Result<ProjectManifest> {
+    pub fn discover_single(path: &AbsPath) -> anyhow::Result<ProjectManifest> {
         let mut candidates = ProjectManifest::discover(path)?;
         let res = match candidates.pop() {
             None => bail!("no projects"),
@@ -126,8 +134,8 @@ impl ProjectManifest {
                 .filter_map(Result::ok)
                 .map(|it| it.path().join("Cargo.toml"))
                 .filter(|it| it.exists())
-                .map(AbsPathBuf::assert)
-                .filter_map(|it| it.try_into().ok())
+                .map(AbsPathBuf::try_from)
+                .filter_map(|it| it.ok()?.try_into().ok())
                 .collect()
         }
     }
@@ -143,9 +151,23 @@ impl ProjectManifest {
         res.sort();
         res
     }
+
+    pub fn manifest_path(&self) -> &ManifestPath {
+        match self {
+            ProjectManifest::ProjectJson(it)
+            | ProjectManifest::CargoToml(it)
+            | ProjectManifest::CargoScript(it) => it,
+        }
+    }
 }
 
-fn utf8_stdout(mut cmd: Command) -> Result<String> {
+impl fmt::Display for ProjectManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.manifest_path(), f)
+    }
+}
+
+fn utf8_stdout(mut cmd: Command) -> anyhow::Result<String> {
     let output = cmd.output().with_context(|| format!("{cmd:?} failed"))?;
     if !output.status.success() {
         match String::from_utf8(output.stderr) {
@@ -156,7 +178,7 @@ fn utf8_stdout(mut cmd: Command) -> Result<String> {
         }
     }
     let stdout = String::from_utf8(output.stdout)?;
-    Ok(stdout.trim().to_string())
+    Ok(stdout.trim().to_owned())
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

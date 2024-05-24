@@ -1,4 +1,4 @@
-use rustc_macros::Diagnostic;
+use rustc_macros::{Diagnostic, Subdiagnostic};
 
 #[derive(Diagnostic)]
 #[diag(driver_impl_rlink_unable_to_read)]
@@ -33,10 +33,9 @@ pub(crate) struct RLinkRustcVersionMismatch<'a> {
 pub(crate) struct RlinkNotAFile;
 
 #[derive(Diagnostic)]
-#[diag(driver_impl_unpretty_dump_fail)]
-pub(crate) struct UnprettyDumpFail {
-    pub path: String,
-    pub err: String,
+#[diag(driver_impl_rlink_corrupt_file)]
+pub(crate) struct RlinkCorruptFile<'a> {
+    pub file: &'a std::path::Path,
 }
 
 #[derive(Diagnostic)]
@@ -50,10 +49,39 @@ pub(crate) struct IceBugReport<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag(driver_impl_ice_bug_report_update_note)]
+pub(crate) struct UpdateNightlyNote;
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_ice_bug_report_internal_feature)]
+pub(crate) struct IceBugReportInternalFeature;
+
+#[derive(Diagnostic)]
 #[diag(driver_impl_ice_version)]
 pub(crate) struct IceVersion<'a> {
     pub version: &'a str,
     pub triple: &'a str,
+}
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_ice_path)]
+pub(crate) struct IcePath {
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_ice_path_error)]
+pub(crate) struct IcePathError {
+    pub path: std::path::PathBuf,
+    pub error: String,
+    #[subdiagnostic]
+    pub env_var: Option<IcePathErrorEnv>,
+}
+
+#[derive(Subdiagnostic)]
+#[note(driver_impl_ice_path_error_env)]
+pub(crate) struct IcePathErrorEnv {
+    pub env_var: std::path::PathBuf,
 }
 
 #[derive(Diagnostic)]

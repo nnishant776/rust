@@ -8,15 +8,15 @@ use rustc_span::symbol::sym;
 use rustc_span::Span;
 use thin_vec::thin_vec;
 
-pub fn expand_deriving_partial_eq(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_deriving_partial_eq(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
     push: &mut dyn FnMut(Annotatable),
     is_const: bool,
 ) {
-    fn cs_eq(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
+    fn cs_eq(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
         let base = true;
         let expr = cs_fold(
             true, // use foldl
@@ -26,11 +26,12 @@ pub fn expand_deriving_partial_eq(
             |cx, fold| match fold {
                 CsFold::Single(field) => {
                     let [other_expr] = &field.other_selflike_exprs[..] else {
-                        cx.span_bug(field.span, "not exactly 2 arguments in `derive(PartialEq)`");
+                        cx.dcx()
+                            .span_bug(field.span, "not exactly 2 arguments in `derive(PartialEq)`");
                     };
 
                     // We received arguments of type `&T`. Convert them to type `T` by stripping
-                    // any leading `&` or adding `*`. This isn't necessary for type checking, but
+                    // any leading `&`. This isn't necessary for type checking, but
                     // it results in better error messages if something goes wrong.
                     //
                     // Note: for arguments that look like `&{ x }`, which occur with packed
@@ -52,8 +53,7 @@ pub fn expand_deriving_partial_eq(
                                 inner.clone()
                             }
                         } else {
-                            // No leading `&`: add a leading `*`.
-                            cx.expr_deref(field.span, expr.clone())
+                            expr.clone()
                         }
                     };
                     cx.expr_binary(
@@ -72,24 +72,30 @@ pub fn expand_deriving_partial_eq(
         BlockOrExpr::new_expr(expr)
     }
 
-    super::inject_impl_of_structural_trait(
-        cx,
+    let structural_trait_def = TraitDef {
         span,
-        item,
-        path_std!(marker::StructuralPartialEq),
-        push,
-    );
+        path: path_std!(marker::StructuralPartialEq),
+        skip_path_as_bound: true, // crucial!
+        needs_copy_as_bound_if_packed: false,
+        additional_bounds: Vec::new(),
+        // We really don't support unions, but that's already checked by the impl generated below;
+        // a second check here would lead to redundant error messages.
+        supports_unions: true,
+        methods: Vec::new(),
+        associated_types: Vec::new(),
+        is_const: false,
+    };
+    structural_trait_def.expand(cx, mitem, item, push);
 
     // No need to generate `ne`, the default suffices, and not generating it is
     // faster.
-    let attrs = thin_vec![cx.attr_word(sym::inline, span)];
     let methods = vec![MethodDef {
         name: sym::eq,
         generics: Bounds::empty(),
         explicit_self: true,
         nonself_args: vec![(self_ref(), sym::other)],
         ret_ty: Path(path_local!(bool)),
-        attributes: attrs,
+        attributes: thin_vec![cx.attr_word(sym::inline, span)],
         fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
         combine_substructure: combine_substructure(Box::new(|a, b, c| cs_eq(a, b, c))),
     }];

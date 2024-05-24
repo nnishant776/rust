@@ -6,7 +6,14 @@ use std::env;
 use std::path::Path;
 
 fn main() {
-    let target = env::var("TARGET").expect("TARGET was not set");
+    println!("cargo:rerun-if-env-changed=LLVM_PROFILER_RT_LIB");
+    if let Ok(rt) = env::var("LLVM_PROFILER_RT_LIB") {
+        println!("cargo:rustc-link-lib=static:+verbatim={rt}");
+        return;
+    }
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV was not set");
     let cfg = &mut cc::Build::new();
 
     // FIXME: `rerun-if-changed` directives are not currently emitted and the build script
@@ -19,6 +26,7 @@ fn main() {
         "InstrProfilingMerge.c",
         "InstrProfilingMergeFile.c",
         "InstrProfilingNameVar.c",
+        "InstrProfilingPlatformAIX.c",
         "InstrProfilingPlatformDarwin.c",
         "InstrProfilingPlatformFuchsia.c",
         "InstrProfilingPlatformLinux.c",
@@ -34,7 +42,7 @@ fn main() {
         "InstrProfilingBiasVar.c",
     ];
 
-    if target.contains("msvc") {
+    if target_env == "msvc" {
         // Don't pull in extra libraries on MSVC
         cfg.flag("/Zl");
         profile_sources.push("WindowsMMap.c");
@@ -49,7 +57,7 @@ fn main() {
         cfg.flag("-fno-builtin");
         cfg.flag("-fomit-frame-pointer");
         cfg.define("VISIBILITY_HIDDEN", None);
-        if !target.contains("windows") {
+        if target_os != "windows" {
             cfg.flag("-fvisibility=hidden");
             cfg.define("COMPILER_RT_HAS_UNAME", Some("1"));
         } else {

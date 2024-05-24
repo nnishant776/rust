@@ -31,7 +31,7 @@ Rust's source-based code coverage requires the Rust "profiler runtime". Without 
 
 The Rust `nightly` distribution channel includes the profiler runtime, by default.
 
-> **Important**: If you are building the Rust compiler from the source distribution, the profiler runtime is _not_ enabled in the default `config.toml.example`. Edit your `config.toml` file and ensure the `profiler` feature is set it to `true` (either under the `[build]` section, or under the settings for an individual `[target.<triple>]`):
+> **Important**: If you are building the Rust compiler from the source distribution, the profiler runtime is _not_ enabled in the default `config.example.toml`. Edit your `config.toml` file and ensure the `profiler` feature is set it to `true` (either under the `[build]` section, or under the settings for an individual `[target.<triple>]`):
 >
 > ```toml
 > # Build the profiler runtime (required when compiling with options that depend
@@ -117,7 +117,7 @@ $ ls formatjson5.profraw
 formatjson5.profraw
 ```
 
-If `LLVM_PROFILE_FILE` contains a path to a non-existent directory, the missing directory structure will be created. Additionally, the following special pattern strings are rewritten:
+If `LLVM_PROFILE_FILE` contains a path to a nonexistent directory, the missing directory structure will be created. Additionally, the following special pattern strings are rewritten:
 
 -   `%p` - The process ID.
 -   `%h` - The hostname of the machine running the program.
@@ -173,9 +173,9 @@ Some of the more notable options in this example include:
 [`llvm-cov report`]: https://llvm.org/docs/CommandGuide/llvm-cov.html#llvm-cov-report
 [`llvm-cov show`]: https://llvm.org/docs/CommandGuide/llvm-cov.html#llvm-cov-show
 
-> **Note**: Coverage can also be disabled on an individual function by annotating the function with the [`no_coverage` attribute] (which requires the feature flag `#![feature(no_coverage)]`).
+> **Note**: Coverage can also be disabled on an individual function by annotating the function with the [`coverage(off)` attribute] (which requires the feature flag `#![feature(coverage)]`).
 
-[`no_coverage` attribute]: ../unstable-book/language-features/no-coverage.html
+[`coverage` attribute]: ../unstable-book/language-features/coverage.html
 
 ## Interpreting reports
 
@@ -331,10 +331,24 @@ $ llvm-cov report \
 
 ## `-C instrument-coverage=<options>`
 
--   `-C instrument-coverage=all`: Instrument all functions, including unused functions and unused generics. (This is the same as `-C instrument-coverage`, with no value.)
--   `-C instrument-coverage=off`: Do not instrument any functions. (This is the same as simply not including the `-C instrument-coverage` option.)
--   `-Zunstable-options -C instrument-coverage=except-unused-generics`: Instrument all functions except unused generics.
--   `-Zunstable-options -C instrument-coverage=except-unused-functions`: Instrument only used (called) functions and instantiated generic functions.
+- `-C instrument-coverage=no` (or `n`/`off`/`false`):
+  Don't enable coverage instrumentation. No functions will be instrumented for coverage.
+  - This is the same as not using the `-C instrument-coverage` flag at all.
+- `-C instrument-coverage=yes` (or `y`/`on`/`true`):
+  Enable coverage instrumentation with the default behaviour.
+  Currently this instruments all functions, including unused functions and unused generics.
+  - This is the same as `-C instrument-coverage` with no value.
+
+### Other values
+
+- `-C instrument-coverage=all`:
+  Currently an alias for `yes`, but may behave differently in the future if
+  more fine-grained coverage options are added.
+  Using this value is currently not recommended.
+
+## `-Z coverage-options=<options>`
+
+[This unstable option is described in the Unstable Book.](../unstable-book/compiler-flags/coverage-options.html)
 
 ## Other references
 

@@ -2,7 +2,7 @@
 
 use crate::ast::{AttrArgs, AttrArgsEq, AttrId, AttrItem, AttrKind, AttrStyle, AttrVec, Attribute};
 use crate::ast::{DelimArgs, Expr, ExprKind, LitKind, MetaItemLit};
-use crate::ast::{MacDelimiter, MetaItem, MetaItemKind, NestedMetaItem, NormalAttr};
+use crate::ast::{MetaItem, MetaItemKind, NestedMetaItem, NormalAttr};
 use crate::ast::{Path, PathSegment, DUMMY_NODE_ID};
 use crate::ptr::P;
 use crate::token::{self, CommentKind, Delimiter, Token};
@@ -10,15 +10,11 @@ use crate::tokenstream::{DelimSpan, Spacing, TokenTree};
 use crate::tokenstream::{LazyAttrTokenStream, TokenStream};
 use crate::util::comments;
 use crate::util::literal::escape_string_symbol;
-use rustc_data_structures::sync::WorkerLocal;
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
-use std::cell::Cell;
+use smallvec::{smallvec, SmallVec};
 use std::iter;
-#[cfg(debug_assertions)]
-use std::ops::BitXor;
-#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use thin_vec::{thin_vec, ThinVec};
 
@@ -40,39 +36,16 @@ impl MarkedAttrs {
     }
 }
 
-pub struct AttrIdGenerator(WorkerLocal<Cell<u32>>);
-
-#[cfg(debug_assertions)]
-static MAX_ATTR_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+pub struct AttrIdGenerator(AtomicU32);
 
 impl AttrIdGenerator {
     pub fn new() -> Self {
-        // We use `(index as u32).reverse_bits()` to initialize the
-        // starting value of AttrId in each worker thread.
-        // The `index` is the index of the worker thread.
-        // This ensures that the AttrId generated in each thread is unique.
-        AttrIdGenerator(WorkerLocal::new(|index| {
-            let index: u32 = index.try_into().unwrap();
-
-            #[cfg(debug_assertions)]
-            {
-                let max_id = ((index + 1).next_power_of_two() - 1).bitxor(u32::MAX).reverse_bits();
-                MAX_ATTR_ID.fetch_min(max_id, Ordering::Release);
-            }
-
-            Cell::new(index.reverse_bits())
-        }))
+        AttrIdGenerator(AtomicU32::new(0))
     }
 
     pub fn mk_attr_id(&self) -> AttrId {
-        let id = self.0.get();
-
-        // Ensure the assigned attr_id does not overlap the bits
-        // representing the number of threads.
-        #[cfg(debug_assertions)]
-        assert!(id <= MAX_ATTR_ID.load(Ordering::Acquire));
-
-        self.0.set(id + 1);
+        let id = self.0.fetch_add(1, Ordering::Relaxed);
+        assert!(id != u32::MAX);
         AttrId::from_u32(id)
     }
 }
@@ -115,14 +88,40 @@ impl Attribute {
             AttrKind::DocComment(..) => None,
         }
     }
+
     pub fn name_or_empty(&self) -> Symbol {
         self.ident().unwrap_or_else(Ident::empty).name
+    }
+
+    pub fn path(&self) -> SmallVec<[Symbol; 1]> {
+        match &self.kind {
+            AttrKind::Normal(normal) => {
+                normal.item.path.segments.iter().map(|s| s.ident.name).collect()
+            }
+            AttrKind::DocComment(..) => smallvec![sym::doc],
+        }
     }
 
     #[inline]
     pub fn has_name(&self, name: Symbol) -> bool {
         match &self.kind {
             AttrKind::Normal(normal) => normal.item.path == name,
+            AttrKind::DocComment(..) => false,
+        }
+    }
+
+    pub fn path_matches(&self, name: &[Symbol]) -> bool {
+        match &self.kind {
+            AttrKind::Normal(normal) => {
+                normal.item.path.segments.len() == name.len()
+                    && normal
+                        .item
+                        .path
+                        .segments
+                        .iter()
+                        .zip(name)
+                        .all(|(s, n)| s.args.is_none() && s.ident.name == *n)
+            }
             AttrKind::DocComment(..) => false,
         }
     }
@@ -177,7 +176,13 @@ impl Attribute {
     }
 
     pub fn may_have_doc_links(&self) -> bool {
-        self.doc_str().map_or(false, |s| comments::may_have_doc_links(s.as_str()))
+        self.doc_str().is_some_and(|s| comments::may_have_doc_links(s.as_str()))
+    }
+
+    pub fn is_proc_macro_attr(&self) -> bool {
+        [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
+            .iter()
+            .any(|kind| self.has_name(*kind))
     }
 
     /// Extracts the MetaItem from inside this Attribute.
@@ -203,10 +208,10 @@ impl Attribute {
                 .unwrap_or_else(|| panic!("attribute is missing tokens: {self:?}"))
                 .to_attr_token_stream()
                 .to_tokenstream(),
-            &AttrKind::DocComment(comment_kind, data) => TokenStream::new(vec![TokenTree::Token(
-                Token::new(token::DocComment(comment_kind, self.style, data), self.span),
-                Spacing::Alone,
-            )]),
+            &AttrKind::DocComment(comment_kind, data) => TokenStream::token_alone(
+                token::DocComment(comment_kind, self.style, data),
+                self.span,
+            ),
         }
     }
 }
@@ -218,7 +223,7 @@ impl AttrItem {
 
     fn meta_item_list(&self) -> Option<ThinVec<NestedMetaItem>> {
         match &self.args {
-            AttrArgs::Delimited(args) if args.delim == MacDelimiter::Parenthesis => {
+            AttrArgs::Delimited(args) if args.delim == Delimiter::Parenthesis => {
                 MetaItemKind::list_from_tokens(args.tokens.clone())
             }
             AttrArgs::Delimited(_) | AttrArgs::Eq(..) | AttrArgs::Empty => None,
@@ -304,21 +309,24 @@ impl MetaItem {
     }
 
     pub fn value_str(&self) -> Option<Symbol> {
-        self.kind.value_str()
+        match &self.kind {
+            MetaItemKind::NameValue(v) => v.kind.str(),
+            _ => None,
+        }
     }
 
-    fn from_tokens<I>(tokens: &mut iter::Peekable<I>) -> Option<MetaItem>
+    fn from_tokens<'a, I>(tokens: &mut iter::Peekable<I>) -> Option<MetaItem>
     where
-        I: Iterator<Item = TokenTree>,
+        I: Iterator<Item = &'a TokenTree>,
     {
         // FIXME: Share code with `parse_path`.
-        let path = match tokens.next().map(TokenTree::uninterpolate) {
-            Some(TokenTree::Token(
-                Token { kind: kind @ (token::Ident(..) | token::ModSep), span },
+        let path = match tokens.next().map(|tt| TokenTree::uninterpolate(tt)).as_deref() {
+            Some(&TokenTree::Token(
+                Token { kind: ref kind @ (token::Ident(..) | token::PathSep), span },
                 _,
             )) => 'arm: {
-                let mut segments = if let token::Ident(name, _) = kind {
-                    if let Some(TokenTree::Token(Token { kind: token::ModSep, .. }, _)) =
+                let mut segments = if let &token::Ident(name, _) = kind {
+                    if let Some(TokenTree::Token(Token { kind: token::PathSep, .. }, _)) =
                         tokens.peek()
                     {
                         tokens.next();
@@ -330,14 +338,14 @@ impl MetaItem {
                     thin_vec![PathSegment::path_root(span)]
                 };
                 loop {
-                    if let Some(TokenTree::Token(Token { kind: token::Ident(name, _), span }, _)) =
-                        tokens.next().map(TokenTree::uninterpolate)
+                    if let Some(&TokenTree::Token(Token { kind: token::Ident(name, _), span }, _)) =
+                        tokens.next().map(|tt| TokenTree::uninterpolate(tt)).as_deref()
                     {
                         segments.push(PathSegment::from_ident(Ident::new(name, span)));
                     } else {
                         return None;
                     }
-                    if let Some(TokenTree::Token(Token { kind: token::ModSep, .. }, _)) =
+                    if let Some(TokenTree::Token(Token { kind: token::PathSep, .. }, _)) =
                         tokens.peek()
                     {
                         tokens.next();
@@ -348,7 +356,7 @@ impl MetaItem {
                 let span = span.with_hi(segments.last().unwrap().ident.span.hi());
                 Path { span, segments, tokens: None }
             }
-            Some(TokenTree::Token(Token { kind: token::Interpolated(nt), .. }, _)) => match &*nt {
+            Some(TokenTree::Token(Token { kind: token::Interpolated(nt), .. }, _)) => match &**nt {
                 token::Nonterminal::NtMeta(item) => return item.meta(item.path.span),
                 token::Nonterminal::NtPath(path) => (**path).clone(),
                 _ => return None,
@@ -368,15 +376,8 @@ impl MetaItem {
 }
 
 impl MetaItemKind {
-    pub fn value_str(&self) -> Option<Symbol> {
-        match self {
-            MetaItemKind::NameValue(v) => v.kind.str(),
-            _ => None,
-        }
-    }
-
     fn list_from_tokens(tokens: TokenStream) -> Option<ThinVec<NestedMetaItem>> {
-        let mut tokens = tokens.into_trees().peekable();
+        let mut tokens = tokens.trees().peekable();
         let mut result = ThinVec::new();
         while tokens.peek().is_some() {
             let item = NestedMetaItem::from_tokens(&mut tokens)?;
@@ -389,25 +390,25 @@ impl MetaItemKind {
         Some(result)
     }
 
-    fn name_value_from_tokens(
-        tokens: &mut impl Iterator<Item = TokenTree>,
+    fn name_value_from_tokens<'a>(
+        tokens: &mut impl Iterator<Item = &'a TokenTree>,
     ) -> Option<MetaItemKind> {
         match tokens.next() {
-            Some(TokenTree::Delimited(_, Delimiter::Invisible, inner_tokens)) => {
-                MetaItemKind::name_value_from_tokens(&mut inner_tokens.into_trees())
+            Some(TokenTree::Delimited(.., Delimiter::Invisible, inner_tokens)) => {
+                MetaItemKind::name_value_from_tokens(&mut inner_tokens.trees())
             }
             Some(TokenTree::Token(token, _)) => {
-                MetaItemLit::from_token(&token).map(MetaItemKind::NameValue)
+                MetaItemLit::from_token(token).map(MetaItemKind::NameValue)
             }
             _ => None,
         }
     }
 
-    fn from_tokens(
-        tokens: &mut iter::Peekable<impl Iterator<Item = TokenTree>>,
+    fn from_tokens<'a>(
+        tokens: &mut iter::Peekable<impl Iterator<Item = &'a TokenTree>>,
     ) -> Option<MetaItemKind> {
         match tokens.peek() {
-            Some(TokenTree::Delimited(_, Delimiter::Parenthesis, inner_tokens)) => {
+            Some(TokenTree::Delimited(.., Delimiter::Parenthesis, inner_tokens)) => {
                 let inner_tokens = inner_tokens.clone();
                 tokens.next();
                 MetaItemKind::list_from_tokens(inner_tokens).map(MetaItemKind::List)
@@ -424,11 +425,9 @@ impl MetaItemKind {
     fn from_attr_args(args: &AttrArgs) -> Option<MetaItemKind> {
         match args {
             AttrArgs::Empty => Some(MetaItemKind::Word),
-            AttrArgs::Delimited(DelimArgs {
-                dspan: _,
-                delim: MacDelimiter::Parenthesis,
-                tokens,
-            }) => MetaItemKind::list_from_tokens(tokens.clone()).map(MetaItemKind::List),
+            AttrArgs::Delimited(DelimArgs { dspan: _, delim: Delimiter::Parenthesis, tokens }) => {
+                MetaItemKind::list_from_tokens(tokens.clone()).map(MetaItemKind::List)
+            }
             AttrArgs::Delimited(..) => None,
             AttrArgs::Eq(_, AttrArgsEq::Ast(expr)) => match expr.kind {
                 ExprKind::Lit(token_lit) => {
@@ -463,12 +462,12 @@ impl NestedMetaItem {
 
     /// Returns `true` if this list item is a MetaItem with a name of `name`.
     pub fn has_name(&self, name: Symbol) -> bool {
-        self.meta_item().map_or(false, |meta_item| meta_item.has_name(name))
+        self.meta_item().is_some_and(|meta_item| meta_item.has_name(name))
     }
 
     /// Returns `true` if `self` is a `MetaItem` and the meta item is a word.
     pub fn is_word(&self) -> bool {
-        self.meta_item().map_or(false, |meta_item| meta_item.is_word())
+        self.meta_item().is_some_and(|meta_item| meta_item.is_word())
     }
 
     /// Gets a list of inner meta items from a list `MetaItem` type.
@@ -476,8 +475,9 @@ impl NestedMetaItem {
         self.meta_item().and_then(|meta_item| meta_item.meta_item_list())
     }
 
-    /// Returns a name and single literal value tuple of the `MetaItem`.
-    pub fn name_value_literal(&self) -> Option<(Symbol, &MetaItemLit)> {
+    /// If it's a singleton list of the form `foo(lit)`, returns the `foo` and
+    /// the `lit`.
+    pub fn singleton_lit_list(&self) -> Option<(Symbol, &MetaItemLit)> {
         self.meta_item().and_then(|meta_item| {
             meta_item.meta_item_list().and_then(|meta_item_list| {
                 if meta_item_list.len() == 1
@@ -523,21 +523,18 @@ impl NestedMetaItem {
         self.meta_item().is_some()
     }
 
-    fn from_tokens<I>(tokens: &mut iter::Peekable<I>) -> Option<NestedMetaItem>
+    fn from_tokens<'a, I>(tokens: &mut iter::Peekable<I>) -> Option<NestedMetaItem>
     where
-        I: Iterator<Item = TokenTree>,
+        I: Iterator<Item = &'a TokenTree>,
     {
         match tokens.peek() {
-            Some(TokenTree::Token(token, _))
-                if let Some(lit) = MetaItemLit::from_token(token) =>
-            {
+            Some(TokenTree::Token(token, _)) if let Some(lit) = MetaItemLit::from_token(token) => {
                 tokens.next();
                 return Some(NestedMetaItem::Lit(lit));
             }
-            Some(TokenTree::Delimited(_, Delimiter::Invisible, inner_tokens)) => {
-                let inner_tokens = inner_tokens.clone();
+            Some(TokenTree::Delimited(.., Delimiter::Invisible, inner_tokens)) => {
                 tokens.next();
-                return NestedMetaItem::from_tokens(&mut inner_tokens.into_trees().peekable());
+                return NestedMetaItem::from_tokens(&mut inner_tokens.trees().peekable());
             }
             _ => {}
         }
@@ -601,7 +598,7 @@ pub fn mk_attr_nested_word(
     let path = Path::from_ident(outer_ident);
     let attr_args = AttrArgs::Delimited(DelimArgs {
         dspan: DelimSpan::from_single(span),
-        delim: MacDelimiter::Parenthesis,
+        delim: Delimiter::Parenthesis,
         tokens: inner_tokens,
     });
     mk_attr(g, style, path, attr_args, span)
@@ -625,6 +622,22 @@ pub fn mk_attr_name_value_str(
     let path = Path::from_ident(Ident::new(name, span));
     let args = AttrArgs::Eq(span, AttrArgsEq::Ast(expr));
     mk_attr(g, style, path, args, span)
+}
+
+pub fn filter_by_name(attrs: &[Attribute], name: Symbol) -> impl Iterator<Item = &Attribute> {
+    attrs.iter().filter(move |attr| attr.has_name(name))
+}
+
+pub fn find_by_name(attrs: &[Attribute], name: Symbol) -> Option<&Attribute> {
+    filter_by_name(attrs, name).next()
+}
+
+pub fn first_attr_value_str_by_name(attrs: &[Attribute], name: Symbol) -> Option<Symbol> {
+    find_by_name(attrs, name).and_then(|attr| attr.value_str())
+}
+
+pub fn contains_name(attrs: &[Attribute], name: Symbol) -> bool {
+    find_by_name(attrs, name).is_some()
 }
 
 pub fn list_contains_name(items: &[NestedMetaItem], name: Symbol) -> bool {

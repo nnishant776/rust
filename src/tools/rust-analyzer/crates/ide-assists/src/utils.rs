@@ -1,16 +1,17 @@
 //! Assorted functions shared by several assists.
 
-use std::ops;
-
 pub(crate) use gen_trait_fn_body::gen_trait_fn_body;
-use hir::{db::HirDatabase, HirDisplay, Semantics};
-use ide_db::{famous_defs::FamousDefs, path_transform::PathTransform, RootDatabase, SnippetCap};
+use hir::{db::HirDatabase, HasAttrs as HirHasAttrs, HirDisplay, InFile, Semantics};
+use ide_db::{
+    famous_defs::FamousDefs, path_transform::PathTransform,
+    syntax_helpers::insert_whitespace_into_node::insert_ws_into, RootDatabase,
+};
 use stdx::format_to;
 use syntax::{
     ast::{
         self,
-        edit::{self, AstNodeEdit},
-        edit_in_place::{AttrsOwnerEdit, Removable},
+        edit::{AstNodeEdit, IndentLevel},
+        edit_in_place::{AttrsOwnerEdit, Indent, Removable},
         make, HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
     },
     ted, AstNode, AstToken, Direction, SourceFile,
@@ -20,8 +21,9 @@ use syntax::{
 
 use crate::assist_context::{AssistContext, SourceChangeBuilder};
 
-pub(crate) mod suggest_name;
 mod gen_trait_fn_body;
+pub(crate) mod ref_field_expr;
+pub(crate) mod suggest_name;
 
 pub(crate) fn unwrap_trivial_block(block_expr: ast::BlockExpr) -> ast::Expr {
     extract_trivial_expression(&block_expr)
@@ -69,7 +71,7 @@ pub fn extract_trivial_expression(block_expr: &ast::BlockExpr) -> Option<ast::Ex
 ///
 /// It may produce false positives, for example, `#[wasm_bindgen_test]` requires a different command to run the test,
 /// but it's better than not to have the runnables for the tests at all.
-pub fn test_related_attribute(fn_def: &ast::Fn) -> Option<ast::Attr> {
+pub fn test_related_attribute_syn(fn_def: &ast::Fn) -> Option<ast::Attr> {
     fn_def.attrs().find_map(|attr| {
         let path = attr.path()?;
         let text = path.syntax().text().to_string();
@@ -79,6 +81,25 @@ pub fn test_related_attribute(fn_def: &ast::Fn) -> Option<ast::Attr> {
             None
         }
     })
+}
+
+pub fn has_test_related_attribute(attrs: &hir::AttrsWithOwner) -> bool {
+    attrs.iter().any(|attr| {
+        let path = attr.path();
+        (|| {
+            Some(
+                path.segments().first()?.as_text()?.starts_with("test")
+                    || path.segments().last()?.as_text()?.ends_with("test"),
+            )
+        })()
+        .unwrap_or_default()
+    })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum IgnoreAssocItems {
+    DocHiddenAttrPresent,
+    No,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -91,30 +112,36 @@ pub fn filter_assoc_items(
     sema: &Semantics<'_, RootDatabase>,
     items: &[hir::AssocItem],
     default_methods: DefaultMethods,
-) -> Vec<ast::AssocItem> {
-    fn has_def_name(item: &ast::AssocItem) -> bool {
-        match item {
-            ast::AssocItem::Fn(def) => def.name(),
-            ast::AssocItem::TypeAlias(def) => def.name(),
-            ast::AssocItem::Const(def) => def.name(),
-            ast::AssocItem::MacroCall(_) => None,
-        }
-        .is_some()
-    }
-
-    items
+    ignore_items: IgnoreAssocItems,
+) -> Vec<InFile<ast::AssocItem>> {
+    return items
         .iter()
+        .copied()
+        .filter(|assoc_item| {
+            if ignore_items == IgnoreAssocItems::DocHiddenAttrPresent
+                && assoc_item.attrs(sema.db).has_doc_hidden()
+            {
+                if let hir::AssocItem::Function(f) = assoc_item {
+                    if !f.has_body(sema.db) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            true
+        })
         // Note: This throws away items with no source.
-        .filter_map(|&i| {
-            let item = match i {
-                hir::AssocItem::Function(i) => ast::AssocItem::Fn(sema.source(i)?.value),
-                hir::AssocItem::TypeAlias(i) => ast::AssocItem::TypeAlias(sema.source(i)?.value),
-                hir::AssocItem::Const(i) => ast::AssocItem::Const(sema.source(i)?.value),
+        .filter_map(|assoc_item| {
+            let item = match assoc_item {
+                hir::AssocItem::Function(it) => sema.source(it)?.map(ast::AssocItem::Fn),
+                hir::AssocItem::TypeAlias(it) => sema.source(it)?.map(ast::AssocItem::TypeAlias),
+                hir::AssocItem::Const(it) => sema.source(it)?.map(ast::AssocItem::Const),
             };
             Some(item)
         })
         .filter(has_def_name)
-        .filter(|it| match it {
+        .filter(|it| match &it.value {
             ast::AssocItem::Fn(def) => matches!(
                 (default_methods, def.body()),
                 (DefaultMethods::Only, Some(_)) | (DefaultMethods::No, None)
@@ -125,36 +152,67 @@ pub fn filter_assoc_items(
             ),
             _ => default_methods == DefaultMethods::No,
         })
-        .collect::<Vec<_>>()
+        .collect();
+
+    fn has_def_name(item: &InFile<ast::AssocItem>) -> bool {
+        match &item.value {
+            ast::AssocItem::Fn(def) => def.name(),
+            ast::AssocItem::TypeAlias(def) => def.name(),
+            ast::AssocItem::Const(def) => def.name(),
+            ast::AssocItem::MacroCall(_) => None,
+        }
+        .is_some()
+    }
 }
 
+/// Given `original_items` retrieved from the trait definition (usually by
+/// [`filter_assoc_items()`]), clones each item for update and applies path transformation to it,
+/// then inserts into `impl_`. Returns the modified `impl_` and the first associated item that got
+/// inserted.
 pub fn add_trait_assoc_items_to_impl(
     sema: &Semantics<'_, RootDatabase>,
-    items: Vec<ast::AssocItem>,
+    original_items: &[InFile<ast::AssocItem>],
     trait_: hir::Trait,
-    impl_: ast::Impl,
+    impl_: &ast::Impl,
     target_scope: hir::SemanticsScope<'_>,
-) -> (ast::Impl, ast::AssocItem) {
-    let source_scope = sema.scope_for_def(trait_);
+) -> ast::AssocItem {
+    let new_indent_level = IndentLevel::from_node(impl_.syntax()) + 1;
+    let items = original_items.iter().map(|InFile { file_id, value: original_item }| {
+        let cloned_item = {
+            if file_id.is_macro() {
+                if let Some(formatted) =
+                    ast::AssocItem::cast(insert_ws_into(original_item.syntax().clone()))
+                {
+                    return formatted;
+                } else {
+                    stdx::never!("formatted `AssocItem` could not be cast back to `AssocItem`");
+                }
+            }
+            original_item.clone_for_update()
+        };
 
-    let transform = PathTransform::trait_impl(&target_scope, &source_scope, trait_, impl_.clone());
-
-    let items = items.into_iter().map(|assoc_item| {
-        transform.apply(assoc_item.syntax());
-        assoc_item.remove_attrs_and_docs();
-        assoc_item
+        if let Some(source_scope) = sema.scope(original_item.syntax()) {
+            // FIXME: Paths in nested macros are not handled well. See
+            // `add_missing_impl_members::paths_in_nested_macro_should_get_transformed` test.
+            let transform =
+                PathTransform::trait_impl(&target_scope, &source_scope, trait_, impl_.clone());
+            transform.apply(cloned_item.syntax());
+        }
+        cloned_item.remove_attrs_and_docs();
+        cloned_item.reindent_to(new_indent_level);
+        cloned_item
     });
 
-    let res = impl_.clone_for_update();
-
-    let assoc_item_list = res.get_or_create_assoc_item_list();
+    let assoc_item_list = impl_.get_or_create_assoc_item_list();
     let mut first_item = None;
     for item in items {
         first_item.get_or_insert_with(|| item.clone());
         match &item {
             ast::AssocItem::Fn(fn_) if fn_.body().is_none() => {
-                let body = make::block_expr(None, Some(make::ext::expr_todo()))
-                    .indent(edit::IndentLevel(1));
+                let body = AstNodeEdit::indent(
+                    &make::block_expr(None, Some(make::ext::expr_todo())),
+                    new_indent_level,
+                );
                 ted::replace(fn_.get_or_create_body().syntax(), body.clone_for_update().syntax())
             }
             ast::AssocItem::TypeAlias(type_alias) => {
@@ -168,44 +226,7 @@ pub fn add_trait_assoc_items_to_impl(
         assoc_item_list.add_item(item)
     }
 
-    (res, first_item.unwrap())
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Cursor<'a> {
-    Replace(&'a SyntaxNode),
-    Before(&'a SyntaxNode),
-}
-
-impl<'a> Cursor<'a> {
-    fn node(self) -> &'a SyntaxNode {
-        match self {
-            Cursor::Replace(node) | Cursor::Before(node) => node,
-        }
-    }
-}
-
-pub(crate) fn render_snippet(_cap: SnippetCap, node: &SyntaxNode, cursor: Cursor<'_>) -> String {
-    assert!(cursor.node().ancestors().any(|it| it == *node));
-    let range = cursor.node().text_range() - node.text_range().start();
-    let range: ops::Range<usize> = range.into();
-
-    let mut placeholder = cursor.node().to_string();
-    escape(&mut placeholder);
-    let tab_stop = match cursor {
-        Cursor::Replace(placeholder) => format!("${{0:{placeholder}}}"),
-        Cursor::Before(placeholder) => format!("$0{placeholder}"),
-    };
-
-    let mut buf = node.to_string();
-    buf.replace_range(range, &tab_stop);
-    return buf;
-
-    fn escape(buf: &mut String) {
-        stdx::replace(buf, '{', r"\{");
-        stdx::replace(buf, '}', r"\}");
-        stdx::replace(buf, '$', r"\$");
-    }
+    first_item.unwrap()
 }
 
 pub(crate) fn vis_offset(node: &SyntaxNode) -> TextSize {
@@ -338,7 +359,12 @@ fn calc_depth(pat: &ast::Pat, depth: usize) -> usize {
 
 /// `find_struct_impl` looks for impl of a struct, but this also has additional feature
 /// where it takes a list of function names and check if they exist inside impl_, if
-/// even one match is found, it returns None
+/// even one match is found, it returns None.
+///
+/// That means this function can have 3 potential return values:
+///  - `None`: an impl exists, but one of the function names within the impl matches one of the provided names.
+///  - `Some(None)`: no impl exists.
+///  - `Some(Some(_))`: an impl exists, with no matching function names.
 pub(crate) fn find_struct_impl(
     ctx: &AssistContext<'_>,
     adt: &ast::Adt,
@@ -394,15 +420,6 @@ fn has_any_fn(imp: &ast::Impl, names: &[String]) -> bool {
     false
 }
 
-/// Find the start of the `impl` block for the given `ast::Impl`.
-//
-// FIXME: this partially overlaps with `find_struct_impl`
-pub(crate) fn find_impl_block_start(impl_def: ast::Impl, buf: &mut String) -> Option<TextSize> {
-    buf.push('\n');
-    let start = impl_def.assoc_item_list().and_then(|it| it.l_curly_token())?.text_range().end();
-    Some(start)
-}
-
 /// Find the end of the `impl` block for the given `ast::Impl`.
 //
 // FIXME: this partially overlaps with `find_struct_impl`
@@ -419,6 +436,7 @@ pub(crate) fn find_impl_block_end(impl_def: ast::Impl, buf: &mut String) -> Opti
 
 /// Generates the surrounding `impl Type { <code> }` including type and lifetime
 /// parameters.
+// FIXME: migrate remaining uses to `generate_impl`
 pub(crate) fn generate_impl_text(adt: &ast::Adt, code: &str) -> String {
     generate_impl_text_inner(adt, None, true, code)
 }
@@ -427,6 +445,7 @@ pub(crate) fn generate_impl_text(adt: &ast::Adt, code: &str) -> String {
 /// and lifetime parameters, with `<trait>` appended to `impl`'s generic parameters' bounds.
 ///
 /// This is useful for traits like `PartialEq`, since `impl<T> PartialEq for U<T>` often requires `T: PartialEq`.
+// FIXME: migrate remaining uses to `generate_trait_impl`
 pub(crate) fn generate_trait_impl_text(adt: &ast::Adt, trait_text: &str, code: &str) -> String {
     generate_impl_text_inner(adt, Some(trait_text), true, code)
 }
@@ -435,6 +454,7 @@ pub(crate) fn generate_trait_impl_text(adt: &ast::Adt, trait_text: &str, code: &
 /// and lifetime parameters, with `impl`'s generic parameters' bounds kept as-is.
 ///
 /// This is useful for traits like `From<T>`, since `impl<T> From<T> for U<T>` doesn't require `T: From<T>`.
+// FIXME: migrate remaining uses to `generate_trait_impl_intransitive`
 pub(crate) fn generate_trait_impl_text_intransitive(
     adt: &ast::Adt,
     trait_text: &str,
@@ -465,7 +485,7 @@ fn generate_impl_text_inner(
                         // Add the current trait to `bounds` if the trait is transitive,
                         // meaning `impl<T> Trait for U<T>` requires `T: Trait`.
                         if trait_is_transitive {
-                            bounds.push(make::type_bound(trait_));
+                            bounds.push(make::type_bound_text(trait_));
                         }
                     };
                     // `{ty_param}: {bounds}`
@@ -523,6 +543,101 @@ fn generate_impl_text_inner(
     buf
 }
 
+/// Generates the corresponding `impl Type {}` including type and lifetime
+/// parameters.
+pub(crate) fn generate_impl(adt: &ast::Adt) -> ast::Impl {
+    generate_impl_inner(adt, None, true)
+}
+
+/// Generates the corresponding `impl <trait> for Type {}` including type
+/// and lifetime parameters, with `<trait>` appended to `impl`'s generic parameters' bounds.
+///
+/// This is useful for traits like `PartialEq`, since `impl<T> PartialEq for U<T>` often requires `T: PartialEq`.
+pub(crate) fn generate_trait_impl(adt: &ast::Adt, trait_: ast::Type) -> ast::Impl {
+    generate_impl_inner(adt, Some(trait_), true)
+}
+
+/// Generates the corresponding `impl <trait> for Type {}` including type
+/// and lifetime parameters, with `impl`'s generic parameters' bounds kept as-is.
+///
+/// This is useful for traits like `From<T>`, since `impl<T> From<T> for U<T>` doesn't require `T: From<T>`.
+pub(crate) fn generate_trait_impl_intransitive(adt: &ast::Adt, trait_: ast::Type) -> ast::Impl {
+    generate_impl_inner(adt, Some(trait_), false)
+}
+
+fn generate_impl_inner(
+    adt: &ast::Adt,
+    trait_: Option<ast::Type>,
+    trait_is_transitive: bool,
+) -> ast::Impl {
+    // Ensure lifetime params are before type & const params
+    let generic_params = adt.generic_param_list().map(|generic_params| {
+        let lifetime_params =
+            generic_params.lifetime_params().map(ast::GenericParam::LifetimeParam);
+        let ty_or_const_params = generic_params.type_or_const_params().map(|param| {
+            match param {
+                ast::TypeOrConstParam::Type(param) => {
+                    let param = param.clone_for_update();
+                    // remove defaults since they can't be specified in impls
+                    param.remove_default();
+                    let mut bounds =
+                        param.type_bound_list().map_or_else(Vec::new, |it| it.bounds().collect());
+                    if let Some(trait_) = &trait_ {
+                        // Add the current trait to `bounds` if the trait is transitive,
+                        // meaning `impl<T> Trait for U<T>` requires `T: Trait`.
+                        if trait_is_transitive {
+                            bounds.push(make::type_bound(trait_.clone()));
+                        }
+                    };
+                    // `{ty_param}: {bounds}`
+                    let param =
+                        make::type_param(param.name().unwrap(), make::type_bound_list(bounds));
+                    ast::GenericParam::TypeParam(param)
+                }
+                ast::TypeOrConstParam::Const(param) => {
+                    let param = param.clone_for_update();
+                    // remove defaults since they can't be specified in impls
+                    param.remove_default();
+                    ast::GenericParam::ConstParam(param)
+                }
+            }
+        });
+
+        make::generic_param_list(itertools::chain(lifetime_params, ty_or_const_params))
+    });
+    let generic_args =
+        generic_params.as_ref().map(|params| params.to_generic_args().clone_for_update());
+    let ty = make::ty_path(make::ext::ident_path(&adt.name().unwrap().text()));
+
+    let impl_ = match trait_ {
+        Some(trait_) => make::impl_trait(
+            false,
+            None,
+            None,
+            generic_params,
+            generic_args,
+            false,
+            trait_,
+            ty,
+            None,
+            adt.where_clause(),
+            None,
+        ),
+        None => make::impl_(generic_params, generic_args, ty, adt.where_clause(), None),
+    }
+    .clone_for_update();
+
+    // Copy any cfg attrs from the original adt
+    let cfg_attrs = adt
+        .attrs()
+        .filter(|attr| attr.as_simple_call().map(|(name, _arg)| name == "cfg").unwrap_or(false));
+    for attr in cfg_attrs {
+        impl_.add_attr(attr.clone_for_update());
+    }
+
+    impl_
+}
+
 pub(crate) fn add_method_to_adt(
     builder: &mut SourceChangeBuilder,
     adt: &ast::Adt,
@@ -549,6 +664,7 @@ pub(crate) fn add_method_to_adt(
 pub(crate) struct ReferenceConversion {
     conversion: ReferenceConversionType,
     ty: hir::Type,
+    impls_deref: bool,
 }
 
 #[derive(Debug)]
@@ -568,10 +684,10 @@ enum ReferenceConversionType {
 }
 
 impl ReferenceConversion {
-    pub(crate) fn convert_type(&self, db: &dyn HirDatabase) -> String {
-        match self.conversion {
+    pub(crate) fn convert_type(&self, db: &dyn HirDatabase) -> ast::Type {
+        let ty = match self.conversion {
             ReferenceConversionType::Copy => self.ty.display(db).to_string(),
-            ReferenceConversionType::AsRefStr => "&str".to_string(),
+            ReferenceConversionType::AsRefStr => "&str".to_owned(),
             ReferenceConversionType::AsRefSlice => {
                 let type_argument_name =
                     self.ty.type_arguments().next().unwrap().display(db).to_string();
@@ -595,17 +711,27 @@ impl ReferenceConversion {
                     type_arguments.next().unwrap().display(db).to_string();
                 format!("Result<&{first_type_argument_name}, &{second_type_argument_name}>")
             }
-        }
+        };
+
+        make::ty(&ty)
     }
 
-    pub(crate) fn getter(&self, field_name: String) -> String {
+    pub(crate) fn getter(&self, field_name: String) -> ast::Expr {
+        let expr = make::expr_field(make::ext::expr_self(), &field_name);
+
         match self.conversion {
-            ReferenceConversionType::Copy => format!("self.{field_name}"),
+            ReferenceConversionType::Copy => expr,
             ReferenceConversionType::AsRefStr
             | ReferenceConversionType::AsRefSlice
             | ReferenceConversionType::Dereferenced
             | ReferenceConversionType::Option
-            | ReferenceConversionType::Result => format!("self.{field_name}.as_ref()"),
+            | ReferenceConversionType::Result => {
+                if self.impls_deref {
+                    make::expr_ref(expr, false)
+                } else {
+                    make::expr_method_call(expr, make::name_ref("as_ref"), make::arg_list([]))
+                }
+            }
         }
     }
 }
@@ -624,54 +750,64 @@ pub(crate) fn convert_reference_type(
         .or_else(|| handle_dereferenced(&ty, db, famous_defs))
         .or_else(|| handle_option_as_ref(&ty, db, famous_defs))
         .or_else(|| handle_result_as_ref(&ty, db, famous_defs))
-        .map(|conversion| ReferenceConversion { ty, conversion })
+        .map(|(conversion, impls_deref)| ReferenceConversion { ty, conversion, impls_deref })
 }
 
-fn handle_copy(ty: &hir::Type, db: &dyn HirDatabase) -> Option<ReferenceConversionType> {
-    ty.is_copy(db).then_some(ReferenceConversionType::Copy)
+fn could_deref_to_target(ty: &hir::Type, target: &hir::Type, db: &dyn HirDatabase) -> bool {
+    let ty_ref = hir::Type::reference(ty, hir::Mutability::Shared);
+    let target_ref = hir::Type::reference(target, hir::Mutability::Shared);
+    ty_ref.could_coerce_to(db, &target_ref)
+}
+
+fn handle_copy(ty: &hir::Type, db: &dyn HirDatabase) -> Option<(ReferenceConversionType, bool)> {
+    ty.is_copy(db).then_some((ReferenceConversionType::Copy, true))
 }
 
 fn handle_as_ref_str(
     ty: &hir::Type,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversionType> {
+) -> Option<(ReferenceConversionType, bool)> {
     let str_type = hir::BuiltinType::str().ty(db);
 
-    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[str_type])
-        .then_some(ReferenceConversionType::AsRefStr)
+    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[str_type.clone()])
+        .then_some((ReferenceConversionType::AsRefStr, could_deref_to_target(ty, &str_type, db)))
 }
 
 fn handle_as_ref_slice(
     ty: &hir::Type,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversionType> {
+) -> Option<(ReferenceConversionType, bool)> {
     let type_argument = ty.type_arguments().next()?;
     let slice_type = hir::Type::new_slice(type_argument);
 
-    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[slice_type])
-        .then_some(ReferenceConversionType::AsRefSlice)
+    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[slice_type.clone()]).then_some((
+        ReferenceConversionType::AsRefSlice,
+        could_deref_to_target(ty, &slice_type, db),
+    ))
 }
 
 fn handle_dereferenced(
     ty: &hir::Type,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversionType> {
+) -> Option<(ReferenceConversionType, bool)> {
     let type_argument = ty.type_arguments().next()?;
 
-    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[type_argument])
-        .then_some(ReferenceConversionType::Dereferenced)
+    ty.impls_trait(db, famous_defs.core_convert_AsRef()?, &[type_argument.clone()]).then_some((
+        ReferenceConversionType::Dereferenced,
+        could_deref_to_target(ty, &type_argument, db),
+    ))
 }
 
 fn handle_option_as_ref(
     ty: &hir::Type,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversionType> {
+) -> Option<(ReferenceConversionType, bool)> {
     if ty.as_adt() == famous_defs.core_option_Option()?.ty(db).as_adt() {
-        Some(ReferenceConversionType::Option)
+        Some((ReferenceConversionType::Option, false))
     } else {
         None
     }
@@ -681,9 +817,9 @@ fn handle_result_as_ref(
     ty: &hir::Type,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversionType> {
+) -> Option<(ReferenceConversionType, bool)> {
     if ty.as_adt() == famous_defs.core_result_Result()?.ty(db).as_adt() {
-        Some(ReferenceConversionType::Result)
+        Some((ReferenceConversionType::Result, false))
     } else {
         None
     }
@@ -761,4 +897,22 @@ fn test_required_hashes() {
     assert_eq!(0, required_hashes("#abc"));
     assert_eq!(3, required_hashes("#ab\"##c"));
     assert_eq!(5, required_hashes("#ab\"##\"####c"));
+}
+
+/// Replaces the record expression, handling field shorthands including inside macros.
+pub(crate) fn replace_record_field_expr(
+    ctx: &AssistContext<'_>,
+    edit: &mut SourceChangeBuilder,
+    record_field: ast::RecordExprField,
+    initializer: ast::Expr,
+) {
+    if let Some(ast::Expr::PathExpr(path_expr)) = record_field.expr() {
+        // replace field shorthand
+        let file_range = ctx.sema.original_range(path_expr.syntax());
+        edit.insert(file_range.range.end(), format!(": {}", initializer.syntax().text()))
+    } else if let Some(expr) = record_field.expr() {
+        // just replace expr
+        let file_range = ctx.sema.original_range(expr.syntax());
+        edit.replace(file_range.range, initializer.syntax().text());
+    }
 }

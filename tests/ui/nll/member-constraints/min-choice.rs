@@ -1,11 +1,11 @@
-// Assuming that the hidden type in these tests is `&'_#15r u8`,
-// we have a member constraint: `'_#15r member ['static, 'a, 'b, 'c]`.
+// Assuming that the hidden type in these tests is `&'?15 u8`,
+// we have a member constraint: `'?15 member ['static, 'a, 'b, 'c]`.
 //
 // Make sure we pick up the minimum non-ambiguous region among them.
 // We will have to exclude `['b, 'c]` because they're incomparable,
 // and then we should pick `'a` because we know `'static: 'a`.
 
-// check-pass
+//@ check-pass
 
 trait Cap<'a> {}
 impl<T> Cap<'_> for T {}

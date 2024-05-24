@@ -5,6 +5,7 @@ use rustc_data_structures::{
     fx::FxHashMap,
     stable_hasher::{HashStable, StableHasher},
 };
+use rustc_macros::HashStable;
 use rustc_middle::{
     bug,
     ty::{ParamEnv, PolyExistentialTraitRef, Ty, TyCtxt},
@@ -23,6 +24,8 @@ use crate::{
 use super::{unknown_file_metadata, SmallVec, UNKNOWN_LINE_NUMBER};
 
 mod private {
+    use rustc_macros::HashStable;
+
     // This type cannot be constructed outside of this module because
     // it has a private field. We make use of this in order to prevent
     // `UniqueTypeId` from being constructed directly, without asserting
@@ -43,7 +46,7 @@ pub(super) enum UniqueTypeId<'tcx> {
     /// The ID of a regular type as it shows up at the language level.
     Ty(Ty<'tcx>, private::HiddenZst),
     /// The ID for the single DW_TAG_variant_part nested inside the top-level
-    /// DW_TAG_structure_type that describes enums and generators.
+    /// DW_TAG_structure_type that describes enums and coroutines.
     VariantPart(Ty<'tcx>, private::HiddenZst),
     /// The ID for the artificial struct type describing a single enum variant.
     VariantStructType(Ty<'tcx>, VariantIdx, private::HiddenZst),

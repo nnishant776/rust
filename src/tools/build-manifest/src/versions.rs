@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
+use xz2::read::XzDecoder;
 
 const DEFAULT_TARGET: &str = "x86_64-unknown-linux-gnu";
 
@@ -56,6 +57,8 @@ pkg_type! {
     LlvmTools = "llvm-tools"; preview = true,
     Miri = "miri"; preview = true,
     JsonDocs = "rust-docs-json"; preview = true,
+    RustcCodegenCranelift = "rustc-codegen-cranelift"; preview = true,
+    LlvmBitcodeLinker = "llvm-bitcode-linker"; preview = true,
 }
 
 impl PkgType {
@@ -79,6 +82,7 @@ impl PkgType {
             PkgType::Rustfmt => false,
             PkgType::LlvmTools => false,
             PkgType::Miri => false,
+            PkgType::RustcCodegenCranelift => false,
 
             PkgType::Rust => true,
             PkgType::RustStd => true,
@@ -91,6 +95,7 @@ impl PkgType {
             PkgType::ReproducibleArtifacts => true,
             PkgType::RustMingw => true,
             PkgType::RustAnalysis => true,
+            PkgType::LlvmBitcodeLinker => true,
         }
     }
 
@@ -105,6 +110,7 @@ impl PkgType {
             ReproducibleArtifacts => HOSTS,
             RustcDocs => HOSTS,
             Cargo => HOSTS,
+            RustcCodegenCranelift => HOSTS,
             RustMingw => MINGW,
             RustStd => TARGETS,
             HtmlDocs => HOSTS,
@@ -117,6 +123,7 @@ impl PkgType {
             Rustfmt => HOSTS,
             RustAnalysis => TARGETS,
             LlvmTools => TARGETS,
+            LlvmBitcodeLinker => HOSTS,
         }
     }
 
@@ -175,9 +182,23 @@ impl Versions {
     }
 
     fn load_version_from_tarball(&mut self, package: &PkgType) -> Result<VersionInfo, Error> {
-        let tarball_name = self.tarball_name(package, DEFAULT_TARGET)?;
-        let tarball = self.dist_path.join(tarball_name);
+        for ext in ["xz", "gz"] {
+            let info =
+                self.load_version_from_tarball_inner(&self.dist_path.join(self.archive_name(
+                    package,
+                    DEFAULT_TARGET,
+                    &format!("tar.{}", ext),
+                )?))?;
+            if info.present {
+                return Ok(info);
+            }
+        }
 
+        // If neither tarball is present, we fallback to returning the non-present info.
+        Ok(VersionInfo::default())
+    }
+
+    fn load_version_from_tarball_inner(&mut self, tarball: &Path) -> Result<VersionInfo, Error> {
         let file = match File::open(&tarball) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -187,7 +208,14 @@ impl Versions {
             }
             Err(err) => return Err(err.into()),
         };
-        let mut tar = Archive::new(GzDecoder::new(file));
+        let mut tar: Archive<Box<dyn std::io::Read>> =
+            Archive::new(if tarball.extension().map_or(false, |e| e == "gz") {
+                Box::new(GzDecoder::new(file))
+            } else if tarball.extension().map_or(false, |e| e == "xz") {
+                Box::new(XzDecoder::new(file))
+            } else {
+                unimplemented!("tarball extension not recognized: {}", tarball.display())
+            });
 
         let mut version = None;
         let mut git_commit = None;

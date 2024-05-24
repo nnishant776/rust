@@ -1,9 +1,9 @@
 // Regression test for issues #77763, #84579 and #102142.
 #![crate_name = "main"]
 
-// aux-build:assoc_item_trait_bounds.rs
-// build-aux-docs
-// ignore-cross-compile
+//@ aux-build:assoc_item_trait_bounds.rs
+//@ build-aux-docs
+//@ ignore-cross-compile
 extern crate assoc_item_trait_bounds as aux;
 
 // @has main/trait.Main.html
@@ -42,3 +42,15 @@ pub use aux::Main;
 // @has main/trait.Aid.html
 // @has - '//*[@id="associatedtype.Result"]' "type Result<'inter: 'src>"
 pub use aux::Aid;
+
+// Below, ensure that we correctly display generic parameters and where-clauses on
+// associated types inside trait *impls*. More particularly, check that we don't render
+// any bounds (here `Self::Alias<T>: ...`) as item bounds unlike all the trait test cases above.
+
+// @has main/struct.Implementor.html
+// @has - '//*[@id="associatedtype.Alias"]' \
+// "type Alias<T: Eq> = T \
+// where \
+//     String: From<T>, \
+//     <Implementor as Implementee>::Alias<T>: From<<Implementor as Implementee>::Alias<T>>"
+pub use aux::Implementor;

@@ -1,8 +1,10 @@
 // Test that or-patterns are pass-through with respect to default binding modes.
 
-// check-pass
+//@ check-pass
 
 #![allow(irrefutable_let_patterns)]
+#![allow(dropping_copy_types)]
+#![allow(dropping_references)]
 
 fn main() {
     // A regression test for a mistake we made at one point:

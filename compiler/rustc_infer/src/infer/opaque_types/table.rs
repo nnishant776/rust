@@ -1,9 +1,8 @@
 use rustc_data_structures::undo_log::UndoLogs;
-use rustc_hir::OpaqueTyOrigin;
+use rustc_middle::bug;
 use rustc_middle::ty::{self, OpaqueHiddenType, OpaqueTypeKey, Ty};
-use rustc_span::DUMMY_SP;
 
-use crate::infer::{InferCtxtUndoLogs, UndoLog};
+use crate::infer::snapshot::undo_log::{InferCtxtUndoLogs, UndoLog};
 
 use super::{OpaqueTypeDecl, OpaqueTypeMap};
 
@@ -22,7 +21,8 @@ impl<'tcx> OpaqueTypeStorage<'tcx> {
         if let Some(idx) = idx {
             self.opaque_types.get_mut(&key).unwrap().hidden_type = idx;
         } else {
-            match self.opaque_types.remove(&key) {
+            // FIXME(#120456) - is `swap_remove` correct?
+            match self.opaque_types.swap_remove(&key) {
                 None => bug!("reverted opaque type inference that was never registered: {:?}", key),
                 Some(_) => {}
             }
@@ -41,9 +41,7 @@ impl<'tcx> OpaqueTypeStorage<'tcx> {
 impl<'tcx> Drop for OpaqueTypeStorage<'tcx> {
     fn drop(&mut self) {
         if !self.opaque_types.is_empty() {
-            ty::tls::with(|tcx| {
-                tcx.sess.delay_span_bug(DUMMY_SP, &format!("{:?}", self.opaque_types))
-            });
+            ty::tls::with(|tcx| tcx.dcx().delayed_bug(format!("{:?}", self.opaque_types)));
         }
     }
 }
@@ -60,14 +58,13 @@ impl<'a, 'tcx> OpaqueTypeTable<'a, 'tcx> {
         &mut self,
         key: OpaqueTypeKey<'tcx>,
         hidden_type: OpaqueHiddenType<'tcx>,
-        origin: OpaqueTyOrigin,
     ) -> Option<Ty<'tcx>> {
         if let Some(decl) = self.storage.opaque_types.get_mut(&key) {
             let prev = std::mem::replace(&mut decl.hidden_type, hidden_type);
             self.undo_log.push(UndoLog::OpaqueTypes(key, Some(prev)));
             return Some(prev.ty);
         }
-        let decl = OpaqueTypeDecl { hidden_type, origin };
+        let decl = OpaqueTypeDecl { hidden_type };
         self.storage.opaque_types.insert(key, decl);
         self.undo_log.push(UndoLog::OpaqueTypes(key, None));
         None

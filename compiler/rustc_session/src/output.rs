@@ -1,21 +1,22 @@
-//! Related to out filenames of compilation (e.g. save analysis, binaries).
-use crate::config::{CrateType, Input, OutputFilenames, OutputType};
+//! Related to out filenames of compilation (e.g. binaries).
+use crate::config::{self, CrateType, Input, OutFileName, OutputFilenames, OutputType};
 use crate::errors::{
-    CrateNameDoesNotMatch, CrateNameEmpty, CrateNameInvalid, FileIsNotWriteable,
-    InvalidCharacterInCrateName,
+    self, CrateNameDoesNotMatch, CrateNameEmpty, CrateNameInvalid, FileIsNotWriteable,
+    InvalidCharacterInCrateName, InvalidCrateNameHelp,
 };
 use crate::Session;
-use rustc_ast as ast;
+use rustc_ast::{self as ast, attr};
+use rustc_errors::FatalError;
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn out_filename(
     sess: &Session,
     crate_type: CrateType,
     outputs: &OutputFilenames,
     crate_name: Symbol,
-) -> PathBuf {
+) -> OutFileName {
     let default_filename = filename_for_input(sess, crate_type, crate_name, outputs);
     let out_filename = outputs
         .outputs
@@ -24,7 +25,9 @@ pub fn out_filename(
         .or_else(|| outputs.single_output_file.clone())
         .unwrap_or(default_filename);
 
-    check_file_is_writeable(&out_filename, sess);
+    if let OutFileName::Real(ref path) = out_filename {
+        check_file_is_writeable(path, sess);
+    }
 
     out_filename
 }
@@ -34,7 +37,7 @@ pub fn out_filename(
 /// read-only file. We should be consistent.
 pub fn check_file_is_writeable(file: &Path, sess: &Session) {
     if !is_writeable(file) {
-        sess.emit_fatal(FileIsNotWriteable { file });
+        sess.dcx().emit_fatal(FileIsNotWriteable { file });
     }
 }
 
@@ -56,13 +59,13 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute]) -> Symbol {
     // the command line over one found in the #[crate_name] attribute. If we
     // find both we ensure that they're the same later on as well.
     let attr_crate_name =
-        sess.find_by_name(attrs, sym::crate_name).and_then(|at| at.value_str().map(|s| (at, s)));
+        attr::find_by_name(attrs, sym::crate_name).and_then(|at| at.value_str().map(|s| (at, s)));
 
     if let Some(ref s) = sess.opts.crate_name {
         let s = Symbol::intern(s);
         if let Some((attr, name)) = attr_crate_name {
             if name != s {
-                sess.emit_err(CrateNameDoesNotMatch { span: attr.span, s, name });
+                sess.dcx().emit_err(CrateNameDoesNotMatch { span: attr.span, s, name });
             }
         }
         return validate(s, None);
@@ -74,7 +77,7 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute]) -> Symbol {
     if let Input::File(ref path) = sess.io.input {
         if let Some(s) = path.file_stem().and_then(|s| s.to_str()) {
             if s.starts_with('-') {
-                sess.emit_err(CrateNameInvalid { s });
+                sess.dcx().emit_err(CrateNameInvalid { s });
             } else {
                 return validate(Symbol::intern(&s.replace('-', "_")), None);
             }
@@ -89,7 +92,7 @@ pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {
     {
         if s.is_empty() {
             err_count += 1;
-            sess.emit_err(CrateNameEmpty { span: sp });
+            sess.dcx().emit_err(CrateNameEmpty { span: sp });
         }
         for c in s.as_str().chars() {
             if c.is_alphanumeric() {
@@ -99,34 +102,29 @@ pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {
                 continue;
             }
             err_count += 1;
-            sess.emit_err(InvalidCharacterInCrateName { span: sp, character: c, crate_name: s });
+            sess.dcx().emit_err(InvalidCharacterInCrateName {
+                span: sp,
+                character: c,
+                crate_name: s,
+                crate_name_help: if sp.is_none() {
+                    Some(InvalidCrateNameHelp::AddCrateName)
+                } else {
+                    None
+                },
+            });
         }
     }
 
     if err_count > 0 {
-        sess.abort_if_errors();
+        FatalError.raise();
     }
 }
 
-pub fn filename_for_metadata(
-    sess: &Session,
-    crate_name: Symbol,
-    outputs: &OutputFilenames,
-) -> PathBuf {
-    // If the command-line specified the path, use that directly.
-    if let Some(Some(out_filename)) = sess.opts.output_types.get(&OutputType::Metadata) {
-        return out_filename.clone();
+pub fn filename_for_metadata(sess: &Session, outputs: &OutputFilenames) -> OutFileName {
+    let out_filename = outputs.path(OutputType::Metadata);
+    if let OutFileName::Real(ref path) = out_filename {
+        check_file_is_writeable(path, sess);
     }
-
-    let libname = format!("{}{}", crate_name, sess.opts.cg.extra_filename);
-
-    let out_filename = outputs
-        .single_output_file
-        .clone()
-        .unwrap_or_else(|| outputs.out_directory.join(&format!("lib{libname}.rmeta")));
-
-    check_file_is_writeable(&out_filename, sess);
-
     out_filename
 }
 
@@ -135,23 +133,33 @@ pub fn filename_for_input(
     crate_type: CrateType,
     crate_name: Symbol,
     outputs: &OutputFilenames,
-) -> PathBuf {
+) -> OutFileName {
     let libname = format!("{}{}", crate_name, sess.opts.cg.extra_filename);
 
     match crate_type {
-        CrateType::Rlib => outputs.out_directory.join(&format!("lib{libname}.rlib")),
+        CrateType::Rlib => {
+            OutFileName::Real(outputs.out_directory.join(&format!("lib{libname}.rlib")))
+        }
         CrateType::Cdylib | CrateType::ProcMacro | CrateType::Dylib => {
             let (prefix, suffix) = (&sess.target.dll_prefix, &sess.target.dll_suffix);
-            outputs.out_directory.join(&format!("{prefix}{libname}{suffix}"))
+            OutFileName::Real(outputs.out_directory.join(&format!("{prefix}{libname}{suffix}")))
         }
         CrateType::Staticlib => {
             let (prefix, suffix) = (&sess.target.staticlib_prefix, &sess.target.staticlib_suffix);
-            outputs.out_directory.join(&format!("{prefix}{libname}{suffix}"))
+            OutFileName::Real(outputs.out_directory.join(&format!("{prefix}{libname}{suffix}")))
         }
         CrateType::Executable => {
             let suffix = &sess.target.exe_suffix;
             let out_filename = outputs.path(OutputType::Exe);
-            if suffix.is_empty() { out_filename } else { out_filename.with_extension(&suffix[1..]) }
+            if let OutFileName::Real(ref path) = out_filename {
+                if suffix.is_empty() {
+                    out_filename
+                } else {
+                    OutFileName::Real(path.with_extension(&suffix[1..]))
+                }
+            } else {
+                out_filename
+            }
         }
     }
 }
@@ -179,12 +187,77 @@ pub fn invalid_output_for_target(sess: &Session, crate_type: CrateType) -> bool 
             return true;
         }
     }
-    if let CrateType::ProcMacro | CrateType::Dylib = crate_type && sess.target.only_cdylib {
+    if let CrateType::ProcMacro | CrateType::Dylib = crate_type
+        && sess.target.only_cdylib
+    {
         return true;
     }
-    if let CrateType::Executable = crate_type && !sess.target.executables {
+    if let CrateType::Executable = crate_type
+        && !sess.target.executables
+    {
         return true;
     }
 
     false
+}
+
+pub const CRATE_TYPES: &[(Symbol, CrateType)] = &[
+    (sym::rlib, CrateType::Rlib),
+    (sym::dylib, CrateType::Dylib),
+    (sym::cdylib, CrateType::Cdylib),
+    (sym::lib, config::default_lib_output()),
+    (sym::staticlib, CrateType::Staticlib),
+    (sym::proc_dash_macro, CrateType::ProcMacro),
+    (sym::bin, CrateType::Executable),
+];
+
+pub fn categorize_crate_type(s: Symbol) -> Option<CrateType> {
+    Some(CRATE_TYPES.iter().find(|(key, _)| *key == s)?.1)
+}
+
+pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<CrateType> {
+    // If we're generating a test executable, then ignore all other output
+    // styles at all other locations
+    if session.opts.test {
+        return vec![CrateType::Executable];
+    }
+
+    // Only check command line flags if present. If no types are specified by
+    // command line, then reuse the empty `base` Vec to hold the types that
+    // will be found in crate attributes.
+    // JUSTIFICATION: before wrapper fn is available
+    #[allow(rustc::bad_opt_access)]
+    let mut base = session.opts.crate_types.clone();
+    if base.is_empty() {
+        let attr_types = attrs.iter().filter_map(|a| {
+            if a.has_name(sym::crate_type)
+                && let Some(s) = a.value_str()
+            {
+                categorize_crate_type(s)
+            } else {
+                None
+            }
+        });
+        base.extend(attr_types);
+        if base.is_empty() {
+            base.push(default_output_for_target(session));
+        } else {
+            base.sort();
+            base.dedup();
+        }
+    }
+
+    base.retain(|crate_type| {
+        if invalid_output_for_target(session, *crate_type) {
+            session.dcx().emit_warn(errors::UnsupportedCrateTypeForTarget {
+                crate_type: *crate_type,
+                target_triple: &session.opts.target_triple,
+            });
+            false
+        } else {
+            true
+        }
+    });
+
+    base
 }

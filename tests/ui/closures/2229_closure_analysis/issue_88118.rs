@@ -1,9 +1,6 @@
 // Regression test for #88118. Used to ICE.
-//
-// check-pass
-
-#![allow(incomplete_features)]
-#![feature(capture_disjoint_fields)]
+//@ edition:2021
+//@ check-pass
 
 fn foo<MsU>(handler: impl FnOnce() -> MsU + Clone + 'static) {
     Box::new(move |value| {

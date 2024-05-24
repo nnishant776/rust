@@ -75,19 +75,19 @@ pub(crate) use ParseResult::*;
 
 use crate::mbe::{macro_rules::Tracker, KleeneOp, TokenTree};
 
-use rustc_ast::token::{self, DocComment, Nonterminal, NonterminalKind, Token};
+use rustc_ast::token::{self, DocComment, NonterminalKind, Token};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::ErrorGuaranteed;
 use rustc_lint_defs::pluralize;
-use rustc_parse::parser::{NtOrTt, Parser};
+use rustc_parse::parser::{ParseNtResult, Parser};
 use rustc_span::symbol::Ident;
 use rustc_span::symbol::MacroRulesNormalizedIdent;
 use rustc_span::Span;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Display;
+use std::rc::Rc;
 
 /// A unit within a matcher that a `MatcherPos` can refer to. Similar to (and derived from)
 /// `mbe::TokenTree`, but designed specifically for fast and easy traversal during matching.
@@ -155,7 +155,7 @@ impl Display for MatcherLoc {
             MatcherLoc::MetaVarDecl { bind, kind, .. } => {
                 write!(f, "meta-variable `${bind}")?;
                 if let Some(kind) = kind {
-                    write!(f, ":{}", kind)?;
+                    write!(f, ":{kind}")?;
                 }
                 write!(f, "`")?;
                 Ok(())
@@ -183,7 +183,7 @@ pub(super) fn compute_locs(matcher: &[TokenTree]) -> Vec<MatcherLoc> {
                 TokenTree::Token(token) => {
                     locs.push(MatcherLoc::Token { token: token.clone() });
                 }
-                TokenTree::Delimited(span, delimited) => {
+                TokenTree::Delimited(span, _, delimited) => {
                     let open_token = Token::new(token::OpenDelim(delimited.delim), span.open);
                     let close_token = Token::new(token::CloseDelim(delimited.delim), span.close);
 
@@ -248,6 +248,7 @@ pub(super) fn compute_locs(matcher: &[TokenTree]) -> Vec<MatcherLoc> {
 }
 
 /// A single matcher position, representing the state of matching.
+#[derive(Debug)]
 struct MatcherPos {
     /// The index into `TtParser::locs`, which represents the "dot".
     idx: usize,
@@ -257,14 +258,14 @@ struct MatcherPos {
     /// against the relevant metavar by the black box parser. An element will be a `MatchedSeq` if
     /// the corresponding metavar decl is within a sequence.
     ///
-    /// It is critical to performance that this is an `Lrc`, because it gets cloned frequently when
+    /// It is critical to performance that this is an `Rc`, because it gets cloned frequently when
     /// processing sequences. Mostly for sequence-ending possibilities that must be tried but end
     /// up failing.
-    matches: Lrc<Vec<NamedMatch>>,
+    matches: Rc<Vec<NamedMatch>>,
 }
 
 // This type is used a lot. Make sure it doesn't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(MatcherPos, 16);
 
 impl MatcherPos {
@@ -272,7 +273,7 @@ impl MatcherPos {
     /// and both are hot enough to be always worth inlining.
     #[inline(always)]
     fn push_match(&mut self, metavar_idx: usize, seq_depth: usize, m: NamedMatch) {
-        let matches = Lrc::make_mut(&mut self.matches);
+        let matches = Rc::make_mut(&mut self.matches);
         match seq_depth {
             0 => {
                 // We are not within a sequence. Just append `m`.
@@ -333,7 +334,7 @@ pub(super) fn count_metavar_decls(matcher: &[TokenTree]) -> usize {
         .map(|tt| match tt {
             TokenTree::MetaVarDecl(..) => 1,
             TokenTree::Sequence(_, seq) => seq.num_captures,
-            TokenTree::Delimited(_, delim) => count_metavar_decls(&delim.tts),
+            TokenTree::Delimited(.., delim) => count_metavar_decls(&delim.tts),
             TokenTree::Token(..) => 0,
             TokenTree::MetaVar(..) | TokenTree::MetaVarExpr(..) => unreachable!(),
         })
@@ -390,12 +391,7 @@ pub(super) fn count_metavar_decls(matcher: &[TokenTree]) -> usize {
 #[derive(Debug, Clone)]
 pub(crate) enum NamedMatch {
     MatchedSeq(Vec<NamedMatch>),
-
-    // A metavar match of type `tt`.
-    MatchedTokenTree(rustc_ast::tokenstream::TokenTree),
-
-    // A metavar match of any type other than `tt`.
-    MatchedNonterminal(Lrc<Nonterminal>),
+    MatchedSingle(ParseNtResult),
 }
 
 /// Performs a token equality check, ignoring syntax context (that is, an unhygienic comparison)
@@ -427,7 +423,7 @@ pub struct TtParser {
 
     /// Pre-allocate an empty match array, so it can be cloned cheaply for macros with many rules
     /// that have no metavars.
-    empty_matches: Lrc<Vec<NamedMatch>>,
+    empty_matches: Rc<Vec<NamedMatch>>,
 }
 
 impl TtParser {
@@ -437,7 +433,7 @@ impl TtParser {
             cur_mps: vec![],
             next_mps: vec![],
             bb_mps: vec![],
-            empty_matches: Lrc::new(vec![]),
+            empty_matches: Rc::new(vec![]),
         }
     }
 
@@ -481,7 +477,7 @@ impl TtParser {
                     if matches!(t, Token { kind: DocComment(..), .. }) {
                         mp.idx += 1;
                         self.cur_mps.push(mp);
-                    } else if token_name_eq(&t, token) {
+                    } else if token_name_eq(t, token) {
                         mp.idx += 1;
                         self.next_mps.push(mp);
                     }
@@ -507,7 +503,7 @@ impl TtParser {
                         // Try zero matches of this sequence, by skipping over it.
                         self.cur_mps.push(MatcherPos {
                             idx: idx_first_after,
-                            matches: Lrc::clone(&mp.matches),
+                            matches: Rc::clone(&mp.matches),
                         });
                     }
 
@@ -521,7 +517,7 @@ impl TtParser {
                     // processed next time around the loop.
                     let ending_mp = MatcherPos {
                         idx: mp.idx + 1, // +1 skips the Kleene op
-                        matches: Lrc::clone(&mp.matches),
+                        matches: Rc::clone(&mp.matches),
                     };
                     self.cur_mps.push(ending_mp);
 
@@ -537,7 +533,7 @@ impl TtParser {
                     // will fail quietly when it is processed next time around the loop.
                     let ending_mp = MatcherPos {
                         idx: mp.idx + 2, // +2 skips the separator and the Kleene op
-                        matches: Lrc::clone(&mp.matches),
+                        matches: Rc::clone(&mp.matches),
                     };
                     self.cur_mps.push(ending_mp);
 
@@ -545,6 +541,8 @@ impl TtParser {
                         // The separator matches the current token. Advance past it.
                         mp.idx += 1;
                         self.next_mps.push(mp);
+                    } else {
+                        track.set_expected_token(separator);
                     }
                 }
                 &MatcherLoc::SequenceKleeneOpAfterSep { idx_first } => {
@@ -587,9 +585,9 @@ impl TtParser {
         if *token == token::Eof {
             Some(match eof_mps {
                 EofMatcherPositions::One(mut eof_mp) => {
-                    // Need to take ownership of the matches from within the `Lrc`.
-                    Lrc::make_mut(&mut eof_mp.matches);
-                    let matches = Lrc::try_unwrap(eof_mp.matches).unwrap().into_iter();
+                    // Need to take ownership of the matches from within the `Rc`.
+                    Rc::make_mut(&mut eof_mp.matches);
+                    let matches = Rc::try_unwrap(eof_mp.matches).unwrap().into_iter();
                     self.nameize(matcher, matches)
                 }
                 EofMatcherPositions::Multiple => {
@@ -636,6 +634,7 @@ impl TtParser {
                 parser.approx_token_stream_pos(),
                 track,
             );
+
             if let Some(res) = res {
                 return res;
             }
@@ -677,8 +676,8 @@ impl TtParser {
                         // We use the span of the metavariable declaration to determine any
                         // edition-specific matching behavior for non-terminals.
                         let nt = match parser.to_mut().parse_nonterminal(kind) {
-                            Err(mut err) => {
-                                let guarantee = err.span_label(
+                            Err(err) => {
+                                let guarantee = err.with_span_label(
                                     span,
                                     format!(
                                         "while parsing argument for this `{kind}` macro fragment"
@@ -689,11 +688,7 @@ impl TtParser {
                             }
                             Ok(nt) => nt,
                         };
-                        let m = match nt {
-                            NtOrTt::Nt(nt) => MatchedNonterminal(Lrc::new(nt)),
-                            NtOrTt::Tt(tt) => MatchedTokenTree(tt),
-                        };
-                        mp.push_match(next_metavar, seq_depth, m);
+                        mp.push_match(next_metavar, seq_depth, MatchedSingle(nt));
                         mp.idx += 1;
                     } else {
                         unreachable!()
@@ -721,7 +716,7 @@ impl TtParser {
             .iter()
             .map(|mp| match &matcher[mp.idx] {
                 MatcherLoc::MetaVarDecl { bind, kind: Some(kind), .. } => {
-                    format!("{} ('{}')", kind, bind)
+                    format!("{kind} ('{bind}')")
                 }
                 _ => unreachable!(),
             })
@@ -734,8 +729,8 @@ impl TtParser {
                 "local ambiguity when calling macro `{}`: multiple parsing options: {}",
                 self.macro_name,
                 match self.next_mps.len() {
-                    0 => format!("built-in NTs {}.", nts),
-                    n => format!("built-in NTs {} or {n} other option{s}.", nts, s = pluralize!(n)),
+                    0 => format!("built-in NTs {nts}."),
+                    n => format!("built-in NTs {nts} or {n} other option{s}.", s = pluralize!(n)),
                 }
             ),
         )
@@ -755,7 +750,7 @@ impl TtParser {
                     match ret_val.entry(MacroRulesNormalizedIdent::new(bind)) {
                         Vacant(spot) => spot.insert(res.next().unwrap()),
                         Occupied(..) => {
-                            return Error(span, format!("duplicated bind name: {}", bind));
+                            return Error(span, format!("duplicated bind name: {bind}"));
                         }
                     };
                 } else {

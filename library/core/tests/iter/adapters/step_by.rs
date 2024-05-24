@@ -49,6 +49,7 @@ fn test_iterator_step_by_nth() {
 }
 
 #[test]
+#[allow(non_local_definitions)]
 fn test_iterator_step_by_nth_overflow() {
     #[cfg(target_pointer_width = "16")]
     type Bigger = u32;
@@ -220,7 +221,8 @@ fn test_iterator_step_by_size_hint() {
     assert_eq!(it.len(), 3);
 
     // Cannot be TrustedLen as a step greater than one makes an iterator
-    // with (usize::MAX, None) no longer meet the safety requirements
+    // with (usize::MAX, None) no longer meet the safety requirements.
+    // Exception: The inner iterator is known to have a len() <= usize::MAX
     trait TrustedLenCheck {
         fn test(self) -> bool;
     }
@@ -235,7 +237,9 @@ fn test_iterator_step_by_size_hint() {
         }
     }
     assert!(TrustedLenCheck::test(a.iter()));
-    assert!(!TrustedLenCheck::test(a.iter().step_by(1)));
+    assert!(TrustedLenCheck::test(a.iter().step_by(1)));
+    assert!(TrustedLenCheck::test(a.iter().chain(a.iter())));
+    assert!(!TrustedLenCheck::test(a.iter().chain(a.iter()).step_by(1)));
 }
 
 #[test]
@@ -243,4 +247,55 @@ fn test_step_by_skip() {
     assert_eq!((0..640).step_by(128).skip(1).collect::<Vec<_>>(), [128, 256, 384, 512]);
     assert_eq!((0..=50).step_by(10).nth(3), Some(30));
     assert_eq!((200..=255u8).step_by(10).nth(3), Some(230));
+}
+
+struct DeOpt<I: Iterator>(I);
+
+impl<I: Iterator> Iterator for DeOpt<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> core::option::Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl<I: DoubleEndedIterator> DoubleEndedIterator for DeOpt<I> {
+    fn next_back(&mut self) -> core::option::Option<Self::Item> {
+        self.0.next_back()
+    }
+}
+
+#[test]
+fn test_step_by_fold_range_specialization() {
+    macro_rules! t {
+        ($range:expr, $var: ident, $body:tt) => {{
+            // run the same tests for the non-optimized version
+            let mut $var = DeOpt($range);
+            $body
+        }
+        {
+            let mut $var = $range;
+            $body
+        }};
+    }
+
+    t!((1usize..5).step_by(1), r, {
+        assert_eq!(r.next_back(), Some(4));
+        assert_eq!(r.sum::<usize>(), 6);
+    });
+
+    t!((0usize..4).step_by(2), r, {
+        assert_eq!(r.next(), Some(0));
+        assert_eq!(r.sum::<usize>(), 2);
+    });
+
+    t!((0usize..5).step_by(2), r, {
+        assert_eq!(r.next(), Some(0));
+        assert_eq!(r.sum::<usize>(), 6);
+    });
+
+    t!((usize::MAX - 6..usize::MAX).step_by(5), r, {
+        assert_eq!(r.next(), Some(usize::MAX - 6));
+        assert_eq!(r.sum::<usize>(), usize::MAX - 1);
+    });
 }

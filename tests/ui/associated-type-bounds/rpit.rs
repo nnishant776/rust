@@ -1,11 +1,9 @@
-// run-pass
-
-#![feature(associated_type_bounds)]
+//@ run-pass
 
 use std::ops::Add;
 
 trait Tr1 { type As1; fn mk(self) -> Self::As1; }
-trait Tr2<'a> { fn tr2(self) -> &'a Self; }
+trait Tr2<'a> { fn tr2(self) -> &'a Self; } //~ WARN method `tr2` is never used
 
 fn assert_copy<T: Copy>(x: T) { let _x = x; let _x = x; }
 fn assert_static<T: 'static>(_: T) {}
@@ -57,8 +55,8 @@ fn def_et4() -> impl Tr1<As1: for<'a> Tr2<'a>> {
 pub fn use_et4() { assert_forall_tr2(def_et4().mk()); }
 
 fn main() {
-    let _ = use_et1();
-    let _ = use_et2();
-    let _ = use_et3();
-    let _ = use_et4();
+    use_et1();
+    use_et2();
+    use_et3();
+    use_et4();
 }

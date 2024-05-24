@@ -1,6 +1,4 @@
-// error-pattern: evaluation of constant value failed
-
-#![feature(const_ptr_read)]
+//@ error-pattern: evaluation of constant value failed
 
 fn main() {
     use std::ptr;

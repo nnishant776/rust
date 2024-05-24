@@ -1,5 +1,6 @@
 use crate::iter::{FusedIterator, TrustedLen};
 use crate::mem::ManuallyDrop;
+use crate::num::NonZero;
 
 /// Creates a new iterator that repeats a single element a given number of times.
 ///
@@ -58,7 +59,6 @@ use crate::mem::ManuallyDrop;
 /// ```
 #[inline]
 #[unstable(feature = "iter_repeat_n", issue = "104434")]
-#[doc(hidden)] // waiting on ACP#120 to decide whether to expose publicly
 pub fn repeat_n<T: Clone>(element: T, count: usize) -> RepeatN<T> {
     let mut element = ManuallyDrop::new(element);
 
@@ -78,7 +78,6 @@ pub fn repeat_n<T: Clone>(element: T, count: usize) -> RepeatN<T> {
 /// See its documentation for more.
 #[derive(Clone, Debug)]
 #[unstable(feature = "iter_repeat_n", issue = "104434")]
-#[doc(hidden)] // waiting on ACP#120 to decide whether to expose publicly
 pub struct RepeatN<A> {
     count: usize,
     // Invariant: has been dropped iff count == 0.
@@ -137,7 +136,7 @@ impl<A: Clone> Iterator for RepeatN<A> {
     }
 
     #[inline]
-    fn advance_by(&mut self, skip: usize) -> Result<(), usize> {
+    fn advance_by(&mut self, skip: usize) -> Result<(), NonZero<usize>> {
         let len = self.count;
 
         if skip >= len {
@@ -145,7 +144,8 @@ impl<A: Clone> Iterator for RepeatN<A> {
         }
 
         if skip > len {
-            Err(len)
+            // SAFETY: we just checked that the difference is positive
+            Err(unsafe { NonZero::new_unchecked(skip - len) })
         } else {
             self.count = len - skip;
             Ok(())
@@ -178,7 +178,7 @@ impl<A: Clone> DoubleEndedIterator for RepeatN<A> {
     }
 
     #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         self.advance_by(n)
     }
 

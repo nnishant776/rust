@@ -22,11 +22,11 @@ fn attributes() {
     check_highlighting(
         r#"
 //- proc_macros: identity
-//- minicore: derive, copy
+//- minicore: derive, copy, default
 #[allow(dead_code)]
 #[rustfmt::skip]
 #[proc_macros::identity]
-#[derive(Copy)]
+#[derive(Default)]
 /// This is a doc comment
 // This is a normal comment
 /// This is a doc comment
@@ -34,9 +34,12 @@ fn attributes() {
 // This is another normal comment
 /// This is another doc comment
 // This is another normal comment
-#[derive(Copy)]
+#[derive(Copy, Unresolved)]
 // The reason for these being here is to test AttrIds
-struct Foo;
+enum Foo {
+    #[default]
+    Bar
+}
 "#,
         expect_file!["./test_data/highlight_attributes.html"],
         false,
@@ -47,8 +50,12 @@ struct Foo;
 fn macros() {
     check_highlighting(
         r#"
-//- proc_macros: mirror
-proc_macros::mirror! {
+//- proc_macros: mirror, identity, derive_identity
+//- minicore: fmt, include, concat
+//- /lib.rs crate:lib
+use proc_macros::{mirror, identity, DeriveIdentity};
+
+mirror! {
     {
         ,i32 :x pub
         ,i32 :y pub
@@ -95,11 +102,17 @@ macro without_args {
     }
 }
 
+
+include!(concat!("foo/", "foo.rs"));
+
 fn main() {
-    println!("Hello, {}!", 92);
+    format_args!("Hello, {}!", (92,).0);
     dont_color_me_braces!();
     noop!(noop!(1));
 }
+//- /foo/foo.rs crate:foo
+mod foo {}
+use self::foo as bar;
 "#,
         expect_file!["./test_data/highlight_macros.html"],
         false,
@@ -287,7 +300,7 @@ impl Bool {
         true
     }
 }
-const USAGE_OF_BOOL:bool = Bool::True.to_primitive();
+const USAGE_OF_BOOL: bool = Bool::True.to_primitive();
 
 trait Baz {
     type Qux;
@@ -388,57 +401,57 @@ fn test_string_highlighting() {
     // thus, we have to copy the macro definition from `std`
     check_highlighting(
         r#"
+//- minicore: fmt, assert, asm, concat, panic
 macro_rules! println {
     ($($arg:tt)*) => ({
-        $crate::io::_print($crate::format_args_nl!($($arg)*));
+        $crate::io::_print(format_args_nl!($($arg)*));
     })
 }
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! format_args {}
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! const_format_args {}
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! format_args_nl {}
 
 mod panic {
     pub macro panic_2015 {
         () => (
-            $crate::panicking::panic("explicit panic")
+            panic("explicit panic")
         ),
         ($msg:literal $(,)?) => (
-            $crate::panicking::panic($msg)
+            panic($msg)
         ),
         // Use `panic_str` instead of `panic_display::<&str>` for non_fmt_panic lint.
         ($msg:expr $(,)?) => (
-            $crate::panicking::panic_str($msg)
+            panic_str($msg)
         ),
         // Special-case the single-argument case for const_panic.
         ("{}", $arg:expr $(,)?) => (
-            $crate::panicking::panic_display(&$arg)
+            panic_display(&$arg)
         ),
         ($fmt:expr, $($arg:tt)+) => (
-            $crate::panicking::panic_fmt($crate::const_format_args!($fmt, $($arg)+))
+            panic_fmt(const_format_args!($fmt, $($arg)+))
         ),
     }
 }
 
-#[rustc_builtin_macro(std_panic)]
-#[macro_export]
-macro_rules! panic {}
-#[rustc_builtin_macro]
-macro_rules! assert {}
-#[rustc_builtin_macro]
-macro_rules! asm {}
-
 macro_rules! toho {
     () => ($crate::panic!("not yet implemented"));
-    ($($arg:tt)+) => ($crate::panic!("not yet implemented: {}", $crate::format_args!($($arg)+)));
+    ($($arg:tt)+) => ($crate::panic!("not yet implemented: {}", format_args!($($arg)+)));
+}
+
+macro_rules! reuse_twice {
+    ($literal:literal) => {{stringify!($literal); format_args!($literal)}};
 }
 
 fn main() {
+    let a = '\n';
+    let a = '\t';
+    let a = '\e'; // invalid escape
+    let a = 'e';
+    let a = ' ';
+    let a = '\u{48}';
+    let a = '\u{4823}';
+    let a = '\x65';
+    let a = '\x00';
+
+    let a = b'\xFF';
+
     println!("Hello {{Hello}}");
     // from https://doc.rust-lang.org/std/fmt/index.html
     println!("Hello");                 // => "Hello"
@@ -493,8 +506,10 @@ fn main() {
     println!("Hello\nWorld");
     println!("\u{48}\x65\x6C\x6C\x6F World");
 
-    let _ = "\x28\x28\x00\x63\n";
-    let _ = b"\x28\x28\x00\x63\n";
+    let _ = "\x28\x28\x00\x63\xFF\u{FF}\n"; // invalid non-UTF8 escape sequences
+    let _ = b"\x28\x28\x00\x63\xFF\u{FF}\n"; // valid bytes, invalid unicodes
+    let _ = c"\u{FF}\xFF"; // valid bytes, valid unicodes
+    let backslash = r"\\";
 
     println!("{\x41}", A = 92);
     println!("{ничоси}", ничоси = 92);
@@ -505,8 +520,20 @@ fn main() {
     assert!(true, "{}", 1);
     assert!(true, "{} asdasd", 1);
     toho!("{}fmt", 0);
-    asm!("mov eax, {0}");
+    let i: u64 = 3;
+    let o: u64;
+    asm!(
+        "mov {0}, {1}",
+        "add {0}, 5",
+        out(reg) o,
+        in(reg) i,
+    );
+
+    const CONSTANT: () = ():
+    let mut m = ();
     format_args!(concat!("{}"), "{}");
+    format_args!("{} {} {} {} {} {} {backslash} {CONSTANT} {m}", backslash, format_args!("{}", 0), foo, "bar", toho!(), backslash);
+    reuse_twice!("{backslash}");
 }"#,
         expect_file!["./test_data/highlight_strings.html"],
         false,
@@ -601,6 +628,52 @@ fn main() {
 }
 "#,
         expect_file!["./test_data/highlight_unsafe.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_const_highlighting() {
+    check_highlighting(
+        r#"
+macro_rules! id {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+const CONST_ITEM: *const () = &raw const ();
+const fn const_fn<const CONST_PARAM: ()>(const {}: const fn()) where (): const ConstTrait {
+    CONST_ITEM;
+    CONST_PARAM;
+    const {
+        const || {}
+    }
+    id!(
+        CONST_ITEM;
+        CONST_PARAM;
+        const {
+            const || {}
+        };
+        &raw const ();
+        const
+    );
+}
+trait ConstTrait {
+    const ASSOC_CONST: () = ();
+    const fn assoc_const_fn() {}
+}
+impl const ConstTrait for () {
+    const ASSOC_CONST: () = ();
+    const fn assoc_const_fn() {}
+}
+
+macro_rules! unsafe_deref {
+    () => {
+        *(&() as *const ())
+    };
+}
+"#,
+        expect_file!["./test_data/highlight_const.html"],
         false,
     );
 }
@@ -774,6 +847,7 @@ fn test_extern_crate() {
 //- /main.rs crate:main deps:std,alloc
 extern crate std;
 extern crate alloc as abc;
+extern crate unresolved as definitely_unresolved;
 //- /std/lib.rs crate:std
 pub struct S;
 //- /alloc/lib.rs crate:alloc
@@ -968,10 +1042,6 @@ pub struct Struct;
 }
 
 #[test]
-#[cfg_attr(
-    not(all(unix, target_pointer_width = "64")),
-    ignore = "depends on `DefaultHasher` outputs"
-)]
 fn test_rainbow_highlighting() {
     check_highlighting(
         r#"
@@ -990,6 +1060,35 @@ fn bar() {
 "#,
         expect_file!["./test_data/highlight_rainbow.html"],
         true,
+    );
+}
+
+#[test]
+fn test_block_mod_items() {
+    check_highlighting(
+        r#"
+macro_rules! foo {
+    ($foo:ident) => {
+        mod y {
+            struct $foo;
+        }
+    };
+}
+fn main() {
+    foo!(Foo);
+    mod module {
+        // FIXME: IDE layer has this unresolved
+        foo!(Bar);
+        fn func() {
+            mod inner {
+                struct Innerest<const C: usize> { field: [(); {C}] }
+            }
+        }
+    }
+}
+"#,
+        expect_file!["./test_data/highlight_block_mod_items.html"],
+        false,
     );
 }
 
@@ -1123,8 +1222,27 @@ fn benchmark_syntax_highlighting_parser() {
             .highlight(HL_CONFIG, file_id)
             .unwrap()
             .iter()
-            .filter(|it| it.highlight.tag == HlTag::Symbol(SymbolKind::Function))
+            .filter(|it| {
+                matches!(it.highlight.tag, HlTag::Symbol(SymbolKind::Function | SymbolKind::Method))
+            })
             .count()
     };
-    assert_eq!(hash, 1608);
+    assert_eq!(hash, 1169);
+}
+
+#[test]
+fn highlight_trait_with_lifetimes_regression_16958() {
+    let (analysis, file_id) = fixture::file(
+        r#"
+pub trait Deserialize<'de> {
+    fn deserialize();
+}
+
+fn f<'de, T: Deserialize<'de>>() {
+    T::deserialize();
+}
+"#
+        .trim(),
+    );
+    let _ = analysis.highlight(HL_CONFIG, file_id).unwrap();
 }

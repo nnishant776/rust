@@ -1,5 +1,4 @@
 use crate::borrow::Cow;
-use core::iter::FromIterator;
 
 use super::Vec;
 
@@ -13,6 +12,19 @@ impl<'a, T: Clone> From<&'a [T]> for Cow<'a, [T]> {
     /// [`Borrowed`]: crate::borrow::Cow::Borrowed
     fn from(s: &'a [T]) -> Cow<'a, [T]> {
         Cow::Borrowed(s)
+    }
+}
+
+#[stable(feature = "cow_from_array_ref", since = "1.77.0")]
+impl<'a, T: Clone, const N: usize> From<&'a [T; N]> for Cow<'a, [T]> {
+    /// Creates a [`Borrowed`] variant of [`Cow`]
+    /// from a reference to an array.
+    ///
+    /// This conversion does not allocate or clone the data.
+    ///
+    /// [`Borrowed`]: crate::borrow::Cow::Borrowed
+    fn from(s: &'a [T; N]) -> Cow<'a, [T]> {
+        Cow::Borrowed(s as &[_])
     }
 }
 

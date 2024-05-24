@@ -1,12 +1,13 @@
 //! Errors emitted by codegen_ssa
 
+use crate::assert_module_sources::CguReuse;
 use crate::back::command::Command;
 use crate::fluent_generated as fluent;
 use rustc_errors::{
-    DiagnosticArgValue, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
-    IntoDiagnosticArg,
+    codes::*, Diag, DiagArgValue, DiagCtxt, Diagnostic, EmissionGuarantee, IntoDiagArg, Level,
 };
 use rustc_macros::Diagnostic;
+use rustc_middle::ty::layout::LayoutError;
 use rustc_middle::ty::Ty;
 use rustc_span::{Span, Symbol};
 use rustc_type_ir::FloatTy;
@@ -14,6 +15,74 @@ use std::borrow::Cow;
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_incorrect_cgu_reuse_type)]
+pub struct IncorrectCguReuseType<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub cgu_user_name: &'a str,
+    pub actual_reuse: CguReuse,
+    pub expected_reuse: CguReuse,
+    pub at_least: u8,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_cgu_not_recorded)]
+pub struct CguNotRecorded<'a> {
+    pub cgu_user_name: &'a str,
+    pub cgu_name: &'a str,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_unknown_reuse_kind)]
+pub struct UnknownReuseKind {
+    #[primary_span]
+    pub span: Span,
+    pub kind: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_missing_query_depgraph)]
+pub struct MissingQueryDepGraph {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_malformed_cgu_name)]
+pub struct MalformedCguName {
+    #[primary_span]
+    pub span: Span,
+    pub user_path: String,
+    pub crate_name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_no_module_named)]
+pub struct NoModuleNamed<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub user_path: &'a str,
+    pub cgu_name: Symbol,
+    pub cgu_names: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_field_associated_value_expected)]
+pub struct FieldAssociatedValueExpected {
+    #[primary_span]
+    pub span: Span,
+    pub name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_no_field)]
+pub struct NoField {
+    #[primary_span]
+    pub span: Span,
+    pub name: Symbol,
+}
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_lib_def_write_failure)]
@@ -52,6 +121,12 @@ pub struct NoNatvisDirectory {
 }
 
 #[derive(Diagnostic)]
+#[diag(codegen_ssa_no_saved_object_file)]
+pub struct NoSavedObjectFile<'a> {
+    pub cgu_name: &'a str,
+}
+
+#[derive(Diagnostic)]
 #[diag(codegen_ssa_copy_path_buf)]
 pub struct CopyPathBuf {
     pub source_file: PathBuf,
@@ -76,10 +151,16 @@ impl<'a> CopyPath<'a> {
 
 struct DebugArgPath<'a>(pub &'a Path);
 
-impl IntoDiagnosticArg for DebugArgPath<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        DiagnosticArgValue::Str(Cow::Owned(format!("{:?}", self.0)))
+impl IntoDiagArg for DebugArgPath<'_> {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        DiagArgValue::Str(Cow::Owned(format!("{:?}", self.0)))
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_binary_output_to_tty)]
+pub struct BinaryOutputToTty {
+    pub shorthand: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -99,10 +180,6 @@ pub struct IgnoringOutput {
 pub struct CreateTempDir {
     pub error: Error,
 }
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_incompatible_linking_modifiers)]
-pub struct IncompatibleLinkingModifiers;
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_add_native_library)]
@@ -137,195 +214,126 @@ pub enum LinkRlibError {
 
 pub struct ThorinErrorWrapper(pub thorin::Error);
 
-impl IntoDiagnostic<'_> for ThorinErrorWrapper {
-    fn into_diagnostic(self, handler: &Handler) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
-        let mut diag;
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for ThorinErrorWrapper {
+    fn into_diag(self, dcx: &DiagCtxt, level: Level) -> Diag<'_, G> {
+        let build = |msg| Diag::new(dcx, level, msg);
         match self.0 {
-            thorin::Error::ReadInput(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_read_input_failure);
-                diag
-            }
+            thorin::Error::ReadInput(_) => build(fluent::codegen_ssa_thorin_read_input_failure),
             thorin::Error::ParseFileKind(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_input_file_kind);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_input_file_kind)
             }
             thorin::Error::ParseObjectFile(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_input_object_file);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_input_object_file)
             }
             thorin::Error::ParseArchiveFile(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_input_archive_file);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_input_archive_file)
             }
             thorin::Error::ParseArchiveMember(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_archive_member);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_archive_member)
             }
-            thorin::Error::InvalidInputKind => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_invalid_input_kind);
-                diag
-            }
-            thorin::Error::DecompressData(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_decompress_data);
-                diag
-            }
+            thorin::Error::InvalidInputKind => build(fluent::codegen_ssa_thorin_invalid_input_kind),
+            thorin::Error::DecompressData(_) => build(fluent::codegen_ssa_thorin_decompress_data),
             thorin::Error::NamelessSection(_, offset) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_section_without_name);
-                diag.set_arg("offset", format!("0x{:08x}", offset));
-                diag
+                build(fluent::codegen_ssa_thorin_section_without_name)
+                    .with_arg("offset", format!("0x{offset:08x}"))
             }
             thorin::Error::RelocationWithInvalidSymbol(section, offset) => {
-                diag =
-                    handler.struct_err(fluent::codegen_ssa_thorin_relocation_with_invalid_symbol);
-                diag.set_arg("section", section);
-                diag.set_arg("offset", format!("0x{:08x}", offset));
-                diag
+                build(fluent::codegen_ssa_thorin_relocation_with_invalid_symbol)
+                    .with_arg("section", section)
+                    .with_arg("offset", format!("0x{offset:08x}"))
             }
             thorin::Error::MultipleRelocations(section, offset) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_multiple_relocations);
-                diag.set_arg("section", section);
-                diag.set_arg("offset", format!("0x{:08x}", offset));
-                diag
+                build(fluent::codegen_ssa_thorin_multiple_relocations)
+                    .with_arg("section", section)
+                    .with_arg("offset", format!("0x{offset:08x}"))
             }
             thorin::Error::UnsupportedRelocation(section, offset) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_unsupported_relocation);
-                diag.set_arg("section", section);
-                diag.set_arg("offset", format!("0x{:08x}", offset));
-                diag
+                build(fluent::codegen_ssa_thorin_unsupported_relocation)
+                    .with_arg("section", section)
+                    .with_arg("offset", format!("0x{offset:08x}"))
             }
-            thorin::Error::MissingDwoName(id) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_missing_dwo_name);
-                diag.set_arg("id", format!("0x{:08x}", id));
-                diag
-            }
+            thorin::Error::MissingDwoName(id) => build(fluent::codegen_ssa_thorin_missing_dwo_name)
+                .with_arg("id", format!("0x{id:08x}")),
             thorin::Error::NoCompilationUnits => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_no_compilation_units);
-                diag
+                build(fluent::codegen_ssa_thorin_no_compilation_units)
             }
-            thorin::Error::NoDie => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_no_die);
-                diag
-            }
+            thorin::Error::NoDie => build(fluent::codegen_ssa_thorin_no_die),
             thorin::Error::TopLevelDieNotUnit => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_top_level_die_not_unit);
-                diag
+                build(fluent::codegen_ssa_thorin_top_level_die_not_unit)
             }
             thorin::Error::MissingRequiredSection(section) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_missing_required_section);
-                diag.set_arg("section", section);
-                diag
+                build(fluent::codegen_ssa_thorin_missing_required_section)
+                    .with_arg("section", section)
             }
             thorin::Error::ParseUnitAbbreviations(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_unit_abbreviations);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_unit_abbreviations)
             }
             thorin::Error::ParseUnitAttribute(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_unit_attribute);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_unit_attribute)
             }
             thorin::Error::ParseUnitHeader(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_unit_header);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_unit_header)
             }
-            thorin::Error::ParseUnit(_) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_unit);
-                diag
-            }
+            thorin::Error::ParseUnit(_) => build(fluent::codegen_ssa_thorin_parse_unit),
             thorin::Error::IncompatibleIndexVersion(section, format, actual) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_incompatible_index_version);
-                diag.set_arg("section", section);
-                diag.set_arg("actual", actual);
-                diag.set_arg("format", format);
-                diag
+                build(fluent::codegen_ssa_thorin_incompatible_index_version)
+                    .with_arg("section", section)
+                    .with_arg("actual", actual)
+                    .with_arg("format", format)
             }
             thorin::Error::OffsetAtIndex(_, index) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_offset_at_index);
-                diag.set_arg("index", index);
-                diag
+                build(fluent::codegen_ssa_thorin_offset_at_index).with_arg("index", index)
             }
             thorin::Error::StrAtOffset(_, offset) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_str_at_offset);
-                diag.set_arg("offset", format!("0x{:08x}", offset));
-                diag
+                build(fluent::codegen_ssa_thorin_str_at_offset)
+                    .with_arg("offset", format!("0x{offset:08x}"))
             }
             thorin::Error::ParseIndex(_, section) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_parse_index);
-                diag.set_arg("section", section);
-                diag
+                build(fluent::codegen_ssa_thorin_parse_index).with_arg("section", section)
             }
             thorin::Error::UnitNotInIndex(unit) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_unit_not_in_index);
-                diag.set_arg("unit", format!("0x{:08x}", unit));
-                diag
+                build(fluent::codegen_ssa_thorin_unit_not_in_index)
+                    .with_arg("unit", format!("0x{unit:08x}"))
             }
             thorin::Error::RowNotInIndex(_, row) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_row_not_in_index);
-                diag.set_arg("row", row);
-                diag
+                build(fluent::codegen_ssa_thorin_row_not_in_index).with_arg("row", row)
             }
-            thorin::Error::SectionNotInRow => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_section_not_in_row);
-                diag
-            }
-            thorin::Error::EmptyUnit(unit) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_empty_unit);
-                diag.set_arg("unit", format!("0x{:08x}", unit));
-                diag
-            }
+            thorin::Error::SectionNotInRow => build(fluent::codegen_ssa_thorin_section_not_in_row),
+            thorin::Error::EmptyUnit(unit) => build(fluent::codegen_ssa_thorin_empty_unit)
+                .with_arg("unit", format!("0x{unit:08x}")),
             thorin::Error::MultipleDebugInfoSection => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_multiple_debug_info_section);
-                diag
+                build(fluent::codegen_ssa_thorin_multiple_debug_info_section)
             }
             thorin::Error::MultipleDebugTypesSection => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_multiple_debug_types_section);
-                diag
+                build(fluent::codegen_ssa_thorin_multiple_debug_types_section)
             }
-            thorin::Error::NotSplitUnit => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_not_split_unit);
-                diag
-            }
-            thorin::Error::DuplicateUnit(unit) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_duplicate_unit);
-                diag.set_arg("unit", format!("0x{:08x}", unit));
-                diag
-            }
+            thorin::Error::NotSplitUnit => build(fluent::codegen_ssa_thorin_not_split_unit),
+            thorin::Error::DuplicateUnit(unit) => build(fluent::codegen_ssa_thorin_duplicate_unit)
+                .with_arg("unit", format!("0x{unit:08x}")),
             thorin::Error::MissingReferencedUnit(unit) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_missing_referenced_unit);
-                diag.set_arg("unit", format!("0x{:08x}", unit));
-                diag
+                build(fluent::codegen_ssa_thorin_missing_referenced_unit)
+                    .with_arg("unit", format!("0x{unit:08x}"))
             }
             thorin::Error::NoOutputObjectCreated => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_not_output_object_created);
-                diag
+                build(fluent::codegen_ssa_thorin_not_output_object_created)
             }
             thorin::Error::MixedInputEncodings => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_mixed_input_encodings);
-                diag
+                build(fluent::codegen_ssa_thorin_mixed_input_encodings)
             }
             thorin::Error::Io(e) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_io);
-                diag.set_arg("error", format!("{e}"));
-                diag
+                build(fluent::codegen_ssa_thorin_io).with_arg("error", format!("{e}"))
             }
             thorin::Error::ObjectRead(e) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_object_read);
-                diag.set_arg("error", format!("{e}"));
-                diag
+                build(fluent::codegen_ssa_thorin_object_read).with_arg("error", format!("{e}"))
             }
             thorin::Error::ObjectWrite(e) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_object_write);
-                diag.set_arg("error", format!("{e}"));
-                diag
+                build(fluent::codegen_ssa_thorin_object_write).with_arg("error", format!("{e}"))
             }
             thorin::Error::GimliRead(e) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_gimli_read);
-                diag.set_arg("error", format!("{e}"));
-                diag
+                build(fluent::codegen_ssa_thorin_gimli_read).with_arg("error", format!("{e}"))
             }
             thorin::Error::GimliWrite(e) => {
-                diag = handler.struct_err(fluent::codegen_ssa_thorin_gimli_write);
-                diag.set_arg("error", format!("{e}"));
-                diag
+                build(fluent::codegen_ssa_thorin_gimli_write).with_arg("error", format!("{e}"))
             }
             _ => unimplemented!("Untranslated thorin error"),
         }
@@ -336,23 +344,28 @@ pub struct LinkingFailed<'a> {
     pub linker_path: &'a PathBuf,
     pub exit_status: ExitStatus,
     pub command: &'a Command,
-    pub escaped_output: &'a str,
+    pub escaped_output: String,
 }
 
-impl IntoDiagnostic<'_> for LinkingFailed<'_> {
-    fn into_diagnostic(self, handler: &Handler) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
-        let mut diag = handler.struct_err(fluent::codegen_ssa_linking_failed);
-        diag.set_arg("linker_path", format!("{}", self.linker_path.display()));
-        diag.set_arg("exit_status", format!("{}", self.exit_status));
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for LinkingFailed<'_> {
+    fn into_diag(self, dcx: &DiagCtxt, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::codegen_ssa_linking_failed);
+        diag.arg("linker_path", format!("{}", self.linker_path.display()));
+        diag.arg("exit_status", format!("{}", self.exit_status));
+
+        let contains_undefined_ref = self.escaped_output.contains("undefined reference to");
 
         diag.note(format!("{:?}", self.command)).note(self.escaped_output);
 
         // Trying to match an error from OS linkers
         // which by now we have no way to translate.
-        if self.escaped_output.contains("undefined reference to") {
+        if contains_undefined_ref {
             diag.note(fluent::codegen_ssa_extern_funcs_not_found)
-                .note(fluent::codegen_ssa_specify_libraries_to_link)
-                .note(fluent::codegen_ssa_use_cargo_directive);
+                .note(fluent::codegen_ssa_specify_libraries_to_link);
+
+            if rustc_session::utils::was_invoked_from_cargo() {
+                diag.note(fluent::codegen_ssa_use_cargo_directive);
+            }
         }
         diag
     }
@@ -401,12 +414,16 @@ pub struct UnableToExeLinker {
 pub struct MsvcMissingLinker;
 
 #[derive(Diagnostic)]
+#[diag(codegen_ssa_self_contained_linker_missing)]
+pub struct SelfContainedLinkerMissing;
+
+#[derive(Diagnostic)]
 #[diag(codegen_ssa_check_installed_visual_studio)]
 pub struct CheckInstalledVisualStudio;
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_unsufficient_vs_code_product)]
-pub struct UnsufficientVSCodeProduct;
+#[diag(codegen_ssa_insufficient_vs_code_product)]
+pub struct InsufficientVSCodeProduct;
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_processing_dymutil_failed)]
@@ -418,13 +435,12 @@ pub struct ProcessingDymutilFailed {
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_unable_to_run_dsymutil)]
-#[note]
 pub struct UnableToRunDsymutil {
     pub error: Error,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_stripping_debu_info_failed)]
+#[diag(codegen_ssa_stripping_debug_info_failed)]
 #[note]
 pub struct StrippingDebugInfoFailed<'a> {
     pub util: &'a str,
@@ -446,6 +462,12 @@ pub struct LinkerFileStem;
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_static_library_native_artifacts)]
 pub struct StaticLibraryNativeArtifacts;
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_static_library_native_artifacts_to_file)]
+pub struct StaticLibraryNativeArtifactsToFile<'a> {
+    pub path: &'a Path,
+}
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_link_script_unavailable)]
@@ -477,10 +499,6 @@ pub struct UnableToWriteDebuggerVisualizer {
 pub struct RlibArchiveBuildFailure {
     pub error: Error,
 }
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_option_gcc_only)]
-pub struct OptionGccOnly;
 
 #[derive(Diagnostic)]
 pub enum ExtractBundledLibsError<'a> {
@@ -547,6 +565,13 @@ pub struct UnknownArchiveKind<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag(codegen_ssa_expected_coverage_symbol)]
+pub struct ExpectedCoverageSymbol {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(codegen_ssa_expected_used_symbol)]
 pub struct ExpectedUsedSymbol {
     #[primary_span]
@@ -574,20 +599,6 @@ pub struct InvalidWindowsSubsystem {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_erroneous_constant)]
-pub struct ErroneousConstant {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_polymorphic_constant_too_generic)]
-pub struct PolymorphicConstantTooGeneric {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(codegen_ssa_shuffle_indices_evaluation)]
 pub struct ShuffleIndicesEvaluation {
     #[primary_span]
@@ -612,7 +623,7 @@ pub struct UnknownAtomicOperation;
 
 #[derive(Diagnostic)]
 pub enum InvalidMonomorphization<'tcx> {
-    #[diag(codegen_ssa_invalid_monomorphization_basic_integer_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_basic_integer_type, code = E0511)]
     BasicIntegerType {
         #[primary_span]
         span: Span,
@@ -620,7 +631,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_basic_float_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_basic_float_type, code = E0511)]
     BasicFloatType {
         #[primary_span]
         span: Span,
@@ -628,14 +639,14 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_float_to_int_unchecked, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_float_to_int_unchecked, code = E0511)]
     FloatToIntUnchecked {
         #[primary_span]
         span: Span,
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_floating_point_vector, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_vector, code = E0511)]
     FloatingPointVector {
         #[primary_span]
         span: Span,
@@ -644,7 +655,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_floating_point_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_type, code = E0511)]
     FloatingPointType {
         #[primary_span]
         span: Span,
@@ -652,14 +663,14 @@ pub enum InvalidMonomorphization<'tcx> {
         in_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unrecognized_intrinsic, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unrecognized_intrinsic, code = E0511)]
     UnrecognizedIntrinsic {
         #[primary_span]
         span: Span,
         name: Symbol,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_argument, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_argument, code = E0511)]
     SimdArgument {
         #[primary_span]
         span: Span,
@@ -667,7 +678,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_input, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_input, code = E0511)]
     SimdInput {
         #[primary_span]
         span: Span,
@@ -675,7 +686,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_first, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_first, code = E0511)]
     SimdFirst {
         #[primary_span]
         span: Span,
@@ -683,7 +694,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_second, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_second, code = E0511)]
     SimdSecond {
         #[primary_span]
         span: Span,
@@ -691,7 +702,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_third, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_third, code = E0511)]
     SimdThird {
         #[primary_span]
         span: Span,
@@ -699,7 +710,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_return, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_return, code = E0511)]
     SimdReturn {
         #[primary_span]
         span: Span,
@@ -707,7 +718,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_invalid_bitmask, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_invalid_bitmask, code = E0511)]
     InvalidBitmask {
         #[primary_span]
         span: Span,
@@ -717,7 +728,7 @@ pub enum InvalidMonomorphization<'tcx> {
         expected_bytes: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_length_input_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_length_input_type, code = E0511)]
     ReturnLengthInputType {
         #[primary_span]
         span: Span,
@@ -728,7 +739,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_second_argument_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_second_argument_length, code = E0511)]
     SecondArgumentLength {
         #[primary_span]
         span: Span,
@@ -739,7 +750,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_third_argument_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_third_argument_length, code = E0511)]
     ThirdArgumentLength {
         #[primary_span]
         span: Span,
@@ -750,7 +761,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_integer_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_integer_type, code = E0511)]
     ReturnIntegerType {
         #[primary_span]
         span: Span,
@@ -759,7 +770,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_shuffle, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_shuffle, code = E0511)]
     SimdShuffle {
         #[primary_span]
         span: Span,
@@ -767,7 +778,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_length, code = E0511)]
     ReturnLength {
         #[primary_span]
         span: Span,
@@ -777,7 +788,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_element, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_element, code = E0511)]
     ReturnElement {
         #[primary_span]
         span: Span,
@@ -788,16 +799,8 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_not_constant, code = "E0511")]
-    ShuffleIndexNotConstant {
-        #[primary_span]
-        span: Span,
-        name: Symbol,
-        arg_idx: u64,
-    },
-
-    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_out_of_bounds, code = "E0511")]
-    ShuffleIndexOutOfBounds {
+    #[diag(codegen_ssa_invalid_monomorphization_simd_index_out_of_bounds, code = E0511)]
+    SimdIndexOutOfBounds {
         #[primary_span]
         span: Span,
         name: Symbol,
@@ -805,7 +808,7 @@ pub enum InvalidMonomorphization<'tcx> {
         total_len: u128,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_inserted_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_inserted_type, code = E0511)]
     InsertedType {
         #[primary_span]
         span: Span,
@@ -815,7 +818,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_type, code = E0511)]
     ReturnType {
         #[primary_span]
         span: Span,
@@ -825,7 +828,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_return_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_return_type, code = E0511)]
     ExpectedReturnType {
         #[primary_span]
         span: Span,
@@ -834,7 +837,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_mismatched_lengths, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_mismatched_lengths, code = E0511)]
     MismatchedLengths {
         #[primary_span]
         span: Span,
@@ -843,7 +846,7 @@ pub enum InvalidMonomorphization<'tcx> {
         v_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_mask_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_mask_type, code = E0511)]
     MaskType {
         #[primary_span]
         span: Span,
@@ -851,7 +854,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_vector_argument, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_vector_argument, code = E0511)]
     VectorArgument {
         #[primary_span]
         span: Span,
@@ -860,7 +863,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_cannot_return, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_cannot_return, code = E0511)]
     CannotReturn {
         #[primary_span]
         span: Span,
@@ -870,7 +873,7 @@ pub enum InvalidMonomorphization<'tcx> {
         expected_bytes: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_element_type, code = E0511)]
     ExpectedElementType {
         #[primary_span]
         span: Span,
@@ -882,7 +885,7 @@ pub enum InvalidMonomorphization<'tcx> {
         mutability: ExpectedPointerMutability,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_third_arg_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_third_arg_element_type, code = E0511)]
     ThirdArgElementType {
         #[primary_span]
         span: Span,
@@ -891,7 +894,7 @@ pub enum InvalidMonomorphization<'tcx> {
         third_arg: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size, code = E0511)]
     UnsupportedSymbolOfSize {
         #[primary_span]
         span: Span,
@@ -903,7 +906,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol, code = E0511)]
     UnsupportedSymbol {
         #[primary_span]
         span: Span,
@@ -914,7 +917,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_cast_fat_pointer, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_cast_fat_pointer, code = E0511)]
     CastFatPointer {
         #[primary_span]
         span: Span,
@@ -922,7 +925,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_pointer, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_pointer, code = E0511)]
     ExpectedPointer {
         #[primary_span]
         span: Span,
@@ -930,7 +933,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_usize, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_usize, code = E0511)]
     ExpectedUsize {
         #[primary_span]
         span: Span,
@@ -938,7 +941,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_cast, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_cast, code = E0511)]
     UnsupportedCast {
         #[primary_span]
         span: Span,
@@ -949,7 +952,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_operation, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_operation, code = E0511)]
     UnsupportedOperation {
         #[primary_span]
         span: Span,
@@ -958,7 +961,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_vector_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_vector_element_type, code = E0511)]
     ExpectedVectorElementType {
         #[primary_span]
         span: Span,
@@ -973,11 +976,67 @@ pub enum ExpectedPointerMutability {
     Not,
 }
 
-impl IntoDiagnosticArg for ExpectedPointerMutability {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+impl IntoDiagArg for ExpectedPointerMutability {
+    fn into_diag_arg(self) -> DiagArgValue {
         match self {
-            ExpectedPointerMutability::Mut => DiagnosticArgValue::Str(Cow::Borrowed("*mut")),
-            ExpectedPointerMutability::Not => DiagnosticArgValue::Str(Cow::Borrowed("*_")),
+            ExpectedPointerMutability::Mut => DiagArgValue::Str(Cow::Borrowed("*mut")),
+            ExpectedPointerMutability::Not => DiagArgValue::Str(Cow::Borrowed("*_")),
         }
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_invalid_no_sanitize)]
+#[note]
+pub struct InvalidNoSanitize {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_invalid_link_ordinal_nargs)]
+#[note]
+pub struct InvalidLinkOrdinalNargs {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_illegal_link_ordinal_format)]
+#[note]
+pub struct InvalidLinkOrdinalFormat {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_target_feature_safe_trait)]
+pub struct TargetFeatureSafeTrait {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[label(codegen_ssa_label_def)]
+    pub def: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_failed_to_get_layout)]
+pub struct FailedToGetLayout<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    pub err: LayoutError<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_error_creating_remark_dir)]
+pub struct ErrorCreatingRemarkDir {
+    pub error: std::io::Error,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_compiler_builtins_cannot_call)]
+pub struct CompilerBuiltinsCannotCall {
+    pub caller: String,
+    pub callee: String,
 }

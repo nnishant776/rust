@@ -18,10 +18,13 @@ use crate::llvm;
 use crate::llvm::AttributePlace::Function;
 use crate::type_::Type;
 use crate::value::Value;
+use itertools::Itertools;
 use rustc_codegen_ssa::traits::TypeMembershipMethods;
-use rustc_middle::ty::Ty;
-use rustc_symbol_mangling::typeid::{kcfi_typeid_for_fnabi, typeid_for_fnabi};
+use rustc_data_structures::fx::FxIndexSet;
+use rustc_middle::ty::{Instance, Ty};
+use rustc_sanitizers::{cfi, kcfi};
 use smallvec::SmallVec;
+use tracing::debug;
 
 /// Declare a function.
 ///
@@ -81,7 +84,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         fn_type: &'ll Type,
     ) -> &'ll Value {
         // Declare C ABI functions with the visibility used by C by default.
-        let visibility = if self.tcx.sess.target.default_hidden_visibility {
+        let visibility = if self.tcx.sess.default_hidden_visibility() {
             llvm::Visibility::Hidden
         } else {
             llvm::Visibility::Default
@@ -104,7 +107,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         unnamed: llvm::UnnamedAddr,
         fn_type: &'ll Type,
     ) -> &'ll Value {
-        let visibility = if self.tcx.sess.target.default_hidden_visibility {
+        let visibility = if self.tcx.sess.default_hidden_visibility() {
             llvm::Visibility::Hidden
         } else {
             llvm::Visibility::Default
@@ -116,7 +119,12 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     ///
     /// If there’s a value with the same name already declared, the function will
     /// update the declaration and return existing Value instead.
-    pub fn declare_fn(&self, name: &str, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> &'ll Value {
+    pub fn declare_fn(
+        &self,
+        name: &str,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+        instance: Option<Instance<'tcx>>,
+    ) -> &'ll Value {
         debug!("declare_rust_fn(name={:?}, fn_abi={:?})", name, fn_abi);
 
         // Function addresses in Rust are never significant, allowing functions to
@@ -132,13 +140,54 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         fn_abi.apply_attrs_llfn(self, llfn);
 
         if self.tcx.sess.is_sanitizer_cfi_enabled() {
-            let typeid = typeid_for_fnabi(self.tcx, fn_abi);
-            self.set_type_metadata(llfn, typeid);
+            if let Some(instance) = instance {
+                let mut typeids = FxIndexSet::default();
+                for options in [
+                    cfi::TypeIdOptions::GENERALIZE_POINTERS,
+                    cfi::TypeIdOptions::NORMALIZE_INTEGERS,
+                    cfi::TypeIdOptions::USE_CONCRETE_SELF,
+                ]
+                .into_iter()
+                .powerset()
+                .map(cfi::TypeIdOptions::from_iter)
+                {
+                    let typeid = cfi::typeid_for_instance(self.tcx, instance, options);
+                    if typeids.insert(typeid.clone()) {
+                        self.add_type_metadata(llfn, typeid);
+                    }
+                }
+            } else {
+                for options in [
+                    cfi::TypeIdOptions::GENERALIZE_POINTERS,
+                    cfi::TypeIdOptions::NORMALIZE_INTEGERS,
+                ]
+                .into_iter()
+                .powerset()
+                .map(cfi::TypeIdOptions::from_iter)
+                {
+                    let typeid = cfi::typeid_for_fnabi(self.tcx, fn_abi, options);
+                    self.add_type_metadata(llfn, typeid);
+                }
+            }
         }
 
         if self.tcx.sess.is_sanitizer_kcfi_enabled() {
-            let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi);
-            self.set_kcfi_type_metadata(llfn, kcfi_typeid);
+            // LLVM KCFI does not support multiple !kcfi_type attachments
+            let mut options = kcfi::TypeIdOptions::empty();
+            if self.tcx.sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+                options.insert(kcfi::TypeIdOptions::GENERALIZE_POINTERS);
+            }
+            if self.tcx.sess.is_sanitizer_cfi_normalize_integers_enabled() {
+                options.insert(kcfi::TypeIdOptions::NORMALIZE_INTEGERS);
+            }
+
+            if let Some(instance) = instance {
+                let kcfi_typeid = kcfi::typeid_for_instance(self.tcx, instance, options);
+                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
+            } else {
+                let kcfi_typeid = kcfi::typeid_for_fnabi(self.tcx, fn_abi, options);
+                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
+            }
         }
 
         llfn

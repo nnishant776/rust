@@ -56,7 +56,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![stable(feature = "alloc_module", since = "1.28.0")]
 
-use core::intrinsics;
+use core::hint;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::{mem, ptr};
@@ -93,7 +93,7 @@ pub use alloc_crate::alloc::*;
 ///
 /// ```rust
 /// use std::alloc::{System, GlobalAlloc, Layout};
-/// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+/// use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 ///
 /// struct Counter;
 ///
@@ -103,14 +103,14 @@ pub use alloc_crate::alloc::*;
 ///     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 ///         let ret = System.alloc(layout);
 ///         if !ret.is_null() {
-///             ALLOCATED.fetch_add(layout.size(), SeqCst);
+///             ALLOCATED.fetch_add(layout.size(), Relaxed);
 ///         }
 ///         ret
 ///     }
 ///
 ///     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 ///         System.dealloc(ptr, layout);
-///         ALLOCATED.fetch_sub(layout.size(), SeqCst);
+///         ALLOCATED.fetch_sub(layout.size(), Relaxed);
 ///     }
 /// }
 ///
@@ -118,7 +118,7 @@ pub use alloc_crate::alloc::*;
 /// static A: Counter = Counter;
 ///
 /// fn main() {
-///     println!("allocated bytes before main: {}", ALLOCATED.load(SeqCst));
+///     println!("allocated bytes before main: {}", ALLOCATED.load(Relaxed));
 /// }
 /// ```
 ///
@@ -172,7 +172,7 @@ impl System {
                 let new_size = new_layout.size();
 
                 // `realloc` probably checks for `new_size >= old_layout.size()` or something similar.
-                intrinsics::assume(new_size >= old_layout.size());
+                hint::assert_unchecked(new_size >= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -264,7 +264,7 @@ unsafe impl Allocator for System {
             // SAFETY: `new_size` is non-zero. Other conditions must be upheld by the caller
             new_size if old_layout.align() == new_layout.align() => unsafe {
                 // `realloc` probably checks for `new_size <= old_layout.size()` or something similar.
-                intrinsics::assume(new_size <= old_layout.size());
+                hint::assert_unchecked(new_size <= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -290,15 +290,29 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Registers a custom allocation error hook, replacing any that was previously registered.
 ///
-/// The allocation error hook is invoked when an infallible memory allocation fails, before
-/// the runtime aborts. The default hook prints a message to standard error,
-/// but this behavior can be customized with the [`set_alloc_error_hook`] and
-/// [`take_alloc_error_hook`] functions.
+/// The allocation error hook is invoked when an infallible memory allocation fails — that is,
+/// as a consequence of calling [`handle_alloc_error`] — before the runtime aborts.
 ///
-/// The hook is provided with a `Layout` struct which contains information
+/// The allocation error hook is a global resource. [`take_alloc_error_hook`] may be used to
+/// retrieve a previously registered hook and wrap or discard it.
+///
+/// # What the provided `hook` function should expect
+///
+/// The hook function is provided with a [`Layout`] struct which contains information
 /// about the allocation that failed.
 ///
-/// The allocation error hook is a global resource.
+/// The hook function may choose to panic or abort; in the event that it returns normally, this
+/// will cause an immediate abort.
+///
+/// Since [`take_alloc_error_hook`] is a safe function that allows retrieving the hook, the hook
+/// function must be _sound_ to call even if no memory allocations were attempted.
+///
+/// # The default hook
+///
+/// The default hook, used if [`set_alloc_error_hook`] is never called, prints a message to
+/// standard error (and then returns, causing the runtime to abort the process).
+/// Compiler options may cause it to panic instead, and the default behavior may be changed
+/// to panicking in future versions of Rust.
 ///
 /// # Examples
 ///
@@ -315,7 +329,7 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 /// ```
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn set_alloc_error_hook(hook: fn(Layout)) {
-    HOOK.store(hook as *mut (), Ordering::SeqCst);
+    HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 /// Unregisters the current allocation error hook, returning it.
@@ -325,7 +339,7 @@ pub fn set_alloc_error_hook(hook: fn(Layout)) {
 /// If no custom hook is registered, the default hook will be returned.
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn take_alloc_error_hook() -> fn(Layout) {
-    let hook = HOOK.swap(ptr::null_mut(), Ordering::SeqCst);
+    let hook = HOOK.swap(ptr::null_mut(), Ordering::Acquire);
     if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } }
 }
 
@@ -336,10 +350,15 @@ fn default_alloc_error_hook(layout: Layout) {
         static __rust_alloc_error_handler_should_panic: u8;
     }
 
-    #[allow(unused_unsafe)]
     if unsafe { __rust_alloc_error_handler_should_panic != 0 } {
         panic!("memory allocation of {} bytes failed", layout.size());
     } else {
+        // This is the default path taken on OOM, and the only path taken on stable with std.
+        // Crucially, it does *not* call any user-defined code, and therefore users do not have to
+        // worry about allocation failure causing reentrancy issues. That makes it different from
+        // the default `__rdl_oom` defined in alloc (i.e., the default alloc error handler that is
+        // called when there is no `#[alloc_error_handler]`), which triggers a regular panic and
+        // thus can invoke a user-defined panic hook, executing arbitrary user-defined code.
         rtprintpanic!("memory allocation of {} bytes failed\n", layout.size());
     }
 }
@@ -349,7 +368,7 @@ fn default_alloc_error_hook(layout: Layout) {
 #[alloc_error_handler]
 #[unstable(feature = "alloc_internals", issue = "none")]
 pub fn rust_oom(layout: Layout) -> ! {
-    let hook = HOOK.load(Ordering::SeqCst);
+    let hook = HOOK.load(Ordering::Acquire);
     let hook: fn(Layout) =
         if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } };
     hook(layout);

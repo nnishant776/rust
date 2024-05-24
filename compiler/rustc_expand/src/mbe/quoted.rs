@@ -1,19 +1,25 @@
+use crate::errors;
 use crate::mbe::macro_parser::count_metavar_decls;
 use crate::mbe::{Delimited, KleeneOp, KleeneToken, MetaVarExpr, SequenceRepetition, TokenTree};
 
-use rustc_ast::token::{self, Delimiter, Token};
+use rustc_ast::token::{self, Delimiter, IdentIsRaw, Token};
 use rustc_ast::{tokenstream, NodeId};
 use rustc_ast_pretty::pprust;
 use rustc_feature::Features;
-use rustc_session::parse::{feature_err, ParseSess};
+use rustc_session::parse::feature_err;
+use rustc_session::Session;
 use rustc_span::symbol::{kw, sym, Ident};
 
 use rustc_span::edition::Edition;
-use rustc_span::{Span, SyntaxContext};
+use rustc_span::Span;
 
 const VALID_FRAGMENT_NAMES_MSG: &str = "valid fragment specifiers are \
                                         `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, \
                                         `literal`, `path`, `meta`, `tt`, `item` and `vis`";
+const VALID_FRAGMENT_NAMES_MSG_2021: &str = "valid fragment specifiers are \
+                                             `ident`, `block`, `stmt`, `expr`, `expr_2021`, `pat`, \
+                                             `ty`, `lifetime`, `literal`, `path`, `meta`, `tt`, \
+                                             `item` and `vis`";
 
 /// Takes a `tokenstream::TokenStream` and returns a `Vec<self::TokenTree>`. Specifically, this
 /// takes a generic `TokenStream`, such as is used in the rest of the compiler, and returns a
@@ -36,9 +42,9 @@ const VALID_FRAGMENT_NAMES_MSG: &str = "valid fragment specifiers are \
 ///
 /// A collection of `self::TokenTree`. There may also be some errors emitted to `sess`.
 pub(super) fn parse(
-    input: tokenstream::TokenStream,
+    input: &tokenstream::TokenStream,
     parsing_patterns: bool,
-    sess: &ParseSess,
+    sess: &Session,
     node_id: NodeId,
     features: &Features,
     edition: Edition,
@@ -48,7 +54,7 @@ pub(super) fn parse(
 
     // For each token tree in `input`, parse the token into a `self::TokenTree`, consuming
     // additional trees if need be.
-    let mut trees = input.into_trees();
+    let mut trees = input.trees();
     while let Some(tree) = trees.next() {
         // Given the parsed tree, if there is a metavar and we are expecting matchers, actually
         // parse out the matcher (i.e., in `$id:ident` this would parse the `:` and `ident`).
@@ -56,50 +62,79 @@ pub(super) fn parse(
         match tree {
             TokenTree::MetaVar(start_sp, ident) if parsing_patterns => {
                 let span = match trees.next() {
-                    Some(tokenstream::TokenTree::Token(Token { kind: token::Colon, span }, _)) => {
+                    Some(&tokenstream::TokenTree::Token(
+                        Token { kind: token::Colon, span: colon_span },
+                        _,
+                    )) => {
                         match trees.next() {
                             Some(tokenstream::TokenTree::Token(token, _)) => match token.ident() {
-                                Some((frag, _)) => {
+                                Some((fragment, _)) => {
                                     let span = token.span.with_lo(start_sp.lo());
-
+                                    let edition = || {
+                                        // FIXME(#85708) - once we properly decode a foreign
+                                        // crate's `SyntaxContext::root`, then we can replace
+                                        // this with just `span.edition()`. A
+                                        // `SyntaxContext::root()` from the current crate will
+                                        // have the edition of the current crate, and a
+                                        // `SyntaxContext::root()` from a foreign crate will
+                                        // have the edition of that crate (which we manually
+                                        // retrieve via the `edition` parameter).
+                                        if !span.from_expansion() {
+                                            edition
+                                        } else {
+                                            span.edition()
+                                        }
+                                    };
                                     let kind =
-                                        token::NonterminalKind::from_symbol(frag.name, || {
-                                            // FIXME(#85708) - once we properly decode a foreign
-                                            // crate's `SyntaxContext::root`, then we can replace
-                                            // this with just `span.edition()`. A
-                                            // `SyntaxContext::root()` from the current crate will
-                                            // have the edition of the current crate, and a
-                                            // `SyntaxContext::root()` from a foreign crate will
-                                            // have the edition of that crate (which we manually
-                                            // retrieve via the `edition` parameter).
-                                            if span.ctxt() == SyntaxContext::root() {
-                                                edition
-                                            } else {
-                                                span.edition()
-                                            }
-                                        })
-                                        .unwrap_or_else(
-                                            || {
-                                                let msg = format!(
-                                                    "invalid fragment specifier `{}`",
-                                                    frag.name
+                                        token::NonterminalKind::from_symbol(fragment.name, edition)
+                                            .unwrap_or_else(|| {
+                                                let help = match fragment.name {
+                                                    sym::expr_2021 => {
+                                                        format!(
+                                                            "fragment specifier `expr_2021` \
+                                                             requires Rust 2021 or later\n\
+                                                             {VALID_FRAGMENT_NAMES_MSG}"
+                                                        )
+                                                    }
+                                                    _ if edition().at_least_rust_2021()
+                                                        && features
+                                                            .expr_fragment_specifier_2024 =>
+                                                    {
+                                                        VALID_FRAGMENT_NAMES_MSG_2021.into()
+                                                    }
+                                                    _ => VALID_FRAGMENT_NAMES_MSG.into(),
+                                                };
+                                                sess.dcx().emit_err(
+                                                    errors::InvalidFragmentSpecifier {
+                                                        span,
+                                                        fragment,
+                                                        help,
+                                                    },
                                                 );
-                                                sess.span_diagnostic
-                                                    .struct_span_err(span, &msg)
-                                                    .help(VALID_FRAGMENT_NAMES_MSG)
-                                                    .emit();
                                                 token::NonterminalKind::Ident
-                                            },
-                                        );
+                                            });
+                                    if kind == token::NonterminalKind::Expr2021
+                                        && !features.expr_fragment_specifier_2024
+                                    {
+                                        rustc_session::parse::feature_err(
+                                            sess,
+                                            sym::expr_fragment_specifier_2024,
+                                            span,
+                                            "fragment specifier `expr_2021` is unstable",
+                                        )
+                                        .emit();
+                                    }
                                     result.push(TokenTree::MetaVarDecl(span, ident, Some(kind)));
                                     continue;
                                 }
                                 _ => token.span,
                             },
-                            tree => tree.as_ref().map_or(span, tokenstream::TokenTree::span),
+                            Some(tree) => tree.span(),
+                            None => colon_span,
                         }
                     }
-                    tree => tree.as_ref().map_or(start_sp, tokenstream::TokenTree::span),
+                    Some(tree) => tree.span(),
+                    None => start_sp,
                 };
 
                 result.push(TokenTree::MetaVarDecl(span, ident, None));
@@ -113,10 +148,10 @@ pub(super) fn parse(
 }
 
 /// Asks for the `macro_metavar_expr` feature if it is not already declared
-fn maybe_emit_macro_metavar_expr_feature(features: &Features, sess: &ParseSess, span: Span) {
+fn maybe_emit_macro_metavar_expr_feature(features: &Features, sess: &Session, span: Span) {
     if !features.macro_metavar_expr {
         let msg = "meta-variable expressions are unstable";
-        feature_err(&sess, sym::macro_metavar_expr, span, msg).emit();
+        feature_err(sess, sym::macro_metavar_expr, span, msg).emit();
     }
 }
 
@@ -134,11 +169,11 @@ fn maybe_emit_macro_metavar_expr_feature(features: &Features, sess: &ParseSess, 
 /// - `parsing_patterns`: same as [parse].
 /// - `sess`: the parsing session. Any errors will be emitted to this session.
 /// - `features`: language features so we can do feature gating.
-fn parse_tree(
-    tree: tokenstream::TokenTree,
-    outer_trees: &mut impl Iterator<Item = tokenstream::TokenTree>,
+fn parse_tree<'a>(
+    tree: &'a tokenstream::TokenTree,
+    outer_trees: &mut impl Iterator<Item = &'a tokenstream::TokenTree>,
     parsing_patterns: bool,
-    sess: &ParseSess,
+    sess: &Session,
     node_id: NodeId,
     features: &Features,
     edition: Edition,
@@ -146,13 +181,13 @@ fn parse_tree(
     // Depending on what `tree` is, we could be parsing different parts of a macro
     match tree {
         // `tree` is a `$` token. Look at the next token in `trees`
-        tokenstream::TokenTree::Token(Token { kind: token::Dollar, span }, _) => {
+        &tokenstream::TokenTree::Token(Token { kind: token::Dollar, span: dollar_span }, _) => {
             // FIXME: Handle `Invisible`-delimited groups in a more systematic way
             // during parsing.
             let mut next = outer_trees.next();
-            let mut trees: Box<dyn Iterator<Item = tokenstream::TokenTree>>;
-            if let Some(tokenstream::TokenTree::Delimited(_, Delimiter::Invisible, tts)) = next {
-                trees = Box::new(tts.into_trees());
+            let mut trees: Box<dyn Iterator<Item = &tokenstream::TokenTree>>;
+            if let Some(tokenstream::TokenTree::Delimited(.., Delimiter::Invisible, tts)) = next {
+                trees = Box::new(tts.trees());
                 next = trees.next();
             } else {
                 trees = Box::new(outer_trees);
@@ -160,7 +195,7 @@ fn parse_tree(
 
             match next {
                 // `tree` is followed by a delimited set of token trees.
-                Some(tokenstream::TokenTree::Delimited(delim_span, delim, tts)) => {
+                Some(&tokenstream::TokenTree::Delimited(delim_span, _, delim, ref tts)) => {
                     if parsing_patterns {
                         if delim != Delimiter::Parenthesis {
                             span_dollar_dollar_or_metavar_in_the_lhs_err(
@@ -174,12 +209,12 @@ fn parse_tree(
                                 // The delimiter is `{`. This indicates the beginning
                                 // of a meta-variable expression (e.g. `${count(ident)}`).
                                 // Try to parse the meta-variable expression.
-                                match MetaVarExpr::parse(&tts, delim_span.entire(), sess) {
-                                    Err(mut err) => {
+                                match MetaVarExpr::parse(tts, delim_span.entire(), &sess.psess) {
+                                    Err(err) => {
                                         err.emit();
                                         // Returns early the same read `$` to avoid spanning
                                         // unrelated diagnostics that could be performed afterwards
-                                        return TokenTree::token(token::Dollar, span);
+                                        return TokenTree::token(token::Dollar, dollar_span);
                                     }
                                     Ok(elem) => {
                                         maybe_emit_macro_metavar_expr_feature(
@@ -193,9 +228,11 @@ fn parse_tree(
                             }
                             Delimiter::Parenthesis => {}
                             _ => {
-                                let tok = pprust::token_kind_to_string(&token::OpenDelim(delim));
-                                let msg = format!("expected `(` or `{{`, found `{}`", tok);
-                                sess.span_diagnostic.span_err(delim_span.entire(), &msg);
+                                let token = pprust::token_kind_to_string(&token::OpenDelim(delim));
+                                sess.dcx().emit_err(errors::ExpectedParenOrBrace {
+                                    span: delim_span.entire(),
+                                    token,
+                                });
                             }
                         }
                     }
@@ -219,8 +256,8 @@ fn parse_tree(
                 // special metavariable that names the crate of the invocation.
                 Some(tokenstream::TokenTree::Token(token, _)) if token.is_ident() => {
                     let (ident, is_raw) = token.ident().unwrap();
-                    let span = ident.span.with_lo(span.lo());
-                    if ident.name == kw::Crate && !is_raw {
+                    let span = ident.span.with_lo(dollar_span.lo());
+                    if ident.name == kw::Crate && matches!(is_raw, IdentIsRaw::No) {
                         TokenTree::token(token::Ident(kw::DollarCrate, is_raw), span)
                     } else {
                         TokenTree::MetaVar(span, ident)
@@ -228,40 +265,42 @@ fn parse_tree(
                 }
 
                 // `tree` is followed by another `$`. This is an escaped `$`.
-                Some(tokenstream::TokenTree::Token(Token { kind: token::Dollar, span }, _)) => {
+                Some(&tokenstream::TokenTree::Token(
+                    Token { kind: token::Dollar, span: dollar_span2 },
+                    _,
+                )) => {
                     if parsing_patterns {
                         span_dollar_dollar_or_metavar_in_the_lhs_err(
                             sess,
-                            &Token { kind: token::Dollar, span },
+                            &Token { kind: token::Dollar, span: dollar_span2 },
                         );
                     } else {
-                        maybe_emit_macro_metavar_expr_feature(features, sess, span);
+                        maybe_emit_macro_metavar_expr_feature(features, sess, dollar_span2);
                     }
-                    TokenTree::token(token::Dollar, span)
+                    TokenTree::token(token::Dollar, dollar_span2)
                 }
 
                 // `tree` is followed by some other token. This is an error.
                 Some(tokenstream::TokenTree::Token(token, _)) => {
-                    let msg = format!(
-                        "expected identifier, found `{}`",
-                        pprust::token_to_string(&token),
-                    );
-                    sess.span_diagnostic.span_err(token.span, &msg);
+                    let msg =
+                        format!("expected identifier, found `{}`", pprust::token_to_string(token),);
+                    sess.dcx().span_err(token.span, msg);
                     TokenTree::MetaVar(token.span, Ident::empty())
                 }
 
                 // There are no more tokens. Just return the `$` we already have.
-                None => TokenTree::token(token::Dollar, span),
+                None => TokenTree::token(token::Dollar, dollar_span),
             }
         }
 
         // `tree` is an arbitrary token. Keep it.
-        tokenstream::TokenTree::Token(token, _) => TokenTree::Token(token),
+        tokenstream::TokenTree::Token(token, _) => TokenTree::Token(token.clone()),
 
         // `tree` is the beginning of a delimited set of tokens (e.g., `(` or `{`). We need to
         // descend into the delimited set and further parse it.
-        tokenstream::TokenTree::Delimited(span, delim, tts) => TokenTree::Delimited(
+        &tokenstream::TokenTree::Delimited(span, spacing, delim, ref tts) => TokenTree::Delimited(
             span,
+            spacing,
             Delimited {
                 delim,
                 tts: parse(tts, parsing_patterns, sess, node_id, features, edition),
@@ -286,16 +325,16 @@ fn kleene_op(token: &Token) -> Option<KleeneOp> {
 /// - Ok(Ok((op, span))) if the next token tree is a KleeneOp
 /// - Ok(Err(tok, span)) if the next token tree is a token but not a KleeneOp
 /// - Err(span) if the next token tree is not a token
-fn parse_kleene_op(
-    input: &mut impl Iterator<Item = tokenstream::TokenTree>,
+fn parse_kleene_op<'a>(
+    input: &mut impl Iterator<Item = &'a tokenstream::TokenTree>,
     span: Span,
 ) -> Result<Result<(KleeneOp, Span), Token>, Span> {
     match input.next() {
-        Some(tokenstream::TokenTree::Token(token, _)) => match kleene_op(&token) {
+        Some(tokenstream::TokenTree::Token(token, _)) => match kleene_op(token) {
             Some(op) => Ok(Ok((op, token.span))),
-            None => Ok(Err(token)),
+            None => Ok(Err(token.clone())),
         },
-        tree => Err(tree.as_ref().map_or(span, tokenstream::TokenTree::span)),
+        tree => Err(tree.map_or(span, tokenstream::TokenTree::span)),
     }
 }
 
@@ -311,10 +350,10 @@ fn parse_kleene_op(
 /// session `sess`. If the next one (or possibly two) tokens in `input` correspond to a Kleene
 /// operator and separator, then a tuple with `(separator, KleeneOp)` is returned. Otherwise, an
 /// error with the appropriate span is emitted to `sess` and a dummy value is returned.
-fn parse_sep_and_kleene_op(
-    input: &mut impl Iterator<Item = tokenstream::TokenTree>,
+fn parse_sep_and_kleene_op<'a>(
+    input: &mut impl Iterator<Item = &'a tokenstream::TokenTree>,
     span: Span,
-    sess: &ParseSess,
+    sess: &Session,
 ) -> (Option<Token>, KleeneToken) {
     // We basically look at two token trees here, denoted as #1 and #2 below
     let span = match parse_kleene_op(input, span) {
@@ -326,7 +365,7 @@ fn parse_sep_and_kleene_op(
             // #2 is the `?` Kleene op, which does not take a separator (error)
             Ok(Ok((KleeneOp::ZeroOrOne, span))) => {
                 // Error!
-                sess.span_diagnostic.span_err(
+                sess.dcx().span_err(
                     token.span,
                     "the `?` macro repetition operator does not take a separator",
                 );
@@ -347,7 +386,7 @@ fn parse_sep_and_kleene_op(
     };
 
     // If we ever get to this point, we have experienced an "unexpected token" error
-    sess.span_diagnostic.span_err(span, "expected one of: `*`, `+`, or `?`");
+    sess.dcx().span_err(span, "expected one of: `*`, `+`, or `?`");
 
     // Return a dummy
     (None, KleeneToken::new(KleeneOp::ZeroOrMore, span))
@@ -355,11 +394,11 @@ fn parse_sep_and_kleene_op(
 
 // `$$` or a meta-variable is the lhs of a macro but shouldn't.
 //
-// For example, `macro_rules! foo { ( ${length()} ) => {} }`
-fn span_dollar_dollar_or_metavar_in_the_lhs_err(sess: &ParseSess, token: &Token) {
-    sess.span_diagnostic
-        .span_err(token.span, &format!("unexpected token: {}", pprust::token_to_string(token)));
-    sess.span_diagnostic.span_note_without_error(
+// For example, `macro_rules! foo { ( ${len()} ) => {} }`
+fn span_dollar_dollar_or_metavar_in_the_lhs_err(sess: &Session, token: &Token) {
+    sess.dcx()
+        .span_err(token.span, format!("unexpected token: {}", pprust::token_to_string(token)));
+    sess.dcx().span_note(
         token.span,
         "`$$` and meta-variable expressions are not allowed inside macro parameter definitions",
     );

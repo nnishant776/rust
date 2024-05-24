@@ -2,7 +2,7 @@ use crate::def_use::{self, DefUse};
 use crate::location::{LocationIndex, LocationTable};
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location, Place};
-use rustc_middle::ty::subst::GenericArg;
+use rustc_middle::ty::GenericArg;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 
 use super::TypeChecker;
@@ -20,7 +20,7 @@ struct UseFactsExtractor<'me, 'tcx> {
 }
 
 // A Visitor to walk through the MIR and extract point-wise facts
-impl UseFactsExtractor<'_, '_> {
+impl<'tcx> UseFactsExtractor<'_, 'tcx> {
     fn location_to_index(&self, location: Location) -> LocationIndex {
         self.location_table.mid_index(location)
     }
@@ -45,7 +45,7 @@ impl UseFactsExtractor<'_, '_> {
         self.path_accessed_at_base.push((path, self.location_to_index(location)));
     }
 
-    fn place_to_mpi(&self, place: &Place<'_>) -> Option<MovePathIndex> {
+    fn place_to_mpi(&self, place: &Place<'tcx>) -> Option<MovePathIndex> {
         match self.move_data.rev_lookup.find(place.as_ref()) {
             LookupResult::Exact(mpi) => Some(mpi),
             LookupResult::Parent(mmpi) => mmpi,
@@ -87,6 +87,8 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
     body: &Body<'tcx>,
     location_table: &LocationTable,
     move_data: &MoveData<'tcx>,
+    //FIXME: this is not mutated, but expected to be modified as
+    // out param, bug?
     dropped_at: &mut Vec<(Local, Location)>,
 ) {
     debug!("populate_access_facts()");
@@ -100,7 +102,7 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
             location_table,
             move_data,
         };
-        extractor.visit_body(&body);
+        extractor.visit_body(body);
 
         facts.var_dropped_at.extend(
             dropped_at.iter().map(|&(local, location)| (local, location_table.mid_index(location))),
@@ -115,7 +117,7 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
             let universal_regions = &typeck.borrowck_context.universal_regions;
             typeck.infcx.tcx.for_each_free_region(&local_decl.ty, |region| {
                 let region_vid = universal_regions.to_region_vid(region);
-                facts.use_of_var_derefs_origin.push((local, region_vid));
+                facts.use_of_var_derefs_origin.push((local, region_vid.into()));
             });
         }
     }
@@ -134,7 +136,7 @@ pub(super) fn add_drop_of_var_derefs_origin<'tcx>(
         let universal_regions = &typeck.borrowck_context.universal_regions;
         typeck.infcx.tcx.for_each_free_region(kind, |drop_live_region| {
             let region_vid = universal_regions.to_region_vid(drop_live_region);
-            facts.drop_of_var_derefs_origin.push((local, region_vid));
+            facts.drop_of_var_derefs_origin.push((local, region_vid.into()));
         });
     }
 }

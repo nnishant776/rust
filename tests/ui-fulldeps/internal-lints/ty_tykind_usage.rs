@@ -1,4 +1,4 @@
-// compile-flags: -Z unstable-options
+//@ compile-flags: -Z unstable-options
 
 #![feature(rustc_private)]
 
@@ -22,6 +22,7 @@ fn main() {
         TyKind::Foreign(..) => (),          //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Str => (),                  //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Array(..) => (),            //~ ERROR usage of `ty::TyKind::<kind>`
+        TyKind::Pat(..) => (),              //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Slice(..) => (),            //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::RawPtr(..) => (),           //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Ref(..) => (),              //~ ERROR usage of `ty::TyKind::<kind>`
@@ -29,9 +30,9 @@ fn main() {
         TyKind::FnPtr(..) => (),            //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Dynamic(..) => (),          //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Closure(..) => (),          //~ ERROR usage of `ty::TyKind::<kind>`
-        TyKind::Generator(..) => (),        //~ ERROR usage of `ty::TyKind::<kind>`
-        TyKind::GeneratorWitness(..) => (), //~ ERROR usage of `ty::TyKind::<kind>`
-        TyKind::GeneratorWitnessMIR(..) => (), //~ ERROR usage of `ty::TyKind::<kind>`
+        TyKind::CoroutineClosure(..) => (), //~ ERROR usage of `ty::TyKind::<kind>`
+        TyKind::Coroutine(..) => (),        //~ ERROR usage of `ty::TyKind::<kind>`
+        TyKind::CoroutineWitness(..) => (), //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Never => (),                //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Tuple(..) => (),            //~ ERROR usage of `ty::TyKind::<kind>`
         TyKind::Alias(..) => (),            //~ ERROR usage of `ty::TyKind::<kind>`

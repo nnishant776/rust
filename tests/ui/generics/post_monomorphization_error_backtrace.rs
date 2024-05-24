@@ -1,4 +1,4 @@
-// build-fail
+//@ build-fail
 
 fn assert_zst<T>() {
     struct F<T>(T);
@@ -11,7 +11,10 @@ fn assert_zst<T>() {
         //~| NOTE: in this expansion of assert!
         //~| NOTE: the evaluated program panicked
     }
-    let _ = F::<T>::V;
+    F::<T>::V;
+    //~^NOTE: erroneous constant
+    //~|NOTE: erroneous constant
+    //~|NOTE: duplicate
 }
 
 fn foo<U>() {

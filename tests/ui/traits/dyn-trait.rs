@@ -1,5 +1,4 @@
-// run-pass
-// ignore-pretty `dyn ::foo` parses differently in the current edition
+//@ run-pass
 
 use std::fmt::Display;
 

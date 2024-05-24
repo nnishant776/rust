@@ -1,4 +1,4 @@
-//! OS-based thread local storage
+//! OS-based thread local storage for non-Windows systems
 //!
 //! This module provides an implementation of OS-based thread local storage,
 //! using the native OS-provided facilities (think `TlsAlloc` or
@@ -10,6 +10,9 @@
 //! initialization, and does not contain a `Drop` implementation to deallocate
 //! the OS-TLS key. The other is a type which does implement `Drop` and hence
 //! has a safe interface.
+//!
+//! Windows doesn't use this module at all; `sys::pal::windows::thread_local_key`
+//! gets imported in its stead.
 //!
 //! # Usage
 //!
@@ -87,39 +90,20 @@ pub struct StaticKey {
     dtor: Option<unsafe extern "C" fn(*mut u8)>,
 }
 
-/// A type for a safely managed OS-based TLS slot.
-///
-/// This type allocates an OS TLS key when it is initialized and will deallocate
-/// the key when it falls out of scope. When compared with `StaticKey`, this
-/// type is entirely safe to use.
-///
-/// Implementations will likely, however, contain unsafe code as this type only
-/// operates on `*mut u8`, a raw pointer.
-///
-/// # Examples
-///
-/// ```ignore (cannot-doctest-private-modules)
-/// use tls::os::Key;
-///
-/// let key = Key::new(None);
-/// assert!(key.get().is_null());
-/// key.set(1 as *mut u8);
-/// assert!(!key.get().is_null());
-///
-/// drop(key); // deallocate this TLS slot.
-/// ```
-pub struct Key {
-    key: imp::Key,
-}
-
 /// Constant initialization value for static TLS keys.
 ///
 /// This value specifies no destructor by default.
 pub const INIT: StaticKey = StaticKey::new(None);
 
-// Define a sentinel value that is unlikely to be returned
-// as a TLS key (but it may be returned).
+// Define a sentinel value that is likely not to be returned
+// as a TLS key.
+#[cfg(not(target_os = "nto"))]
 const KEY_SENTVAL: usize = 0;
+// On QNX Neutrino, 0 is always returned when currently not in use.
+// Using 0 would mean to always create two keys and remote the first
+// one (with value of 0) immediately afterwards.
+#[cfg(target_os = "nto")]
+const KEY_SENTVAL: usize = libc::PTHREAD_KEYS_MAX + 1;
 
 impl StaticKey {
     #[rustc_const_unstable(feature = "thread_local_internals", issue = "none")]
@@ -147,7 +131,7 @@ impl StaticKey {
 
     #[inline]
     unsafe fn key(&self) -> imp::Key {
-        match self.key.load(Ordering::Relaxed) {
+        match self.key.load(Ordering::Acquire) {
             KEY_SENTVAL => self.lazy_init() as imp::Key,
             n => n as imp::Key,
         }
@@ -175,8 +159,8 @@ impl StaticKey {
         match self.key.compare_exchange(
             KEY_SENTVAL,
             key as usize,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::Release,
+            Ordering::Acquire,
         ) {
             // The CAS succeeded, so we've created the actual key
             Ok(_) => key as usize,
@@ -186,41 +170,5 @@ impl StaticKey {
                 n
             }
         }
-    }
-}
-
-impl Key {
-    /// Creates a new managed OS TLS key.
-    ///
-    /// This key will be deallocated when the key falls out of scope.
-    ///
-    /// The argument provided is an optionally-specified destructor for the
-    /// value of this TLS key. When a thread exits and the value for this key
-    /// is non-null the destructor will be invoked. The TLS value will be reset
-    /// to null before the destructor is invoked.
-    ///
-    /// Note that the destructor will not be run when the `Key` goes out of
-    /// scope.
-    #[inline]
-    pub fn new(dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Key {
-        Key { key: unsafe { imp::create(dtor) } }
-    }
-
-    /// See StaticKey::get
-    #[inline]
-    pub fn get(&self) -> *mut u8 {
-        unsafe { imp::get(self.key) }
-    }
-
-    /// See StaticKey::set
-    #[inline]
-    pub fn set(&self, val: *mut u8) {
-        unsafe { imp::set(self.key, val) }
-    }
-}
-
-impl Drop for Key {
-    fn drop(&mut self) {
-        unsafe { imp::destroy(self.key) }
     }
 }

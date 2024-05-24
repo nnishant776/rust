@@ -1,10 +1,12 @@
 use quote::{quote, ToTokens};
-use syn::{parse_quote, Attribute, Meta, NestedMeta};
+use syn::parse_quote;
 
 pub fn type_foldable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
     if let syn::Data::Union(_) = s.ast().data {
         panic!("cannot derive on union")
     }
+
+    s.underscore_const(true);
 
     if !s.ast().generics.lifetimes().any(|lt| lt.lifetime.ident == "tcx") {
         s.add_impl_generic(parse_quote! { 'tcx });
@@ -17,21 +19,20 @@ pub fn type_foldable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::
         vi.construct(|_, index| {
             let bind = &bindings[index];
 
+            let mut fixed = false;
+
             // retain value of fields with #[type_foldable(identity)]
-            let fixed = bind
-                .ast()
-                .attrs
-                .iter()
-                .map(Attribute::parse_meta)
-                .filter_map(Result::ok)
-                .flat_map(|attr| match attr {
-                    Meta::List(list) if list.path.is_ident("type_foldable") => list.nested,
-                    _ => Default::default(),
-                })
-                .any(|nested| match nested {
-                    NestedMeta::Meta(Meta::Path(path)) => path.is_ident("identity"),
-                    _ => false,
+            bind.ast().attrs.iter().for_each(|x| {
+                if !x.path().is_ident("type_foldable") {
+                    return;
+                }
+                let _ = x.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("identity") {
+                        fixed = true;
+                    }
+                    Ok(())
                 });
+            });
 
             if fixed {
                 bind.to_token_stream()

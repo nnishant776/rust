@@ -13,9 +13,15 @@ use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{scope, ScopedJoinHandle};
+use std::thread::{self, scope, ScopedJoinHandle};
 
 fn main() {
+    // Running Cargo will read the libstd Cargo.toml
+    // which uses the unstable `public-dependency` feature.
+    //
+    // `setenv` might not be thread safe, so run it before using multiple threads.
+    env::set_var("RUSTC_BOOTSTRAP", "1");
+
     let root_path: PathBuf = env::args_os().nth(1).expect("need path to root of repo").into();
     let cargo: PathBuf = env::args_os().nth(2).expect("need path to cargo").into();
     let output_directory: PathBuf =
@@ -29,11 +35,17 @@ fn main() {
     let library_path = root_path.join("library");
     let compiler_path = root_path.join("compiler");
     let librustdoc_path = src_path.join("librustdoc");
+    let crashes_path = tests_path.join("crashes");
 
     let args: Vec<String> = env::args().skip(1).collect();
-
-    let verbose = args.iter().any(|s| *s == "--verbose");
-    let bless = args.iter().any(|s| *s == "--bless");
+    let (cfg_args, pos_args) = match args.iter().position(|arg| arg == "--") {
+        Some(pos) => (&args[..pos], &args[pos + 1..]),
+        None => (&args[..], [].as_slice()),
+    };
+    let verbose = cfg_args.iter().any(|s| *s == "--verbose");
+    let bless = cfg_args.iter().any(|s| *s == "--bless");
+    let extra_checks =
+        cfg_args.iter().find(|s| s.starts_with("--extra-checks=")).map(String::as_str);
 
     let bad = std::sync::Arc::new(AtomicBool::new(false));
 
@@ -55,16 +67,28 @@ fn main() {
             VecDeque::with_capacity(concurrency.get());
 
         macro_rules! check {
-            ($p:ident $(, $args:expr)* ) => {
+            ($p:ident) => {
+                check!(@ $p, name=format!("{}", stringify!($p)));
+            };
+            ($p:ident, $path:expr $(, $args:expr)* ) => {
+                let shortened = $path.strip_prefix(&root_path).unwrap();
+                let name = if shortened == std::path::Path::new("") {
+                    format!("{} (.)", stringify!($p))
+                } else {
+                    format!("{} ({})", stringify!($p), shortened.display())
+                };
+                check!(@ $p, name=name, $path $(,$args)*);
+            };
+            (@ $p:ident, name=$name:expr $(, $args:expr)* ) => {
                 drain_handles(&mut handles);
 
-                let handle = s.spawn(|| {
+                let handle = thread::Builder::new().name($name).spawn_scoped(s, || {
                     let mut flag = false;
                     $p::check($($args, )* &mut flag);
                     if (flag) {
                         bad.store(true, Ordering::Relaxed);
                     }
-                });
+                }).unwrap();
                 handles.push_back(handle);
             }
         }
@@ -77,21 +101,27 @@ fn main() {
 
         // Checks over tests.
         check!(tests_placement, &root_path);
+        check!(tests_revision_unpaired_stdout_stderr, &tests_path);
         check!(debug_artifacts, &tests_path);
-        check!(ui_tests, &tests_path);
+        check!(ui_tests, &root_path, bless);
+        // FIXME(jieyouxu): remove this check once all run-make tests are ported over to rmake.rs.
+        check!(run_make_tests, &tests_path, &src_path, bless);
         check!(mir_opt_tests, &tests_path, bless);
         check!(rustdoc_gui_tests, &tests_path);
+        check!(rustdoc_css_themes, &librustdoc_path);
+        check!(known_bug, &crashes_path);
+        check!(unknown_revision, &tests_path);
 
         // Checks that only make sense for the compiler.
         check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], verbose);
+        check!(fluent_alphabetical, &compiler_path, bless);
+        check!(target_policy, &root_path);
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
-        check!(primitive_docs, &library_path);
 
         // Checks that need to be done for both the compiler and std libraries.
         check!(unit_tests, &src_path);
-        check!(unit_tests, &tests_path);
         check!(unit_tests, &compiler_path);
         check!(unit_tests, &library_path);
 
@@ -107,7 +137,6 @@ fn main() {
         check!(edition, &src_path);
         check!(edition, &compiler_path);
         check!(edition, &library_path);
-        check!(edition, &tests_path);
 
         check!(alphabetical, &src_path);
         check!(alphabetical, &tests_path);
@@ -134,6 +163,8 @@ fn main() {
             r
         };
         check!(unstable_book, &src_path, collected);
+
+        check!(ext_tool_checks, &root_path, &output_directory, bless, extra_checks, pos_args);
     });
 
     if bad.load(Ordering::Relaxed) {

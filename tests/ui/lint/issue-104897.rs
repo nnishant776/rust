@@ -1,6 +1,5 @@
-// error-pattern: this file contains an unclosed delimiter
-// error-pattern: this file contains an unclosed delimiter
-// error-pattern: this file contains an unclosed delimiter
-// error-pattern: format argument must be a string literal
+//@ error-pattern: this file contains an unclosed delimiter
+//@ error-pattern: this file contains an unclosed delimiter
+//@ error-pattern: this file contains an unclosed delimiter
 
 fn f(){(print!(á

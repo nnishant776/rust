@@ -1,29 +1,16 @@
-// compile-flags: -C opt-level=3 -C target-cpu=x86-64-v3
-// no-system-llvm
-// only-x86_64
-// ignore-debug (the extra assertions get in the way)
+//@ compile-flags: -C opt-level=3 -C target-cpu=x86-64-v3
+//@ only-x86_64
 
 #![crate_type = "lib"]
-#![feature(array_zip)]
 
 // CHECK-LABEL: @short_integer_map
 #[no_mangle]
 pub fn short_integer_map(x: [u32; 8]) -> [u32; 8] {
     // CHECK: load <8 x i32>
     // CHECK: shl <8 x i32>
-    // CHECK: or <8 x i32>
+    // CHECK: or{{( disjoint)?}} <8 x i32>
     // CHECK: store <8 x i32>
     x.map(|x| 2 * x + 1)
-}
-
-// CHECK-LABEL: @short_integer_zip_map
-#[no_mangle]
-pub fn short_integer_zip_map(x: [u32; 8], y: [u32; 8]) -> [u32; 8] {
-    // CHECK: %[[A:.+]] = load <8 x i32>
-    // CHECK: %[[B:.+]] = load <8 x i32>
-    // CHECK: sub <8 x i32> %[[A]], %[[B]]
-    // CHECK: store <8 x i32>
-    x.zip(y).map(|(x, y)| x - y)
 }
 
 // This test is checking that LLVM can SRoA away a bunch of the overhead,
@@ -38,10 +25,9 @@ pub fn short_integer_zip_map(x: [u32; 8], y: [u32; 8]) -> [u32; 8] {
 //
 // CHECK-LABEL: @long_integer_map
 #[no_mangle]
-pub fn long_integer_map(x: [u32; 64]) -> [u32; 64] {
+pub fn long_integer_map(x: [u32; 512]) -> [u32; 512] {
     // CHECK: start:
-    // CHECK-NEXT: alloca [64 x i32]
-    // CHECK-NEXT: alloca %"core::mem::manually_drop::ManuallyDrop<[u32; 64]>"
+    // CHECK-NEXT: alloca [2048 x i8]
     // CHECK-NOT: alloca
     // CHECK: mul <{{[0-9]+}} x i32>
     // CHECK: add <{{[0-9]+}} x i32>

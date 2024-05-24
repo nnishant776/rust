@@ -20,13 +20,15 @@ use crate::{
 pub(crate) fn incremental_reparse(
     node: &SyntaxNode,
     edit: &Indel,
-    errors: Vec<SyntaxError>,
+    errors: impl IntoIterator<Item = SyntaxError>,
 ) -> Option<(GreenNode, Vec<SyntaxError>, TextRange)> {
     if let Some((green, new_errors, old_range)) = reparse_token(node, edit) {
         return Some((green, merge_errors(errors, new_errors, old_range, edit), old_range));
     }
 
-    if let Some((green, new_errors, old_range)) = reparse_block(node, edit) {
+    if let Some((green, new_errors, old_range)) =
+        reparse_block(node, edit, parser::Edition::CURRENT)
+    {
         return Some((green, merge_errors(errors, new_errors, old_range, edit), old_range));
     }
     None
@@ -39,7 +41,7 @@ fn reparse_token(
     let prev_token = root.covering_element(edit.delete).as_token()?.clone();
     let prev_token_kind = prev_token.kind();
     match prev_token_kind {
-        WHITESPACE | COMMENT | IDENT | STRING => {
+        WHITESPACE | COMMENT | IDENT | STRING | BYTE_STRING | C_STRING => {
             if prev_token_kind == WHITESPACE || prev_token_kind == COMMENT {
                 // removing a new line may extends previous token
                 let deleted_range = edit.delete - prev_token.text_range().start();
@@ -84,6 +86,7 @@ fn reparse_token(
 fn reparse_block(
     root: &SyntaxNode,
     edit: &Indel,
+    edition: parser::Edition,
 ) -> Option<(GreenNode, Vec<SyntaxError>, TextRange)> {
     let (node, reparser) = find_reparsable_node(root, edit.delete)?;
     let text = get_text_after_edit(node.clone().into(), edit);
@@ -94,7 +97,7 @@ fn reparse_block(
         return None;
     }
 
-    let tree_traversal = reparser.parse(&parser_input);
+    let tree_traversal = reparser.parse(&parser_input, edition);
 
     let (green, new_parser_errors, _eof) = build_tree(lexed, tree_traversal);
 
@@ -105,7 +108,7 @@ fn get_text_after_edit(element: SyntaxElement, edit: &Indel) -> String {
     let edit = Indel::replace(edit.delete - element.text_range().start(), edit.insert.clone());
 
     let mut text = match element {
-        NodeOrToken::Token(token) => token.text().to_string(),
+        NodeOrToken::Token(token) => token.text().to_owned(),
         NodeOrToken::Node(node) => node.text().to_string(),
     };
     edit.apply(&mut text);
@@ -147,7 +150,7 @@ fn is_balanced(lexed: &parser::LexedStr<'_>) -> bool {
 }
 
 fn merge_errors(
-    old_errors: Vec<SyntaxError>,
+    old_errors: impl IntoIterator<Item = SyntaxError>,
     new_errors: Vec<SyntaxError>,
     range_before_reparse: TextRange,
     edit: &Indel,
@@ -166,14 +169,15 @@ fn merge_errors(
     }
     res.extend(new_errors.into_iter().map(|new_err| {
         // fighting borrow checker with a variable ;)
-        let offseted_range = new_err.range() + range_before_reparse.start();
-        new_err.with_range(offseted_range)
+        let offsetted_range = new_err.range() + range_before_reparse.start();
+        new_err.with_range(offsetted_range)
     }));
     res
 }
 
 #[cfg(test)]
 mod tests {
+    use parser::Edition;
     use test_utils::{assert_eq_text, extract_range};
 
     use super::*;
@@ -188,11 +192,15 @@ mod tests {
             after
         };
 
-        let fully_reparsed = SourceFile::parse(&after);
+        let fully_reparsed = SourceFile::parse(&after, Edition::CURRENT);
         let incrementally_reparsed: Parse<SourceFile> = {
-            let before = SourceFile::parse(&before);
-            let (green, new_errors, range) =
-                incremental_reparse(before.tree().syntax(), &edit, before.errors.to_vec()).unwrap();
+            let before = SourceFile::parse(&before, Edition::CURRENT);
+            let (green, new_errors, range) = incremental_reparse(
+                before.tree().syntax(),
+                &edit,
+                before.errors.as_deref().unwrap_or_default().iter().cloned(),
+            )
+            .unwrap();
             assert_eq!(range.len(), reparsed_len.into(), "reparsed fragment has wrong length");
             Parse::new(green, new_errors)
         };
@@ -408,7 +416,7 @@ enum Foo {
 
     #[test]
     fn reparse_str_token_with_error_fixed() {
-        do_check(r#""unterinated$0$0"#, "\"", 12);
+        do_check(r#""unterminated$0$0"#, "\"", 13);
     }
 
     #[test]

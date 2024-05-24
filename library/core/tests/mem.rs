@@ -205,7 +205,7 @@ fn uninit_write_slice() {
     let mut dst = [MaybeUninit::new(255); 64];
     let src = [0; 64];
 
-    assert_eq!(MaybeUninit::write_slice(&mut dst, &src), &src);
+    assert_eq!(MaybeUninit::copy_from_slice(&mut dst, &src), &src);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn uninit_write_slice_panic_lt() {
     let mut dst = [MaybeUninit::uninit(); 64];
     let src = [0; 32];
 
-    MaybeUninit::write_slice(&mut dst, &src);
+    MaybeUninit::copy_from_slice(&mut dst, &src);
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn uninit_write_slice_panic_gt() {
     let mut dst = [MaybeUninit::uninit(); 64];
     let src = [0; 128];
 
-    MaybeUninit::write_slice(&mut dst, &src);
+    MaybeUninit::copy_from_slice(&mut dst, &src);
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn uninit_clone_from_slice() {
     let mut dst = [MaybeUninit::new(255); 64];
     let src = [0; 64];
 
-    assert_eq!(MaybeUninit::write_slice_cloned(&mut dst, &src), &src);
+    assert_eq!(MaybeUninit::clone_from_slice(&mut dst, &src), &src);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn uninit_write_slice_cloned_panic_lt() {
     let mut dst = [MaybeUninit::uninit(); 64];
     let src = [0; 32];
 
-    MaybeUninit::write_slice_cloned(&mut dst, &src);
+    MaybeUninit::clone_from_slice(&mut dst, &src);
 }
 
 #[test]
@@ -249,7 +249,7 @@ fn uninit_write_slice_cloned_panic_gt() {
     let mut dst = [MaybeUninit::uninit(); 64];
     let src = [0; 128];
 
-    MaybeUninit::write_slice_cloned(&mut dst, &src);
+    MaybeUninit::clone_from_slice(&mut dst, &src);
 }
 
 #[test]
@@ -290,7 +290,121 @@ fn uninit_write_slice_cloned_mid_panic() {
     ];
 
     let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        MaybeUninit::write_slice_cloned(&mut dst, &src);
+        MaybeUninit::clone_from_slice(&mut dst, &src);
+    }));
+
+    drop(src);
+
+    match err {
+        Ok(_) => unreachable!(),
+        Err(payload) => {
+            payload
+                .downcast::<&'static str>()
+                .and_then(|s| if *s == "expected panic on clone" { Ok(s) } else { Err(s) })
+                .unwrap_or_else(|p| panic::resume_unwind(p));
+
+            assert_eq!(Rc::strong_count(&rc), 1)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("dropped a bomb! kaboom!")
+    }
+}
+
+#[test]
+fn uninit_write_slice_cloned_no_drop() {
+    let mut dst = [MaybeUninit::uninit()];
+    let src = [Bomb];
+
+    MaybeUninit::clone_from_slice(&mut dst, &src);
+
+    forget(src);
+}
+
+#[test]
+fn uninit_fill() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let expect = [0; 64];
+
+    assert_eq!(MaybeUninit::fill(&mut dst, 0), &expect);
+}
+
+#[cfg(panic = "unwind")]
+struct CloneUntilPanic {
+    limit: usize,
+    rc: Rc<()>,
+}
+
+#[cfg(panic = "unwind")]
+impl Clone for CloneUntilPanic {
+    fn clone(&self) -> Self {
+        if Rc::strong_count(&self.rc) >= self.limit {
+            panic!("expected panic on clone");
+        }
+        Self { limit: self.limit, rc: self.rc.clone() }
+    }
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn uninit_fill_clone_panic_drop() {
+    use std::panic;
+
+    let rc = Rc::new(());
+
+    let mut dst = [MaybeUninit::uninit(), MaybeUninit::uninit(), MaybeUninit::uninit()];
+
+    let src = CloneUntilPanic { limit: 3, rc: rc.clone() };
+    let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        MaybeUninit::fill(&mut dst, src);
+    }));
+
+    match err {
+        Ok(_) => unreachable!(),
+        Err(payload) => {
+            payload
+                .downcast::<&'static str>()
+                .and_then(|s| if *s == "expected panic on clone" { Ok(s) } else { Err(s) })
+                .unwrap_or_else(|p| panic::resume_unwind(p));
+            assert_eq!(Rc::strong_count(&rc), 1)
+        }
+    }
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn uninit_fill_clone_no_drop_clones() {
+    let mut dst = [MaybeUninit::uninit(), MaybeUninit::uninit(), MaybeUninit::uninit()];
+
+    MaybeUninit::fill(&mut dst, Bomb);
+}
+
+#[test]
+fn uninit_fill_with() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let expect = [0; 64];
+
+    assert_eq!(MaybeUninit::fill_with(&mut dst, || 0), &expect);
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn uninit_fill_with_mid_panic() {
+    use std::panic;
+
+    let rc = Rc::new(());
+
+    let mut dst = [MaybeUninit::uninit(), MaybeUninit::uninit(), MaybeUninit::uninit()];
+
+    let src = CloneUntilPanic { limit: 3, rc: rc.clone() };
+    let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        MaybeUninit::fill_with(&mut dst, || src.clone());
     }));
 
     drop(src);
@@ -309,20 +423,111 @@ fn uninit_write_slice_cloned_mid_panic() {
 }
 
 #[test]
-fn uninit_write_slice_cloned_no_drop() {
-    #[derive(Clone)]
-    struct Bomb;
+#[cfg(panic = "unwind")]
+fn uninit_fill_with_no_drop() {
+    let mut dst = [MaybeUninit::uninit()];
+    let src = Bomb;
 
-    impl Drop for Bomb {
-        fn drop(&mut self) {
-            panic!("dropped a bomb! kaboom")
+    MaybeUninit::fill_with(&mut dst, || src.clone());
+
+    forget(src);
+}
+
+#[test]
+fn uninit_fill_from() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let src = [0; 64];
+
+    let (initted, remainder) = MaybeUninit::fill_from(&mut dst, src.into_iter());
+    assert_eq!(initted, &src);
+    assert_eq!(remainder.len(), 0);
+}
+
+#[test]
+fn uninit_fill_from_partial() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let src = [0; 48];
+
+    let (initted, remainder) = MaybeUninit::fill_from(&mut dst, src.into_iter());
+    assert_eq!(initted, &src);
+    assert_eq!(remainder.len(), 16);
+}
+
+#[test]
+fn uninit_over_fill() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let src = [0; 72];
+
+    let (initted, remainder) = MaybeUninit::fill_from(&mut dst, src.into_iter());
+    assert_eq!(initted, &src[0..64]);
+    assert_eq!(remainder.len(), 0);
+}
+
+#[test]
+fn uninit_empty_fill() {
+    let mut dst = [MaybeUninit::new(255); 64];
+    let src = [0; 0];
+
+    let (initted, remainder) = MaybeUninit::fill_from(&mut dst, src.into_iter());
+    assert_eq!(initted, &src[0..0]);
+    assert_eq!(remainder.len(), 64);
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn uninit_fill_from_mid_panic() {
+    use std::panic;
+
+    struct IterUntilPanic {
+        limit: usize,
+        rc: Rc<()>,
+    }
+
+    impl Iterator for IterUntilPanic {
+        type Item = Rc<()>;
+        fn next(&mut self) -> Option<Self::Item> {
+            if Rc::strong_count(&self.rc) >= self.limit {
+                panic!("expected panic on next");
+            }
+            Some(self.rc.clone())
         }
     }
 
+    let rc = Rc::new(());
+
+    let mut dst = [
+        MaybeUninit::uninit(),
+        MaybeUninit::uninit(),
+        MaybeUninit::uninit(),
+        MaybeUninit::uninit(),
+    ];
+
+    let src = IterUntilPanic { limit: 3, rc: rc.clone() };
+
+    let err = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        MaybeUninit::fill_from(&mut dst, src);
+    }));
+
+    match err {
+        Ok(_) => unreachable!(),
+        Err(payload) => {
+            payload
+                .downcast::<&'static str>()
+                .and_then(|s| if *s == "expected panic on next" { Ok(s) } else { Err(s) })
+                .unwrap_or_else(|p| panic::resume_unwind(p));
+
+            assert_eq!(Rc::strong_count(&rc), 1)
+        }
+    }
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn uninit_fill_from_no_drop() {
     let mut dst = [MaybeUninit::uninit()];
     let src = [Bomb];
 
-    MaybeUninit::write_slice_cloned(&mut dst, &src);
+    MaybeUninit::fill_from(&mut dst, src.iter());
 
     forget(src);
 }
@@ -363,4 +568,226 @@ fn const_maybe_uninit() {
     }
 
     assert_eq!(FIELD_BY_FIELD, Foo { x: 1, y: 2 });
+}
+
+#[test]
+fn offset_of() {
+    #[repr(C)]
+    struct Foo {
+        x: u8,
+        y: u16,
+        z: Bar,
+    }
+
+    #[repr(C)]
+    struct Bar(u8, u8);
+
+    assert_eq!(offset_of!(Foo, x), 0);
+    assert_eq!(offset_of!(Foo, y), 2);
+    assert_eq!(offset_of!(Foo, z.0), 4);
+    assert_eq!(offset_of!(Foo, z.1), 5);
+
+    // Layout of tuples is unstable
+    assert!(offset_of!((u8, u16), 0) <= size_of::<(u8, u16)>() - 1);
+    assert!(offset_of!((u8, u16), 1) <= size_of::<(u8, u16)>() - 2);
+
+    #[repr(C)]
+    struct Generic<T> {
+        x: u8,
+        y: u32,
+        z: T,
+    }
+
+    trait Trait {}
+
+    // Ensure that this type of generics works
+    fn offs_of_z<T>() -> usize {
+        offset_of!(Generic<T>, z)
+    }
+
+    assert_eq!(offset_of!(Generic<u8>, z), 8);
+    assert_eq!(offs_of_z::<u8>(), 8);
+
+    // Ensure that it works with the implicit lifetime in `Box<dyn Trait + '_>`.
+    assert_eq!(offset_of!(Generic<Box<dyn Trait>>, z), 8);
+}
+
+#[test]
+fn offset_of_union() {
+    #[repr(C)]
+    union Foo {
+        x: u8,
+        y: u16,
+        z: Bar,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Bar(u8, u8);
+
+    assert_eq!(offset_of!(Foo, x), 0);
+    assert_eq!(offset_of!(Foo, y), 0);
+    assert_eq!(offset_of!(Foo, z.0), 0);
+    assert_eq!(offset_of!(Foo, z.1), 1);
+}
+
+#[test]
+fn offset_of_dst() {
+    #[repr(C)]
+    struct Alpha {
+        x: u8,
+        y: u16,
+        z: [u8],
+    }
+
+    trait Trait {}
+
+    #[repr(C)]
+    struct Beta {
+        x: u8,
+        y: u16,
+        z: dyn Trait,
+    }
+
+    extern "C" {
+        type Extern;
+    }
+
+    #[repr(C)]
+    struct Gamma {
+        x: u8,
+        y: u16,
+        z: Extern,
+    }
+
+    assert_eq!(offset_of!(Alpha, x), 0);
+    assert_eq!(offset_of!(Alpha, y), 2);
+
+    assert_eq!(offset_of!(Beta, x), 0);
+    assert_eq!(offset_of!(Beta, y), 2);
+
+    assert_eq!(offset_of!(Gamma, x), 0);
+    assert_eq!(offset_of!(Gamma, y), 2);
+}
+
+#[test]
+fn offset_of_packed() {
+    #[repr(C, packed)]
+    struct Foo {
+        x: u8,
+        y: u16,
+    }
+
+    assert_eq!(offset_of!(Foo, x), 0);
+    assert_eq!(offset_of!(Foo, y), 1);
+}
+
+#[test]
+fn offset_of_projection() {
+    #[repr(C)]
+    struct Foo {
+        x: u8,
+        y: u16,
+    }
+
+    trait Projector {
+        type Type;
+    }
+
+    impl Projector for () {
+        type Type = Foo;
+    }
+
+    assert_eq!(offset_of!(<() as Projector>::Type, x), 0);
+    assert_eq!(offset_of!(<() as Projector>::Type, y), 2);
+}
+
+#[test]
+fn offset_of_alias() {
+    #[repr(C)]
+    struct Foo {
+        x: u8,
+        y: u16,
+    }
+
+    type Bar = Foo;
+
+    assert_eq!(offset_of!(Bar, x), 0);
+    assert_eq!(offset_of!(Bar, y), 2);
+}
+
+#[test]
+fn const_offset_of() {
+    #[repr(C)]
+    struct Foo {
+        x: u8,
+        y: u16,
+    }
+
+    const X_OFFSET: usize = offset_of!(Foo, x);
+    const Y_OFFSET: usize = offset_of!(Foo, y);
+
+    assert_eq!(X_OFFSET, 0);
+    assert_eq!(Y_OFFSET, 2);
+}
+
+#[test]
+fn offset_of_without_const_promotion() {
+    #[repr(C)]
+    struct Foo<SuppressConstPromotion> {
+        x: u8,
+        y: u16,
+        _scp: SuppressConstPromotion,
+    }
+
+    // Normally, offset_of is always const promoted.
+    // The generic parameter prevents this from happening.
+    // This is needed to test the codegen impl of offset_of
+    fn inner<SuppressConstPromotion>() {
+        assert_eq!(offset_of!(Foo<SuppressConstPromotion>, x), 0);
+        assert_eq!(offset_of!(Foo<SuppressConstPromotion>, y), 2);
+    }
+
+    inner::<()>();
+}
+
+#[test]
+fn offset_of_addr() {
+    #[repr(C)]
+    struct Foo {
+        x: u8,
+        y: u16,
+        z: Bar,
+    }
+
+    #[repr(C)]
+    struct Bar(u8, u8);
+
+    let base = Foo { x: 0, y: 0, z: Bar(0, 0) };
+
+    assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, x), ptr::addr_of!(base.x).addr());
+    assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, y), ptr::addr_of!(base.y).addr());
+    assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, z.0), ptr::addr_of!(base.z.0).addr());
+    assert_eq!(ptr::addr_of!(base).addr() + offset_of!(Foo, z.1), ptr::addr_of!(base.z.1).addr());
+}
+
+#[test]
+fn const_maybe_uninit_zeroed() {
+    // Sanity check for `MaybeUninit::zeroed` in a realistic const situation (plugin array term)
+    #[repr(C)]
+    struct Foo {
+        a: Option<&'static str>,
+        b: Bar,
+        c: f32,
+        d: *const u8,
+    }
+    #[repr(C)]
+    struct Bar(usize);
+    struct FooPtr(*const Foo);
+    unsafe impl Sync for FooPtr {}
+
+    static UNINIT: FooPtr = FooPtr([unsafe { MaybeUninit::zeroed().assume_init() }].as_ptr());
+    const SIZE: usize = size_of::<Foo>();
+
+    assert_eq!(unsafe { (*UNINIT.0.cast::<[[u8; SIZE]; 1]>())[0] }, [0u8; SIZE]);
 }

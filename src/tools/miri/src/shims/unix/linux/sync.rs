@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::concurrency::thread::{MachineCallback, Time};
+use crate::concurrency::thread::MachineCallback;
 use crate::*;
 
 /// Implementation of the SYS_futex syscall.
@@ -8,7 +8,7 @@ use crate::*;
 pub fn futex<'tcx>(
     this: &mut MiriInterpCx<'_, 'tcx>,
     args: &[OpTy<'tcx, Provenance>],
-    dest: &PlaceTy<'tcx, Provenance>,
+    dest: &MPlaceTy<'tcx, Provenance>,
 ) -> InterpResult<'tcx> {
     // The amount of arguments used depends on the type of futex operation.
     // The full futex syscall takes six arguments (excluding the syscall
@@ -34,8 +34,8 @@ pub fn futex<'tcx>(
 
     let thread = this.get_active_thread();
     // This is a vararg function so we have to bring our own type for this pointer.
-    let addr = MPlaceTy::from_aligned_ptr(addr, this.machine.layouts.i32);
-    let addr_usize = addr.ptr.addr().bytes();
+    let addr = this.ptr_to_mplace(addr, this.machine.layouts.i32);
+    let addr_usize = addr.ptr().addr().bytes();
 
     let futex_private = this.eval_libc_i32("FUTEX_PRIVATE_FLAG");
     let futex_wait = this.eval_libc_i32("FUTEX_WAIT");
@@ -85,9 +85,8 @@ pub fn futex<'tcx>(
                 return Ok(());
             }
 
-            // `deref_operand` but not actually dereferencing the ptr yet (it might be NULL!).
-            let timeout = this.ref_to_mplace(&this.read_immediate(&args[3])?)?;
-            let timeout_time = if this.ptr_is_null(timeout.ptr)? {
+            let timeout = this.deref_pointer_as(&args[3], this.libc_ty_layout("timespec"))?;
+            let timeout_time = if this.ptr_is_null(timeout.ptr())? {
                 None
             } else {
                 let realtime = op & futex_realtime == futex_realtime;
@@ -108,16 +107,22 @@ pub fn futex<'tcx>(
                 Some(if wait_bitset {
                     // FUTEX_WAIT_BITSET uses an absolute timestamp.
                     if realtime {
-                        Time::RealTime(SystemTime::UNIX_EPOCH.checked_add(duration).unwrap())
+                        CallbackTime::RealTime(
+                            SystemTime::UNIX_EPOCH.checked_add(duration).unwrap(),
+                        )
                     } else {
-                        Time::Monotonic(this.machine.clock.anchor().checked_add(duration).unwrap())
+                        CallbackTime::Monotonic(
+                            this.machine.clock.anchor().checked_add(duration).unwrap(),
+                        )
                     }
                 } else {
                     // FUTEX_WAIT uses a relative timestamp.
                     if realtime {
-                        Time::RealTime(SystemTime::now().checked_add(duration).unwrap())
+                        CallbackTime::RealTime(SystemTime::now().checked_add(duration).unwrap())
                     } else {
-                        Time::Monotonic(this.machine.clock.now().checked_add(duration).unwrap())
+                        CallbackTime::Monotonic(
+                            this.machine.clock.now().checked_add(duration).unwrap(),
+                        )
                     }
                 })
             };
@@ -170,7 +175,7 @@ pub fn futex<'tcx>(
             let futex_val = this.read_scalar_atomic(&addr, AtomicReadOrd::Relaxed)?.to_i32()?;
             if val == futex_val {
                 // The value still matches, so we block the thread make it wait for FUTEX_WAKE.
-                this.block_thread(thread);
+                this.block_thread(thread, BlockReason::Futex { addr: addr_usize });
                 this.futex_wait(addr_usize, thread, bitset);
                 // Succesfully waking up from FUTEX_WAIT always returns zero.
                 this.write_scalar(Scalar::from_target_isize(0, this), dest)?;
@@ -180,19 +185,22 @@ pub fn futex<'tcx>(
                     struct Callback<'tcx> {
                         thread: ThreadId,
                         addr_usize: u64,
-                        dest: PlaceTy<'tcx, Provenance>,
+                        dest: MPlaceTy<'tcx, Provenance>,
                     }
 
-                    impl<'tcx> VisitTags for Callback<'tcx> {
-                        fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+                    impl<'tcx> VisitProvenance for Callback<'tcx> {
+                        fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
                             let Callback { thread: _, addr_usize: _, dest } = self;
-                            dest.visit_tags(visit);
+                            dest.visit_provenance(visit);
                         }
                     }
 
                     impl<'mir, 'tcx: 'mir> MachineCallback<'mir, 'tcx> for Callback<'tcx> {
                         fn call(&self, this: &mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx> {
-                            this.unblock_thread(self.thread);
+                            this.unblock_thread(
+                                self.thread,
+                                BlockReason::Futex { addr: self.addr_usize },
+                            );
                             this.futex_remove_waiter(self.addr_usize, self.thread);
                             let etimedout = this.eval_libc("ETIMEDOUT");
                             this.set_last_error(etimedout)?;
@@ -247,10 +255,10 @@ pub fn futex<'tcx>(
             // before doing the syscall.
             this.atomic_fence(AtomicFenceOrd::SeqCst)?;
             let mut n = 0;
-            #[allow(clippy::integer_arithmetic)]
+            #[allow(clippy::arithmetic_side_effects)]
             for _ in 0..val {
                 if let Some(thread) = this.futex_wake(addr_usize, bitset) {
-                    this.unblock_thread(thread);
+                    this.unblock_thread(thread, BlockReason::Futex { addr: addr_usize });
                     this.unregister_timeout_callback_if_exists(thread);
                     n += 1;
                 } else {

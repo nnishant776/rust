@@ -1,11 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::ty::{implements_trait, is_must_use_ty, match_type};
-use clippy_utils::{is_must_use_func_call, paths};
-use rustc_hir::{Local, PatKind};
+use clippy_utils::{is_from_proc_macro, is_must_use_func_call, paths};
+use rustc_hir::{LetStmt, LocalSource, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::lint::in_external_macro;
-use rustc_middle::ty::subst::GenericArgKind;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_middle::ty::{GenericArgKind, IsSuggestable};
+use rustc_session::declare_lint_pass;
+use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -16,7 +17,7 @@ declare_clippy_lint! {
     /// expr
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn f() -> Result<u32, u32> {
     ///     Ok(0)
     /// }
@@ -68,7 +69,7 @@ declare_clippy_lint! {
     /// and ignore the resulting value.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// async fn foo() -> Result<(), ()> {
     ///     Ok(())
     /// }
@@ -76,7 +77,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # async fn context() {
     /// async fn foo() -> Result<(), ()> {
     ///     Ok(())
@@ -90,7 +91,45 @@ declare_clippy_lint! {
     "non-binding `let` on a future"
 }
 
-declare_lint_pass!(LetUnderscore => [LET_UNDERSCORE_MUST_USE, LET_UNDERSCORE_LOCK, LET_UNDERSCORE_FUTURE]);
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `let _ = <expr>` without a type annotation, and suggests to either provide one,
+    /// or remove the `let` keyword altogether.
+    ///
+    /// ### Why is this bad?
+    /// The `let _ = <expr>` expression ignores the value of `<expr>` but will remain doing so even
+    /// if the type were to change, thus potentially introducing subtle bugs. By supplying a type
+    /// annotation, one will be forced to re-visit the decision to ignore the value in such cases.
+    ///
+    /// ### Known problems
+    /// The `_ = <expr>` is not properly supported by some tools (e.g. IntelliJ) and may seem odd
+    /// to many developers. This lint also partially overlaps with the other `let_underscore_*`
+    /// lints.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// fn foo() -> Result<u32, ()> {
+    ///     Ok(123)
+    /// }
+    /// let _ = foo();
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// fn foo() -> Result<u32, ()> {
+    ///     Ok(123)
+    /// }
+    /// // Either provide a type annotation:
+    /// let _: Result<u32, ()> = foo();
+    /// // …or drop the let keyword:
+    /// _ = foo();
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub LET_UNDERSCORE_UNTYPED,
+    restriction,
+    "non-binding `let` without a type annotation"
+}
+
+declare_lint_pass!(LetUnderscore => [LET_UNDERSCORE_MUST_USE, LET_UNDERSCORE_LOCK, LET_UNDERSCORE_FUTURE, LET_UNDERSCORE_UNTYPED]);
 
 const SYNC_GUARD_PATHS: [&[&str]; 3] = [
     &paths::PARKING_LOT_MUTEX_GUARD,
@@ -99,8 +138,9 @@ const SYNC_GUARD_PATHS: [&[&str]; 3] = [
 ];
 
 impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
-    fn check_local(&mut self, cx: &LateContext<'_>, local: &Local<'_>) {
-        if !in_external_macro(cx.tcx.sess, local.span)
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &LetStmt<'tcx>) {
+        if matches!(local.source, LocalSource::Normal)
+            && !in_external_macro(cx.tcx.sess, local.span)
             && let PatKind::Wild = local.pat.kind
             && let Some(init) = local.init
         {
@@ -120,14 +160,15 @@ impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
                             binding or dropping explicitly with `std::mem::drop`",
                 );
             } else if let Some(future_trait_def_id) = cx.tcx.lang_items().future_trait()
-                && implements_trait(cx, cx.typeck_results().expr_ty(init), future_trait_def_id, &[]) {
+                && implements_trait(cx, cx.typeck_results().expr_ty(init), future_trait_def_id, &[])
+            {
                 span_lint_and_help(
                     cx,
                     LET_UNDERSCORE_FUTURE,
                     local.span,
                     "non-binding `let` on a future",
                     None,
-                    "consider awaiting the future or dropping explicitly with `std::mem::drop`"
+                    "consider awaiting the future or dropping explicitly with `std::mem::drop`",
                 );
             } else if is_must_use_ty(cx, cx.typeck_results().expr_ty(init)) {
                 span_lint_and_help(
@@ -146,6 +187,36 @@ impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
                     "non-binding `let` on a result of a `#[must_use]` function",
                     None,
                     "consider explicitly using function result",
+                );
+            }
+
+            if local.pat.default_binding_modes && local.ty.is_none() {
+                // When `default_binding_modes` is true, the `let` keyword is present.
+
+                // Ignore unnameable types
+                if let Some(init) = local.init
+                    && !cx.typeck_results().expr_ty(init).is_suggestable(cx.tcx, true)
+                {
+                    return;
+                }
+
+                // Ignore if it is from a procedural macro...
+                if is_from_proc_macro(cx, init) {
+                    return;
+                }
+
+                span_lint_and_help(
+                    cx,
+                    LET_UNDERSCORE_UNTYPED,
+                    local.span,
+                    "non-binding `let` without a type annotation",
+                    Some(Span::new(
+                        local.pat.span.hi(),
+                        local.pat.span.hi() + BytePos(1),
+                        local.pat.span.ctxt(),
+                        local.pat.span.parent(),
+                    )),
+                    "consider adding a type annotation",
                 );
             }
         }

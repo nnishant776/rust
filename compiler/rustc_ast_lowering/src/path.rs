@@ -1,18 +1,24 @@
 use crate::ImplTraitPosition;
 
-use super::errors::{GenericTypeWithParentheses, UseAngleBrackets};
+use super::errors::{
+    AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, GenericTypeWithParentheses, UseAngleBrackets,
+};
 use super::ResolverAstLoweringExt;
 use super::{GenericArgsCtor, LifetimeRes, ParenthesizedGenericArgs};
 use super::{ImplTraitContext, LoweringContext, ParamMode};
 
 use rustc_ast::{self as ast, *};
+use rustc_data_structures::sync::Lrc;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, PartialRes, Res};
+use rustc_hir::def_id::DefId;
 use rustc_hir::GenericArg;
+use rustc_middle::span_bug;
 use rustc_span::symbol::{kw, sym, Ident};
-use rustc_span::{BytePos, Span, DUMMY_SP};
+use rustc_span::{BytePos, DesugaringKind, Span, Symbol, DUMMY_SP};
 
 use smallvec::{smallvec, SmallVec};
+use tracing::{debug, instrument};
 
 impl<'a, 'hir> LoweringContext<'a, 'hir> {
     #[instrument(level = "trace", skip(self))]
@@ -22,7 +28,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         qself: &Option<ptr::P<QSelf>>,
         p: &Path,
         param_mode: ParamMode,
-        itctx: &ImplTraitContext,
+        itctx: ImplTraitContext,
+        // modifiers of the impl/bound if this is a trait path
+        modifiers: Option<ast::TraitBoundModifiers>,
     ) -> hir::QPath<'hir> {
         let qself_position = qself.as_ref().map(|q| q.position);
         let qself = qself.as_ref().map(|q| self.lower_ty(&q.ty, itctx));
@@ -32,10 +40,36 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let base_res = partial_res.base_res();
         let unresolved_segments = partial_res.unresolved_segments();
 
+        let mut res = self.lower_res(base_res);
+
+        // When we have an `async` kw on a bound, map the trait it resolves to.
+        let mut bound_modifier_allowed_features = None;
+        if let Some(TraitBoundModifiers { asyncness: BoundAsyncness::Async(_), .. }) = modifiers {
+            match res {
+                Res::Def(DefKind::Trait, def_id) => {
+                    if let Some((async_def_id, features)) = self.map_trait_to_async_trait(def_id) {
+                        res = Res::Def(DefKind::Trait, async_def_id);
+                        bound_modifier_allowed_features = Some(features);
+                    } else {
+                        self.dcx().emit_err(AsyncBoundOnlyForFnTraits { span: p.span });
+                    }
+                }
+                Res::Err => {
+                    // No additional error.
+                }
+                _ => {
+                    // This error isn't actually emitted AFAICT, but it's best to keep
+                    // it around in case the resolver doesn't always check the defkind
+                    // of an item or something.
+                    self.dcx().emit_err(AsyncBoundNotOnTrait { span: p.span, descr: res.descr() });
+                }
+            }
+        }
+
         let path_span_lo = p.span.shrink_to_lo();
         let proj_start = p.segments.len() - unresolved_segments;
         let path = self.arena.alloc(hir::Path {
-            res: self.lower_res(base_res),
+            res,
             segments: self.arena.alloc_from_iter(p.segments[..proj_start].iter().enumerate().map(
                 |(i, segment)| {
                     let param_mode = match (qself_position, param_mode) {
@@ -51,7 +85,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     let parenthesized_generic_args = match base_res {
                         // `a::b::Trait(Args)`
                         Res::Def(DefKind::Trait, _) if i + 1 == proj_start => {
-                            ParenthesizedGenericArgs::Ok
+                            ParenthesizedGenericArgs::ParenSugar
                         }
                         // `a::b::Trait(Args)::TraitItem`
                         Res::Def(DefKind::AssocFn, _)
@@ -59,10 +93,10 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         | Res::Def(DefKind::AssocTy, _)
                             if i + 2 == proj_start =>
                         {
-                            ParenthesizedGenericArgs::Ok
+                            ParenthesizedGenericArgs::ParenSugar
                         }
                         // Avoid duplicated errors.
-                        Res::Err => ParenthesizedGenericArgs::Ok,
+                        Res::Err => ParenthesizedGenericArgs::ParenSugar,
                         // An error
                         _ => ParenthesizedGenericArgs::Err,
                     };
@@ -73,6 +107,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         param_mode,
                         parenthesized_generic_args,
                         itctx,
+                        // if this is the last segment, add constness to the trait path
+                        if i == proj_start - 1 { modifiers.map(|m| m.constness) } else { None },
+                        bound_modifier_allowed_features.clone(),
                     )
                 },
             )),
@@ -82,6 +119,14 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     .map_or(path_span_lo, |segment| path_span_lo.to(segment.span())),
             ),
         });
+
+        if let Some(bound_modifier_allowed_features) = bound_modifier_allowed_features {
+            path.span = self.mark_span_with_reason(
+                DesugaringKind::BoundModifier,
+                path.span,
+                Some(bound_modifier_allowed_features),
+            );
+        }
 
         // Simple case, either no projections, or only fully-qualified.
         // E.g., `std::mem::size_of` or `<I as Iterator>::Item`.
@@ -119,6 +164,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 param_mode,
                 ParenthesizedGenericArgs::Err,
                 itctx,
+                None,
+                None,
             ));
             let qpath = hir::QPath::TypeRelative(ty, hir_segment);
 
@@ -134,9 +181,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         // We should've returned in the for loop above.
 
-        self.diagnostic().span_bug(
+        self.dcx().span_bug(
             p.span,
-            &format!(
+            format!(
                 "lower_qpath: no final extension segment in {}..{}",
                 proj_start,
                 p.segments.len()
@@ -150,6 +197,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         p: &Path,
         param_mode: ParamMode,
     ) -> &'hir hir::UsePath<'hir> {
+        assert!((1..=3).contains(&res.len()));
         self.arena.alloc(hir::UsePath {
             res,
             segments: self.arena.alloc_from_iter(p.segments.iter().map(|segment| {
@@ -158,7 +206,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     segment,
                     param_mode,
                     ParenthesizedGenericArgs::Err,
-                    &ImplTraitContext::Disallowed(ImplTraitPosition::Path),
+                    ImplTraitContext::Disallowed(ImplTraitPosition::Path),
+                    None,
+                    None,
                 )
             })),
             span: self.lower_span(p.span),
@@ -171,18 +221,26 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         segment: &PathSegment,
         param_mode: ParamMode,
         parenthesized_generic_args: ParenthesizedGenericArgs,
-        itctx: &ImplTraitContext,
+        itctx: ImplTraitContext,
+        constness: Option<ast::BoundConstness>,
+        // Additional features ungated with a bound modifier like `async`.
+        // This is passed down to the implicit associated type binding in
+        // parenthesized bounds.
+        bound_modifier_allowed_features: Option<Lrc<[Symbol]>>,
     ) -> hir::PathSegment<'hir> {
-        debug!("path_span: {:?}, lower_path_segment(segment: {:?})", path_span, segment,);
+        debug!("path_span: {:?}, lower_path_segment(segment: {:?})", path_span, segment);
         let (mut generic_args, infer_args) = if let Some(generic_args) = segment.args.as_deref() {
             match generic_args {
                 GenericArgs::AngleBracketed(data) => {
                     self.lower_angle_bracketed_parameter_data(data, param_mode, itctx)
                 }
                 GenericArgs::Parenthesized(data) => match parenthesized_generic_args {
-                    ParenthesizedGenericArgs::Ok => {
-                        self.lower_parenthesized_parameter_data(data, itctx)
-                    }
+                    ParenthesizedGenericArgs::ParenSugar => self
+                        .lower_parenthesized_parameter_data(
+                            data,
+                            itctx,
+                            bound_modifier_allowed_features,
+                        ),
                     ParenthesizedGenericArgs::Err => {
                         // Suggest replacing parentheses with angle brackets `Trait(params...)` to `Trait<params...>`
                         let sub = if !data.inputs.is_empty() {
@@ -206,7 +264,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         } else {
                             None
                         };
-                        self.tcx.sess.emit_err(GenericTypeWithParentheses { span: data.span, sub });
+                        self.dcx().emit_err(GenericTypeWithParentheses { span: data.span, sub });
                         (
                             self.lower_angle_bracketed_parameter_data(
                                 &data.as_angle_bracketed_args(),
@@ -224,16 +282,22 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 GenericArgsCtor {
                     args: Default::default(),
                     bindings: &[],
-                    parenthesized: false,
+                    parenthesized: hir::GenericArgsParentheses::No,
                     span: path_span.shrink_to_hi(),
                 },
                 param_mode == ParamMode::Optional,
             )
         };
 
+        if let Some(constness) = constness {
+            generic_args.push_constness(self, constness);
+        }
+
         let has_lifetimes =
             generic_args.args.iter().any(|arg| matches!(arg, GenericArg::Lifetime(_)));
-        if !generic_args.parenthesized && !has_lifetimes {
+
+        // FIXME(return_type_notation): Is this correct? I think so.
+        if generic_args.parenthesized != hir::GenericArgsParentheses::ParenSugar && !has_lifetimes {
             self.maybe_insert_elided_lifetimes_in_path(
                 path_span,
                 segment.id,
@@ -272,7 +336,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let (start, end) = match self.resolver.get_lifetime_res(segment_id) {
             Some(LifetimeRes::ElidedAnchor { start, end }) => (start, end),
             None => return,
-            Some(_) => panic!(),
+            Some(res) => {
+                span_bug!(path_span, "expected an elided lifetime to insert. found {res:?}")
+            }
         };
         let expected_lifetimes = end.as_usize() - start.as_usize();
         debug!(expected_lifetimes);
@@ -309,7 +375,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         &mut self,
         data: &AngleBracketedArgs,
         param_mode: ParamMode,
-        itctx: &ImplTraitContext,
+        itctx: ImplTraitContext,
     ) -> (GenericArgsCtor<'hir>, bool) {
         let has_non_lt_args = data.args.iter().any(|arg| match arg {
             AngleBracketedArg::Arg(ast::GenericArg::Lifetime(_))
@@ -328,14 +394,20 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             AngleBracketedArg::Constraint(c) => Some(self.lower_assoc_ty_constraint(c, itctx)),
             AngleBracketedArg::Arg(_) => None,
         }));
-        let ctor = GenericArgsCtor { args, bindings, parenthesized: false, span: data.span };
+        let ctor = GenericArgsCtor {
+            args,
+            bindings,
+            parenthesized: hir::GenericArgsParentheses::No,
+            span: data.span,
+        };
         (ctor, !has_non_lt_args && param_mode == ParamMode::Optional)
     }
 
     fn lower_parenthesized_parameter_data(
         &mut self,
         data: &ParenthesizedArgs,
-        itctx: &ImplTraitContext,
+        itctx: ImplTraitContext,
+        bound_modifier_allowed_features: Option<Lrc<[Symbol]>>,
     ) -> (GenericArgsCtor<'hir>, bool) {
         // Switch to `PassThrough` mode for anonymous lifetimes; this
         // means that we permit things like `&Ref<T>`, where `Ref` has
@@ -344,7 +416,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // we generally don't permit such things (see #51008).
         let ParenthesizedArgs { span, inputs, inputs_span, output } = data;
         let inputs = self.arena.alloc_from_iter(inputs.iter().map(|ty| {
-            self.lower_ty_direct(ty, &ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
+            self.lower_ty_direct(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
         }));
         let output_ty = match output {
             // Only allow `impl Trait` in return position. i.e.:
@@ -352,13 +424,13 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             // fn f(_: impl Fn() -> impl Debug) -> impl Fn() -> impl Debug
             // //      disallowed --^^^^^^^^^^        allowed --^^^^^^^^^^
             // ```
-            FnRetTy::Ty(ty) if matches!(itctx, ImplTraitContext::ReturnPositionOpaqueTy { .. }) => {
+            FnRetTy::Ty(ty) if matches!(itctx, ImplTraitContext::OpaqueTy { .. }) => {
                 if self.tcx.features().impl_trait_in_fn_trait_return {
-                    self.lower_ty(&ty, itctx)
+                    self.lower_ty(ty, itctx)
                 } else {
                     self.lower_ty(
-                        &ty,
-                        &ImplTraitContext::FeatureGated(
+                        ty,
+                        ImplTraitContext::FeatureGated(
                             ImplTraitPosition::FnTraitReturn,
                             sym::impl_trait_in_fn_trait_return,
                         ),
@@ -366,37 +438,50 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 }
             }
             FnRetTy::Ty(ty) => {
-                self.lower_ty(&ty, &ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitReturn))
+                self.lower_ty(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitReturn))
             }
             FnRetTy::Default(_) => self.arena.alloc(self.ty_tup(*span, &[])),
         };
         let args = smallvec![GenericArg::Type(self.arena.alloc(self.ty_tup(*inputs_span, inputs)))];
-        let binding = self.output_ty_binding(output_ty.span, output_ty);
+
+        // If we have a bound like `async Fn() -> T`, make sure that we mark the
+        // `Output = T` associated type bound with the right feature gates.
+        let mut output_span = output_ty.span;
+        if let Some(bound_modifier_allowed_features) = bound_modifier_allowed_features {
+            output_span = self.mark_span_with_reason(
+                DesugaringKind::BoundModifier,
+                output_span,
+                Some(bound_modifier_allowed_features),
+            );
+        }
+        let binding = self.assoc_ty_binding(sym::Output, output_span, output_ty);
+
         (
             GenericArgsCtor {
                 args,
                 bindings: arena_vec![self; binding],
-                parenthesized: true,
+                parenthesized: hir::GenericArgsParentheses::ParenSugar,
                 span: data.inputs_span,
             },
             false,
         )
     }
 
-    /// An associated type binding `Output = $ty`.
-    pub(crate) fn output_ty_binding(
+    /// An associated type binding `$assoc_ty_name = $ty`.
+    pub(crate) fn assoc_ty_binding(
         &mut self,
+        assoc_ty_name: rustc_span::Symbol,
         span: Span,
         ty: &'hir hir::Ty<'hir>,
     ) -> hir::TypeBinding<'hir> {
-        let ident = Ident::with_dummy_span(hir::FN_OUTPUT_NAME);
+        let ident = Ident::with_dummy_span(assoc_ty_name);
         let kind = hir::TypeBindingKind::Equality { term: ty.into() };
         let args = arena_vec![self;];
         let bindings = arena_vec![self;];
         let gen_args = self.arena.alloc(hir::GenericArgs {
             args,
             bindings,
-            parenthesized: false,
+            parenthesized: hir::GenericArgsParentheses::No,
             span_ext: DUMMY_SP,
         });
         hir::TypeBinding {
@@ -405,6 +490,25 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             span: self.lower_span(span),
             ident,
             kind,
+        }
+    }
+
+    /// When a bound is annotated with `async`, it signals to lowering that the trait
+    /// that the bound refers to should be mapped to the "async" flavor of the trait.
+    ///
+    /// This only needs to be done until we unify `AsyncFn` and `Fn` traits into one
+    /// that is generic over `async`ness, if that's ever possible, or modify the
+    /// lowering of `async Fn()` bounds to desugar to another trait like `LendingFn`.
+    fn map_trait_to_async_trait(&self, def_id: DefId) -> Option<(DefId, Lrc<[Symbol]>)> {
+        let lang_items = self.tcx.lang_items();
+        if Some(def_id) == lang_items.fn_trait() {
+            Some((lang_items.async_fn_trait()?, self.allow_async_fn_traits.clone()))
+        } else if Some(def_id) == lang_items.fn_mut_trait() {
+            Some((lang_items.async_fn_mut_trait()?, self.allow_async_fn_traits.clone()))
+        } else if Some(def_id) == lang_items.fn_once_trait() {
+            Some((lang_items.async_fn_once_trait()?, self.allow_async_fn_traits.clone()))
+        } else {
+            None
         }
     }
 }

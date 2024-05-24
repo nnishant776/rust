@@ -4,10 +4,10 @@
 use ::std::prelude::rust_2015::*;
 #[macro_use]
 extern crate std;
-// compile-flags: --crate-type=lib --test
-// pretty-compare-only
-// pretty-mode:expanded
-// pp-exact:tests-are-sorted.pp
+//@ compile-flags: --crate-type=lib --test --remap-path-prefix={{src-base}}/=/the/src/ --remap-path-prefix={{src-base}}\=/the/src/
+//@ pretty-compare-only
+//@ pretty-mode:expanded
+//@ pp-exact:tests-are-sorted.pp
 
 extern crate test;
 #[cfg(test)]
@@ -18,12 +18,18 @@ pub const m_test: test::TestDescAndFn =
             name: test::StaticTestName("m_test"),
             ignore: false,
             ignore_message: ::core::option::Option::None,
+            source_file: "/the/src/tests-are-sorted.rs",
+            start_line: 7usize,
+            start_col: 4usize,
+            end_line: 7usize,
+            end_col: 10usize,
             compile_fail: false,
             no_run: false,
             should_panic: test::ShouldPanic::No,
             test_type: test::TestType::Unknown,
         },
-        testfn: test::StaticTestFn(|| test::assert_test_result(m_test())),
+        testfn: test::StaticTestFn(#[coverage(off)] ||
+                test::assert_test_result(m_test())),
     };
 fn m_test() {}
 
@@ -34,15 +40,22 @@ pub const z_test: test::TestDescAndFn =
     test::TestDescAndFn {
         desc: test::TestDesc {
             name: test::StaticTestName("z_test"),
-            ignore: false,
-            ignore_message: ::core::option::Option::None,
+            ignore: true,
+            ignore_message: ::core::option::Option::Some("not yet implemented"),
+            source_file: "/the/src/tests-are-sorted.rs",
+            start_line: 11usize,
+            start_col: 4usize,
+            end_line: 11usize,
+            end_col: 10usize,
             compile_fail: false,
             no_run: false,
             should_panic: test::ShouldPanic::No,
             test_type: test::TestType::Unknown,
         },
-        testfn: test::StaticTestFn(|| test::assert_test_result(z_test())),
+        testfn: test::StaticTestFn(#[coverage(off)] ||
+                test::assert_test_result(z_test())),
     };
+#[ignore = "not yet implemented"]
 fn z_test() {}
 
 extern crate test;
@@ -54,15 +67,22 @@ pub const a_test: test::TestDescAndFn =
             name: test::StaticTestName("a_test"),
             ignore: false,
             ignore_message: ::core::option::Option::None,
+            source_file: "/the/src/tests-are-sorted.rs",
+            start_line: 14usize,
+            start_col: 4usize,
+            end_line: 14usize,
+            end_col: 10usize,
             compile_fail: false,
             no_run: false,
             should_panic: test::ShouldPanic::No,
             test_type: test::TestType::Unknown,
         },
-        testfn: test::StaticTestFn(|| test::assert_test_result(a_test())),
+        testfn: test::StaticTestFn(#[coverage(off)] ||
+                test::assert_test_result(a_test())),
     };
 fn a_test() {}
 #[rustc_main]
+#[coverage(off)]
 pub fn main() -> () {
     extern crate test;
     test::test_main_static(&[&a_test, &m_test, &z_test])

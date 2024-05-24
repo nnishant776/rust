@@ -37,8 +37,7 @@ impl MemoryUsage {
                 // There doesn't seem to be an API for determining heap usage, so we try to
                 // approximate that by using the Commit Charge value.
 
-                use winapi::um::processthreadsapi::*;
-                use winapi::um::psapi::*;
+                use windows_sys::Win32::System::{Threading::*, ProcessStatus::*};
                 use std::mem::{MaybeUninit, size_of};
 
                 let proc = unsafe { GetCurrentProcess() };
@@ -89,6 +88,12 @@ fn memusage_linux() -> MemoryUsage {
 
 #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct Bytes(isize);
+
+impl Bytes {
+    pub fn new(bytes: isize) -> Bytes {
+        Bytes(bytes)
+    }
+}
 
 impl Bytes {
     pub fn megabytes(self) -> isize {

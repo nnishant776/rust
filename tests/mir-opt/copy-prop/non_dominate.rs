@@ -1,4 +1,5 @@
-// unit-test: CopyProp
+// skip-filecheck
+//@ test-mir-pass: CopyProp
 
 #![feature(custom_mir, core_intrinsics)]
 #![allow(unused_assignments)]

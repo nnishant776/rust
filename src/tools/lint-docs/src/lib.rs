@@ -7,6 +7,44 @@ use walkdir::WalkDir;
 
 mod groups;
 
+/// List of lints which have been renamed.
+///
+/// These will get redirects in the output to the new name. The
+/// format is `(level, [(old_name, new_name), ...])`.
+///
+/// Note: This hard-coded list is a temporary hack. The intent is in the
+/// future to have `rustc` expose this information in some way (like a `-Z`
+/// flag spitting out JSON). Also, this does not yet support changing the
+/// level of the lint, which will be more difficult to support, since rustc
+/// currently does not track that historical information.
+static RENAMES: &[(Level, &[(&str, &str)])] = &[
+    (
+        Level::Allow,
+        &[
+            ("single-use-lifetime", "single-use-lifetimes"),
+            ("elided-lifetime-in-path", "elided-lifetimes-in-paths"),
+            ("async-idents", "keyword-idents"),
+            ("disjoint-capture-migration", "rust-2021-incompatible-closure-captures"),
+            ("keyword-idents", "keyword-idents-2018"),
+            ("or-patterns-back-compat", "rust-2021-incompatible-or-patterns"),
+        ],
+    ),
+    (
+        Level::Warn,
+        &[
+            ("bare-trait-object", "bare-trait-objects"),
+            ("unstable-name-collision", "unstable-name-collisions"),
+            ("unused-doc-comment", "unused-doc-comments"),
+            ("redundant-semicolon", "redundant-semicolons"),
+            ("overlapping-patterns", "overlapping-range-endpoints"),
+            ("non-fmt-panic", "non-fmt-panics"),
+            ("unused-tuple-struct-fields", "dead-code"),
+            ("static-mut-ref", "static-mut-refs"),
+        ],
+    ),
+    (Level::Deny, &[("exceeding-bitshifts", "arithmetic-overflow")]),
+];
+
 pub struct LintExtractor<'a> {
     /// Path to the `src` directory, where it will scan for `.rs` files to
     /// find lint declarations.
@@ -45,6 +83,36 @@ impl Lint {
     fn check_style(&self) -> Result<(), Box<dyn Error>> {
         for &expected in &["### Example", "### Explanation", "{{produces}}"] {
             if expected == "{{produces}}" && self.is_ignored() {
+                if self.doc_contains("{{produces}}") {
+                    return Err(format!(
+                        "the lint example has `ignore`, but also contains the {{{{produces}}}} marker\n\
+                        \n\
+                        The documentation generator cannot generate the example output when the \
+                        example is ignored.\n\
+                        Manually include the sample output below the example. For example:\n\
+                        \n\
+                        /// ```rust,ignore (needs command line option)\n\
+                        /// #[cfg(widnows)]\n\
+                        /// fn foo() {{}}\n\
+                        /// ```\n\
+                        ///\n\
+                        /// This will produce:\n\
+                        /// \n\
+                        /// ```text\n\
+                        /// warning: unknown condition name used\n\
+                        ///  --> lint_example.rs:1:7\n\
+                        ///   |\n\
+                        /// 1 | #[cfg(widnows)]\n\
+                        ///   |       ^^^^^^^\n\
+                        ///   |\n\
+                        ///   = note: `#[warn(unexpected_cfgs)]` on by default\n\
+                        /// ```\n\
+                        \n\
+                        Replacing the output with the text of the example you \
+                        compiled manually yourself.\n\
+                        "
+                    ).into());
+                }
                 continue;
             }
             if !self.doc_contains(expected) {
@@ -96,6 +164,7 @@ impl<'a> LintExtractor<'a> {
                 )
             })?;
         }
+        add_renamed_lints(&mut lints);
         self.save_lints_markdown(&lints)?;
         self.generate_group_docs(&lints)?;
         Ok(())
@@ -240,7 +309,6 @@ impl<'a> LintExtractor<'a> {
         if matches!(
             lint.name.as_str(),
             "unused_features" // broken lint
-            | "unstable_features" // deprecated
         ) {
             return Ok(());
         }
@@ -317,10 +385,10 @@ impl<'a> LintExtractor<'a> {
                             ..,
                             &format!(
                                 "This will produce:\n\
-                            \n\
-                            ```text\n\
-                            {}\
-                            ```",
+                                \n\
+                                ```text\n\
+                                {}\
+                                ```",
                                 output
                             ),
                         );
@@ -385,6 +453,9 @@ impl<'a> LintExtractor<'a> {
         }
         cmd.arg("lint_example.rs");
         cmd.current_dir(tempdir.path());
+        if self.verbose {
+            eprintln!("running: {cmd:?}");
+        }
         let output = cmd.output().map_err(|e| format!("failed to run command {:?}\n{}", cmd, e))?;
         let stderr = std::str::from_utf8(&output.stderr).unwrap();
         let msgs = stderr
@@ -392,37 +463,36 @@ impl<'a> LintExtractor<'a> {
             .filter(|line| line.starts_with('{'))
             .map(serde_json::from_str)
             .collect::<Result<Vec<serde_json::Value>, _>>()?;
-        match msgs
+        // First try to find the messages with the `code` field set to our lint.
+        let matches: Vec<_> = msgs
             .iter()
-            .find(|msg| matches!(&msg["code"]["code"], serde_json::Value::String(s) if s==name))
-        {
-            Some(msg) => {
-                let rendered = msg["rendered"].as_str().expect("rendered field should exist");
-                Ok(rendered.to_string())
+            .filter(|msg| matches!(&msg["code"]["code"], serde_json::Value::String(s) if s==name))
+            .map(|msg| msg["rendered"].as_str().expect("rendered field should exist").to_string())
+            .collect();
+        if matches.is_empty() {
+            // Some lints override their code to something else (E0566).
+            // Try to find something that looks like it could be our lint.
+            let matches: Vec<_> = msgs.iter().filter(|msg|
+                matches!(&msg["rendered"], serde_json::Value::String(s) if s.contains(name)))
+                .map(|msg| msg["rendered"].as_str().expect("rendered field should exist").to_string())
+                .collect();
+            if matches.is_empty() {
+                let rendered: Vec<&str> =
+                    msgs.iter().filter_map(|msg| msg["rendered"].as_str()).collect();
+                let non_json: Vec<&str> =
+                    stderr.lines().filter(|line| !line.starts_with('{')).collect();
+                Err(format!(
+                    "did not find lint `{}` in output of example, got:\n{}\n{}",
+                    name,
+                    non_json.join("\n"),
+                    rendered.join("\n")
+                )
+                .into())
+            } else {
+                Ok(matches.join("\n"))
             }
-            None => {
-                match msgs.iter().find(
-                    |msg| matches!(&msg["rendered"], serde_json::Value::String(s) if s.contains(name)),
-                ) {
-                    Some(msg) => {
-                        let rendered = msg["rendered"].as_str().expect("rendered field should exist");
-                        Ok(rendered.to_string())
-                    }
-                    None => {
-                        let rendered: Vec<&str> =
-                            msgs.iter().filter_map(|msg| msg["rendered"].as_str()).collect();
-                        let non_json: Vec<&str> =
-                            stderr.lines().filter(|line| !line.starts_with('{')).collect();
-                        Err(format!(
-                            "did not find lint `{}` in output of example, got:\n{}\n{}",
-                            name,
-                            non_json.join("\n"),
-                            rendered.join("\n")
-                        )
-                        .into())
-                    }
-                }
-            }
+        } else {
+            Ok(matches.join("\n"))
         }
     }
 
@@ -451,12 +521,63 @@ impl<'a> LintExtractor<'a> {
             }
             result.push('\n');
         }
+        add_rename_redirect(level, &mut result);
         let out_path = self.out_path.join("listing").join(level.doc_filename());
         // Delete the output because rustbuild uses hard links in its copies.
         let _ = fs::remove_file(&out_path);
         fs::write(&out_path, result)
             .map_err(|e| format!("could not write to {}: {}", out_path.display(), e))?;
         Ok(())
+    }
+}
+
+/// Adds `Lint`s that have been renamed.
+fn add_renamed_lints(lints: &mut Vec<Lint>) {
+    for (level, names) in RENAMES {
+        for (from, to) in *names {
+            lints.push(Lint {
+                name: from.to_string(),
+                doc: vec![format!("The lint `{from}` has been renamed to [`{to}`](#{to}).")],
+                level: *level,
+                path: PathBuf::new(),
+                lineno: 0,
+            });
+        }
+    }
+}
+
+// This uses DOMContentLoaded instead of running immediately because for some
+// reason on Firefox (124 of this writing) doesn't update the `target` CSS
+// selector if only the hash changes.
+static RENAME_START: &str = "
+<script>
+document.addEventListener(\"DOMContentLoaded\", (event) => {
+    var fragments = {
+";
+
+static RENAME_END: &str = "\
+    };
+    var target = fragments[window.location.hash];
+    if (target) {
+        var url = window.location.toString();
+        var base = url.substring(0, url.lastIndexOf('/'));
+        window.location.replace(base + \"/\" + target);
+    }
+});
+</script>
+";
+
+/// Adds the javascript redirection code to the given markdown output.
+fn add_rename_redirect(level: Level, output: &mut String) {
+    for (rename_level, names) in RENAMES {
+        if *rename_level == level {
+            let filename = level.doc_filename().replace(".md", ".html");
+            output.push_str(RENAME_START);
+            for (from, to) in *names {
+                write!(output, "        \"#{from}\": \"{filename}#{to}\",\n").unwrap();
+            }
+            output.push_str(RENAME_END);
+        }
     }
 }
 

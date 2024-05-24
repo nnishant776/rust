@@ -1,6 +1,7 @@
-// run-rustfix
 #![deny(clippy::trait_duplication_in_bounds)]
 #![allow(unused)]
+
+use std::any::Any;
 
 fn bad_foo<T: Clone + Clone + Clone + Copy, U: Clone + Copy>(arg0: T, argo1: U) {
     unimplemented!();
@@ -109,4 +110,41 @@ fn qualified_path<T: std::clone::Clone + Clone + foo::Clone>(arg0: T) {
     unimplemented!();
 }
 
-fn main() {}
+fn good_trait_object(arg0: &(dyn Any + Send)) {
+    unimplemented!();
+}
+
+fn bad_trait_object(arg0: &(dyn Any + Send + Send)) {
+    unimplemented!();
+}
+
+trait Proj {
+    type S;
+}
+
+impl Proj for () {
+    type S = ();
+}
+
+impl Proj for i32 {
+    type S = i32;
+}
+
+trait Base<T> {
+    fn is_base(&self);
+}
+
+trait Derived<B: Proj>: Base<B::S> + Base<()> {
+    fn is_derived(&self);
+}
+
+fn f<P: Proj>(obj: &dyn Derived<P>) {
+    obj.is_derived();
+    Base::<P::S>::is_base(obj);
+    Base::<()>::is_base(obj);
+}
+
+fn main() {
+    let _x: fn(_) = f::<()>;
+    let _x: fn(_) = f::<i32>;
+}

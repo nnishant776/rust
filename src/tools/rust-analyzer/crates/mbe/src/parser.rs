@@ -2,9 +2,10 @@
 //! trees.
 
 use smallvec::{smallvec, SmallVec};
+use span::{Edition, Span, SyntaxContextId};
 use syntax::SmolStr;
 
-use crate::{tt, tt_iter::TtIter, ParseError};
+use crate::{tt_iter::TtIter, ParseError};
 
 /// Consider
 ///
@@ -20,44 +21,80 @@ use crate::{tt, tt_iter::TtIter, ParseError};
 /// Stuff to the right is a [`MetaTemplate`] template which is used to produce
 /// output.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MetaTemplate(pub(crate) Vec<Op>);
+pub(crate) struct MetaTemplate(pub(crate) Box<[Op]>);
 
 impl MetaTemplate {
-    pub(crate) fn parse_pattern(pattern: &tt::Subtree) -> Result<MetaTemplate, ParseError> {
-        MetaTemplate::parse(pattern, Mode::Pattern)
+    pub(crate) fn parse_pattern(
+        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        pattern: &tt::Subtree<Span>,
+    ) -> Result<Self, ParseError> {
+        MetaTemplate::parse(edition, pattern, Mode::Pattern, false)
     }
 
-    pub(crate) fn parse_template(template: &tt::Subtree) -> Result<MetaTemplate, ParseError> {
-        MetaTemplate::parse(template, Mode::Template)
+    pub(crate) fn parse_template(
+        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        template: &tt::Subtree<Span>,
+        new_meta_vars: bool,
+    ) -> Result<Self, ParseError> {
+        MetaTemplate::parse(edition, template, Mode::Template, new_meta_vars)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Op> {
         self.0.iter()
     }
 
-    fn parse(tt: &tt::Subtree, mode: Mode) -> Result<MetaTemplate, ParseError> {
+    fn parse(
+        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        tt: &tt::Subtree<Span>,
+        mode: Mode,
+        new_meta_vars: bool,
+    ) -> Result<Self, ParseError> {
         let mut src = TtIter::new(tt);
 
         let mut res = Vec::new();
         while let Some(first) = src.peek_n(0) {
-            let op = next_op(first, &mut src, mode)?;
+            let op = next_op(edition, first, &mut src, mode, new_meta_vars)?;
             res.push(op);
         }
 
-        Ok(MetaTemplate(res))
+        Ok(MetaTemplate(res.into_boxed_slice()))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
-    Var { name: SmolStr, kind: Option<MetaVarKind>, id: tt::TokenId },
-    Ignore { name: SmolStr, id: tt::TokenId },
-    Index { depth: u32 },
-    Repeat { tokens: MetaTemplate, kind: RepeatKind, separator: Option<Separator> },
-    Subtree { tokens: MetaTemplate, delimiter: tt::Delimiter },
-    Literal(tt::Literal),
-    Punct(SmallVec<[tt::Punct; 3]>),
-    Ident(tt::Ident),
+    Var {
+        name: SmolStr,
+        kind: Option<MetaVarKind>,
+        id: Span,
+    },
+    Ignore {
+        name: SmolStr,
+        id: Span,
+    },
+    Index {
+        depth: usize,
+    },
+    Length {
+        depth: usize,
+    },
+    Count {
+        name: SmolStr,
+        // FIXME: `usize`` once we drop support for 1.76
+        depth: Option<usize>,
+    },
+    Repeat {
+        tokens: MetaTemplate,
+        kind: RepeatKind,
+        separator: Option<Separator>,
+    },
+    Subtree {
+        tokens: MetaTemplate,
+        delimiter: tt::Delimiter<Span>,
+    },
+    Literal(tt::Literal<Span>),
+    Punct(SmallVec<[tt::Punct<Span>; 3]>),
+    Ident(tt::Ident<Span>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -87,9 +124,9 @@ pub(crate) enum MetaVarKind {
 
 #[derive(Clone, Debug, Eq)]
 pub(crate) enum Separator {
-    Literal(tt::Literal),
-    Ident(tt::Ident),
-    Puncts(SmallVec<[tt::Punct; 3]>),
+    Literal(tt::Literal<Span>),
+    Ident(tt::Ident<Span>),
+    Puncts(SmallVec<[tt::Punct<Span>; 3]>),
 }
 
 // Note that when we compare a Separator, we just care about its textual value.
@@ -117,9 +154,11 @@ enum Mode {
 }
 
 fn next_op(
-    first_peeked: &tt::TokenTree,
-    src: &mut TtIter<'_>,
+    edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+    first_peeked: &tt::TokenTree<Span>,
+    src: &mut TtIter<'_, Span>,
     mode: Mode,
+    new_meta_vars: bool,
 ) -> Result<Op, ParseError> {
     let res = match first_peeked {
         tt::TokenTree::Leaf(tt::Leaf::Punct(p @ tt::Punct { char: '$', .. })) => {
@@ -133,14 +172,14 @@ fn next_op(
                 tt::TokenTree::Subtree(subtree) => match subtree.delimiter.kind {
                     tt::DelimiterKind::Parenthesis => {
                         let (separator, kind) = parse_repeat(src)?;
-                        let tokens = MetaTemplate::parse(subtree, mode)?;
+                        let tokens = MetaTemplate::parse(edition, subtree, mode, new_meta_vars)?;
                         Op::Repeat { tokens, separator, kind }
                     }
                     tt::DelimiterKind::Brace => match mode {
                         Mode::Template => {
-                            parse_metavar_expr(&mut TtIter::new(subtree)).map_err(|()| {
-                                ParseError::unexpected("invalid metavariable expression")
-                            })?
+                            parse_metavar_expr(new_meta_vars, &mut TtIter::new(subtree)).map_err(
+                                |()| ParseError::unexpected("invalid metavariable expression"),
+                            )?
                         }
                         Mode::Pattern => {
                             return Err(ParseError::unexpected(
@@ -160,13 +199,13 @@ fn next_op(
                         Op::Ident(tt::Ident { text: "$crate".into(), span: ident.span })
                     }
                     tt::Leaf::Ident(ident) => {
-                        let kind = eat_fragment_kind(src, mode)?;
+                        let kind = eat_fragment_kind(edition, src, mode)?;
                         let name = ident.text.clone();
                         let id = ident.span;
                         Op::Var { name, kind, id }
                     }
                     tt::Leaf::Literal(lit) if is_boolean_literal(lit) => {
-                        let kind = eat_fragment_kind(src, mode)?;
+                        let kind = eat_fragment_kind(edition, src, mode)?;
                         let name = lit.text.clone();
                         let id = lit.span;
                         Op::Var { name, kind, id }
@@ -204,14 +243,18 @@ fn next_op(
 
         tt::TokenTree::Subtree(subtree) => {
             src.next().expect("first token already peeked");
-            let tokens = MetaTemplate::parse(subtree, mode)?;
+            let tokens = MetaTemplate::parse(edition, subtree, mode, new_meta_vars)?;
             Op::Subtree { tokens, delimiter: subtree.delimiter }
         }
     };
     Ok(res)
 }
 
-fn eat_fragment_kind(src: &mut TtIter<'_>, mode: Mode) -> Result<Option<MetaVarKind>, ParseError> {
+fn eat_fragment_kind(
+    edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+    src: &mut TtIter<'_, Span>,
+    mode: Mode,
+) -> Result<Option<MetaVarKind>, ParseError> {
     if let Mode::Pattern = mode {
         src.expect_char(':').map_err(|()| ParseError::unexpected("missing fragment specifier"))?;
         let ident = src
@@ -220,7 +263,10 @@ fn eat_fragment_kind(src: &mut TtIter<'_>, mode: Mode) -> Result<Option<MetaVarK
         let kind = match ident.text.as_str() {
             "path" => MetaVarKind::Path,
             "ty" => MetaVarKind::Ty,
-            "pat" => MetaVarKind::Pat,
+            "pat" => match edition(ident.span.ctx) {
+                Edition::Edition2015 | Edition::Edition2018 => MetaVarKind::PatParam,
+                Edition::Edition2021 | Edition::Edition2024 => MetaVarKind::Pat,
+            },
             "pat_param" => MetaVarKind::PatParam,
             "stmt" => MetaVarKind::Stmt,
             "block" => MetaVarKind::Block,
@@ -239,11 +285,11 @@ fn eat_fragment_kind(src: &mut TtIter<'_>, mode: Mode) -> Result<Option<MetaVarK
     Ok(None)
 }
 
-fn is_boolean_literal(lit: &tt::Literal) -> bool {
+fn is_boolean_literal(lit: &tt::Literal<Span>) -> bool {
     matches!(lit.text.as_str(), "true" | "false")
 }
 
-fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind), ParseError> {
+fn parse_repeat(src: &mut TtIter<'_, Span>) -> Result<(Option<Separator>, RepeatKind), ParseError> {
     let mut separator = Separator::Puncts(SmallVec::new());
     for tt in src {
         let tt = match tt {
@@ -280,7 +326,7 @@ fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind),
     Err(ParseError::InvalidRepeat)
 }
 
-fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
+fn parse_metavar_expr(new_meta_vars: bool, src: &mut TtIter<'_, Span>) -> Result<Op, ()> {
     let func = src.expect_ident()?;
     let args = src.expect_subtree()?;
 
@@ -292,12 +338,21 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
 
     let op = match &*func.text {
         "ignore" => {
+            if new_meta_vars {
+                args.expect_dollar()?;
+            }
             let ident = args.expect_ident()?;
             Op::Ignore { name: ident.text.clone(), id: ident.span }
         }
-        "index" => {
-            let depth = if args.len() == 0 { 0 } else { args.expect_u32_literal()? };
-            Op::Index { depth }
+        "index" => Op::Index { depth: parse_depth(&mut args)? },
+        "length" => Op::Length { depth: parse_depth(&mut args)? },
+        "count" => {
+            if new_meta_vars {
+                args.expect_dollar()?;
+            }
+            let ident = args.expect_ident()?;
+            let depth = if try_eat_comma(&mut args) { Some(parse_depth(&mut args)?) } else { None };
+            Op::Count { name: ident.text.clone(), depth }
         }
         _ => return Err(()),
     };
@@ -307,4 +362,23 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
     }
 
     Ok(op)
+}
+
+fn parse_depth(src: &mut TtIter<'_, Span>) -> Result<usize, ()> {
+    if src.len() == 0 {
+        Ok(0)
+    } else if let tt::Leaf::Literal(lit) = src.expect_literal()? {
+        // Suffixes are not allowed.
+        lit.text.parse().map_err(|_| ())
+    } else {
+        Err(())
+    }
+}
+
+fn try_eat_comma(src: &mut TtIter<'_, Span>) -> bool {
+    if let Some(tt::TokenTree::Leaf(tt::Leaf::Punct(tt::Punct { char: ',', .. }))) = src.peek_n(0) {
+        let _ = src.next();
+        return true;
+    }
+    false
 }

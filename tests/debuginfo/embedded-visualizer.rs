@@ -1,7 +1,7 @@
-// compile-flags:-g
-// min-gdb-version: 8.1
-// ignore-lldb
-// ignore-windows-gnu // emit_debug_gdb_scripts is disabled on Windows
+//@ compile-flags:-g
+//@ min-gdb-version: 8.1
+//@ ignore-lldb
+//@ ignore-windows-gnu // emit_debug_gdb_scripts is disabled on Windows
 
 // === CDB TESTS ==================================================================================
 
@@ -60,11 +60,10 @@
 // gdb-check:$4 = "Person A" is 10 years old.
 
 #![allow(unused_variables)]
-#![feature(debugger_visualizer)]
 #![debugger_visualizer(natvis_file = "embedded-visualizer.natvis")]
 #![debugger_visualizer(gdb_script_file = "embedded-visualizer.py")]
 
-// aux-build: dependency-with-embedded-visualizers.rs
+//@ aux-build: dependency-with-embedded-visualizers.rs
 extern crate dependency_with_embedded_visualizers;
 
 use dependency_with_embedded_visualizers::Person;

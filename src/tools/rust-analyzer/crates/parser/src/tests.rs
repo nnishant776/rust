@@ -1,6 +1,6 @@
+mod prefix_entries;
 mod sourcegen_inline_tests;
 mod top_entries;
-mod prefix_entries;
 
 use std::{
     fmt::Write,
@@ -88,7 +88,7 @@ fn parse_inline_err() {
 fn parse(entry: TopEntryPoint, text: &str) -> (String, bool) {
     let lexed = LexedStr::new(text);
     let input = lexed.to_input();
-    let output = entry.parse(&input);
+    let output = entry.parse(&input, crate::Edition::CURRENT);
 
     let mut buf = String::new();
     let mut errors = Vec::new();

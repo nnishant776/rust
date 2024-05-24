@@ -1,19 +1,16 @@
-// run-pass
-// ignore-emscripten
+//@ run-pass
+//@ ignore-emscripten
 
 // Test that the simd_f{min,max} intrinsics produce the correct results.
 
-#![feature(repr_simd, platform_intrinsics)]
+#![feature(repr_simd, core_intrinsics)]
 #![allow(non_camel_case_types)]
 
 #[repr(simd)]
 #[derive(Copy, Clone, PartialEq, Debug)]
 struct f32x4(pub f32, pub f32, pub f32, pub f32);
 
-extern "platform-intrinsic" {
-    fn simd_fmin<T>(x: T, y: T) -> T;
-    fn simd_fmax<T>(x: T, y: T) -> T;
-}
+use std::intrinsics::simd::*;
 
 fn main() {
     let x = f32x4(1.0, 2.0, 3.0, 4.0);
@@ -21,7 +18,7 @@ fn main() {
 
     #[cfg(not(any(target_arch = "mips", target_arch = "mips64")))]
     let nan = f32::NAN;
-    // MIPS hardware treats f32::NAN as SNAN. Clear the signaling bit.
+    // MIPS hardware except MIPS R6 treats f32::NAN as SNAN. Clear the signaling bit.
     // See https://github.com/rust-lang/rust/issues/52746.
     #[cfg(any(target_arch = "mips", target_arch = "mips64"))]
     let nan = f32::from_bits(f32::NAN.to_bits() - 1);

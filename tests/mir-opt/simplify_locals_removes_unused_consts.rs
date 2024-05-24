@@ -1,5 +1,7 @@
-// unit-test: SimplifyLocals-before-const-prop
-// compile-flags: -C overflow-checks=no
+// skip-filecheck
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
+//@ test-mir-pass: SimplifyLocals-before-const-prop
+//@ compile-flags: -C overflow-checks=no
 
 fn use_zst(_: ((), ())) {}
 

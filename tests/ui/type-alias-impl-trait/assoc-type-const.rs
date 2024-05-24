@@ -1,8 +1,11 @@
 // Tests that we properly detect defining usages when using
 // const generics in an associated opaque type
-// check-pass
 
-#![feature(type_alias_impl_trait)]
+//@ check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+#![feature(impl_trait_in_assoc_type)]
 
 trait UnwrapItemsExt<'a, const C: usize> {
     type Iter;

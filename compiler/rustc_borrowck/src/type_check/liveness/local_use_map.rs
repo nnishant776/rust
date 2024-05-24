@@ -1,10 +1,9 @@
-use rustc_data_structures::vec_linked_list as vll;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location};
+use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use crate::def_use::{self, DefUse};
-use crate::region_infer::values::{PointIndex, RegionValueElements};
 
 /// A map that cross references each local with the locations where it
 /// is defined (assigned), used, or dropped. Used during liveness
@@ -37,8 +36,11 @@ pub(crate) struct LocalUseMap {
     /// we add for each local variable.
     first_drop_at: IndexVec<Local, Option<AppearanceIndex>>,
 
-    appearances: IndexVec<AppearanceIndex, Appearance>,
+    appearances: Appearances,
 }
+
+// The `Appearance::next` field effectively embeds a linked list within `Appearances`.
+type Appearances = IndexVec<AppearanceIndex, Appearance>;
 
 struct Appearance {
     point_index: PointIndex,
@@ -49,21 +51,41 @@ rustc_index::newtype_index! {
     pub struct AppearanceIndex {}
 }
 
-impl vll::LinkElem for Appearance {
-    type LinkIndex = AppearanceIndex;
+fn appearances_iter(
+    first: Option<AppearanceIndex>,
+    appearances: &Appearances,
+) -> impl Iterator<Item = AppearanceIndex> + '_ {
+    AppearancesIter { appearances, current: first }
+}
 
-    fn next(elem: &Self) -> Option<AppearanceIndex> {
-        elem.next
+// Iterates over `Appearances` by following `next` fields.
+struct AppearancesIter<'a> {
+    appearances: &'a Appearances,
+    current: Option<AppearanceIndex>,
+}
+
+impl<'a> Iterator for AppearancesIter<'a> {
+    type Item = AppearanceIndex;
+
+    fn next(&mut self) -> Option<AppearanceIndex> {
+        if let Some(c) = self.current {
+            self.current = self.appearances[c].next;
+            Some(c)
+        } else {
+            None
+        }
     }
 }
+
+//-----------------------------------------------------------------------------
 
 impl LocalUseMap {
     pub(crate) fn build(
         live_locals: &[Local],
-        elements: &RegionValueElements,
+        elements: &DenseLocationMap,
         body: &Body<'_>,
     ) -> Self {
-        let nones = IndexVec::from_elem_n(None, body.local_decls.len());
+        let nones = IndexVec::from_elem(None, &body.local_decls);
         let mut local_use_map = LocalUseMap {
             first_def_at: nones.clone(),
             first_use_at: nones.clone(),
@@ -76,34 +98,34 @@ impl LocalUseMap {
         }
 
         let mut locals_with_use_data: IndexVec<Local, bool> =
-            IndexVec::from_elem_n(false, body.local_decls.len());
+            IndexVec::from_elem(false, &body.local_decls);
         live_locals.iter().for_each(|&local| locals_with_use_data[local] = true);
 
         LocalUseMapBuild { local_use_map: &mut local_use_map, elements, locals_with_use_data }
-            .visit_body(&body);
+            .visit_body(body);
 
         local_use_map
     }
 
     pub(crate) fn defs(&self, local: Local) -> impl Iterator<Item = PointIndex> + '_ {
-        vll::iter(self.first_def_at[local], &self.appearances)
+        appearances_iter(self.first_def_at[local], &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 
     pub(crate) fn uses(&self, local: Local) -> impl Iterator<Item = PointIndex> + '_ {
-        vll::iter(self.first_use_at[local], &self.appearances)
+        appearances_iter(self.first_use_at[local], &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 
     pub(crate) fn drops(&self, local: Local) -> impl Iterator<Item = PointIndex> + '_ {
-        vll::iter(self.first_drop_at[local], &self.appearances)
+        appearances_iter(self.first_drop_at[local], &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 }
 
 struct LocalUseMapBuild<'me> {
     local_use_map: &'me mut LocalUseMap,
-    elements: &'me RegionValueElements,
+    elements: &'me DenseLocationMap,
 
     // Vector used in `visit_local` to signal which `Local`s do we need
     // def/use/drop information on, constructed from `live_locals` (that
@@ -144,9 +166,9 @@ impl LocalUseMapBuild<'_> {
     }
 
     fn insert(
-        elements: &RegionValueElements,
+        elements: &DenseLocationMap,
         first_appearance: &mut Option<AppearanceIndex>,
-        appearances: &mut IndexVec<AppearanceIndex, Appearance>,
+        appearances: &mut Appearances,
         location: Location,
     ) {
         let point_index = elements.point_from_location(location);

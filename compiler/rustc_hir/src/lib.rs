@@ -4,24 +4,11 @@
 
 #![feature(associated_type_defaults)]
 #![feature(closure_track_caller)]
-#![feature(const_btree_len)]
 #![feature(let_chains)]
-#![feature(min_specialization)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
 #![feature(variant_count)]
-#![recursion_limit = "256"]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
-#[macro_use]
-extern crate rustc_macros;
-
-#[macro_use]
-extern crate tracing;
-
-#[macro_use]
-extern crate rustc_data_structures;
+#![allow(internal_features)]
 
 extern crate self as rustc_hir;
 
@@ -30,7 +17,6 @@ pub mod def;
 pub mod def_path_hash_map;
 pub mod definitions;
 pub mod diagnostic_items;
-pub mod errors;
 pub use rustc_span::def_id;
 mod hir;
 pub mod hir_id;

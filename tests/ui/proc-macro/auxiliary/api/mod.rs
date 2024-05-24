@@ -1,5 +1,6 @@
-// force-host
-// no-prefer-dynamic
+//@ force-host
+//@ no-prefer-dynamic
+//@ edition: 2021
 
 #![crate_type = "proc-macro"]
 #![crate_name = "proc_macro_api_tests"]

@@ -1,4 +1,4 @@
-// aux-build:foreign-crate.rs
+//@ aux-build:foreign-crate.rs
 #![feature(type_alias_impl_trait)]
 
 extern crate foreign_crate;
@@ -11,7 +11,7 @@ fn use_alias<T>(val: T) -> AliasOfForeignType<T> {
     foreign_crate::ForeignType(val)
 }
 
-impl<T> foreign_crate::ForeignTrait for AliasOfForeignType<T> {}
+impl foreign_crate::ForeignTrait for AliasOfForeignType<()> {}
 //~^ ERROR only traits defined in the current crate can be implemented for arbitrary types
 
 fn main() {}

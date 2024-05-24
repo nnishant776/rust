@@ -1,29 +1,93 @@
+use std::ffi::OsStr;
+use std::io;
 use std::iter;
+use std::path::{self, Path, PathBuf};
+use std::str;
 
 use rustc_span::Symbol;
-use rustc_target::abi::Size;
+use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
+use crate::shims::os_str::bytes_to_os_str;
+use crate::shims::windows::*;
 use crate::*;
-use shims::foreign_items::EmulateByNameResult;
-use shims::windows::handle::{EvalContextExt as _, Handle, PseudoHandle};
-use shims::windows::sync::EvalContextExt as _;
-use shims::windows::thread::EvalContextExt as _;
+use shims::windows::handle::{Handle, PseudoHandle};
 
-use smallvec::SmallVec;
+pub fn is_dyn_sym(name: &str) -> bool {
+    // std does dynamic detection for these symbols
+    matches!(
+        name,
+        "SetThreadDescription" | "GetThreadDescription" | "WaitOnAddress" | "WakeByAddressSingle"
+    )
+}
+
+#[cfg(windows)]
+fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
+    // We are on Windows so we can simply lte the host do this.
+    return Ok(path::absolute(path));
+}
+
+#[cfg(unix)]
+#[allow(clippy::get_first, clippy::arithmetic_side_effects)]
+fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
+    // We are on Unix, so we need to implement parts of the logic ourselves.
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // If it starts with `//` (these were backslashes but are already converted)
+    // then this is a magic special path, we just leave it unchanged.
+    if bytes.get(0).copied() == Some(b'/') && bytes.get(1).copied() == Some(b'/') {
+        return Ok(Ok(path.into()));
+    };
+    // Special treatment for Windows' magic filenames: they are treated as being relative to `\\.\`.
+    let magic_filenames = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if magic_filenames.iter().any(|m| m.as_bytes() == bytes) {
+        let mut result: Vec<u8> = br"//./".into();
+        result.extend(bytes);
+        return Ok(Ok(bytes_to_os_str(&result)?.into()));
+    }
+    // Otherwise we try to do something kind of close to what Windows does, but this is probably not
+    // right in all cases. We iterate over the components between `/`, and remove trailing `.`,
+    // except that trailing `..` remain unchanged.
+    let mut result = vec![];
+    let mut bytes = bytes; // the remaining bytes to process
+    loop {
+        let len = bytes.iter().position(|&b| b == b'/').unwrap_or(bytes.len());
+        let mut component = &bytes[..len];
+        if len >= 2 && component[len - 1] == b'.' && component[len - 2] != b'.' {
+            // Strip trailing `.`
+            component = &component[..len - 1];
+        }
+        // Add this component to output.
+        result.extend(component);
+        // Prepare next iteration.
+        if len < bytes.len() {
+            // There's a component after this; add `/` and process remaining bytes.
+            result.push(b'/');
+            bytes = &bytes[len + 1..];
+            continue;
+        } else {
+            // This was the last component and it did not have a trailing `/`.
+            break;
+        }
+    }
+    // Let the host `absolute` function do working-dir handling
+    Ok(path::absolute(bytes_to_os_str(&result)?))
+}
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    fn emulate_foreign_item_by_name(
+    fn emulate_foreign_item_inner(
         &mut self,
         link_name: Symbol,
         abi: Abi,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
+        dest: &MPlaceTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
-        // See `fn emulate_foreign_item_by_name` in `shims/foreign_items.rs` for the general pattern.
+        // See `fn emulate_foreign_item_inner` in `shims/foreign_items.rs` for the general pattern.
 
         // Windows API stubs.
         // HANDLE = isize
@@ -68,6 +132,111 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let result = this.SetCurrentDirectoryW(path)?;
                 this.write_scalar(result, dest)?;
             }
+            "GetUserProfileDirectoryW" => {
+                let [token, buf, size] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let result = this.GetUserProfileDirectoryW(token, buf, size)?;
+                this.write_scalar(result, dest)?;
+            }
+
+            // File related shims
+            "NtWriteFile" => {
+                if !this.frame_in_std() {
+                    throw_unsup_format!(
+                        "`NtWriteFile` support is crude and just enough for stdout to work"
+                    );
+                }
+
+                let [
+                    handle,
+                    _event,
+                    _apc_routine,
+                    _apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    _key,
+                ] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let handle = this.read_target_isize(handle)?;
+                let buf = this.read_pointer(buf)?;
+                let n = this.read_scalar(n)?.to_u32()?;
+                let byte_offset = this.read_target_usize(byte_offset)?; // is actually a pointer
+                let io_status_block = this
+                    .deref_pointer_as(io_status_block, this.windows_ty_layout("IO_STATUS_BLOCK"))?;
+
+                if byte_offset != 0 {
+                    throw_unsup_format!(
+                        "`NtWriteFile` `ByteOffset` parameter is non-null, which is unsupported"
+                    );
+                }
+
+                let written = if handle == -11 || handle == -12 {
+                    // stdout/stderr
+                    use io::Write;
+
+                    let buf_cont =
+                        this.read_bytes_ptr_strip_provenance(buf, Size::from_bytes(u64::from(n)))?;
+                    let res = if this.machine.mute_stdout_stderr {
+                        Ok(buf_cont.len())
+                    } else if handle == -11 {
+                        io::stdout().write(buf_cont)
+                    } else {
+                        io::stderr().write(buf_cont)
+                    };
+                    // We write at most `n` bytes, which is a `u32`, so we cannot have written more than that.
+                    res.ok().map(|n| u32::try_from(n).unwrap())
+                } else {
+                    throw_unsup_format!(
+                        "on Windows, writing to anything except stdout/stderr is not supported"
+                    )
+                };
+                // We have to put the result into io_status_block.
+                if let Some(n) = written {
+                    let io_status_information =
+                        this.project_field_named(&io_status_block, "Information")?;
+                    this.write_scalar(
+                        Scalar::from_target_usize(n.into(), this),
+                        &io_status_information,
+                    )?;
+                }
+                // Return whether this was a success. >= 0 is success.
+                // For the error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+                this.write_scalar(
+                    Scalar::from_u32(if written.is_some() { 0 } else { 0xC0000185u32 }),
+                    dest,
+                )?;
+            }
+            "GetFullPathNameW" => {
+                let [filename, size, buffer, filepart] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                this.check_no_isolation("`GetFullPathNameW`")?;
+
+                let filename = this.read_pointer(filename)?;
+                let size = this.read_scalar(size)?.to_u32()?;
+                let buffer = this.read_pointer(buffer)?;
+                let filepart = this.read_pointer(filepart)?;
+
+                if !this.ptr_is_null(filepart)? {
+                    throw_unsup_format!("GetFullPathNameW: non-null `lpFilePart` is not supported");
+                }
+
+                let filename = this.read_path_from_wide_str(filename)?;
+                let result = match win_absolute(&filename)? {
+                    Err(err) => {
+                        this.set_last_error_from_io_error(err)?;
+                        Scalar::from_u32(0) // return zero upon failure
+                    }
+                    Ok(abs_filename) => {
+                        Scalar::from_u32(helpers::windows_check_buffer_size(
+                            this.write_path_to_wide_str(&abs_filename, buffer, size.into())?,
+                        ))
+                        // This can in fact return 0. It is up to the caller to set last_error to 0
+                        // beforehand and check it afterwards to exclude that case.
+                    }
+                };
+                this.write_scalar(result, dest)?;
+            }
 
             // Allocation
             "HeapAlloc" => {
@@ -78,8 +247,21 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let size = this.read_target_usize(size)?;
                 let heap_zero_memory = 0x00000008; // HEAP_ZERO_MEMORY
                 let zero_init = (flags & heap_zero_memory) == heap_zero_memory;
-                let res = this.malloc(size, zero_init, MiriMemoryKind::WinHeap)?;
-                this.write_pointer(res, dest)?;
+                // Alignment is twice the pointer size.
+                // Source: <https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc>
+                let align = this.tcx.pointer_size().bytes().strict_mul(2);
+                let ptr = this.allocate_ptr(
+                    Size::from_bytes(size),
+                    Align::from_bytes(align).unwrap(),
+                    MiriMemoryKind::WinHeap.into(),
+                )?;
+                if zero_init {
+                    this.write_bytes_ptr(
+                        ptr.into(),
+                        iter::repeat(0u8).take(usize::try_from(size).unwrap()),
+                    )?;
+                }
+                this.write_pointer(ptr, dest)?;
             }
             "HeapFree" => {
                 let [handle, flags, ptr] =
@@ -87,18 +269,42 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
                 let ptr = this.read_pointer(ptr)?;
-                this.free(ptr, MiriMemoryKind::WinHeap)?;
+                // "This pointer can be NULL." It doesn't say what happens then, but presumably nothing.
+                // (https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapfree)
+                if !this.ptr_is_null(ptr)? {
+                    this.deallocate_ptr(ptr, None, MiriMemoryKind::WinHeap.into())?;
+                }
                 this.write_scalar(Scalar::from_i32(1), dest)?;
             }
             "HeapReAlloc" => {
-                let [handle, flags, ptr, size] =
+                let [handle, flags, old_ptr, size] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
-                let ptr = this.read_pointer(ptr)?;
+                let old_ptr = this.read_pointer(old_ptr)?;
                 let size = this.read_target_usize(size)?;
-                let res = this.realloc(ptr, size, MiriMemoryKind::WinHeap)?;
-                this.write_pointer(res, dest)?;
+                let align = this.tcx.pointer_size().bytes().strict_mul(2); // same as above
+                // The docs say that `old_ptr` must come from an earlier HeapAlloc or HeapReAlloc,
+                // so unlike C `realloc` we do *not* allow a NULL here.
+                // (https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
+                let new_ptr = this.reallocate_ptr(
+                    old_ptr,
+                    None,
+                    Size::from_bytes(size),
+                    Align::from_bytes(align).unwrap(),
+                    MiriMemoryKind::WinHeap.into(),
+                )?;
+                this.write_pointer(new_ptr, dest)?;
+            }
+            "LocalFree" => {
+                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                // "If the hMem parameter is NULL, LocalFree ignores the parameter and returns NULL."
+                // (https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localfree)
+                if !this.ptr_is_null(ptr)? {
+                    this.deallocate_ptr(ptr, None, MiriMemoryKind::WinLocal.into())?;
+                }
+                this.write_null(dest)?;
             }
 
             // errno
@@ -119,54 +325,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // Also called from `page_size` crate.
                 let [system_info] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let system_info = this.deref_operand(system_info)?;
+                let system_info =
+                    this.deref_pointer_as(system_info, this.windows_ty_layout("SYSTEM_INFO"))?;
                 // Initialize with `0`.
                 this.write_bytes_ptr(
-                    system_info.ptr,
+                    system_info.ptr(),
                     iter::repeat(0u8).take(system_info.layout.size.bytes_usize()),
                 )?;
                 // Set selected fields.
-                let word_layout = this.machine.layouts.u16;
-                let dword_layout = this.machine.layouts.u32;
-                let usize_layout = this.machine.layouts.usize;
-
-                // Using `mplace_field` is error-prone, see: https://github.com/rust-lang/miri/issues/2136.
-                // Pointer fields have different sizes on different targets.
-                // To avoid all these issue we calculate the offsets ourselves.
-                let field_sizes = [
-                    word_layout.size,  // 0,  wProcessorArchitecture      : WORD
-                    word_layout.size,  // 1,  wReserved                   : WORD
-                    dword_layout.size, // 2,  dwPageSize                  : DWORD
-                    usize_layout.size, // 3,  lpMinimumApplicationAddress : LPVOID
-                    usize_layout.size, // 4,  lpMaximumApplicationAddress : LPVOID
-                    usize_layout.size, // 5,  dwActiveProcessorMask       : DWORD_PTR
-                    dword_layout.size, // 6,  dwNumberOfProcessors        : DWORD
-                    dword_layout.size, // 7,  dwProcessorType             : DWORD
-                    dword_layout.size, // 8,  dwAllocationGranularity     : DWORD
-                    word_layout.size,  // 9,  wProcessorLevel             : WORD
-                    word_layout.size,  // 10, wProcessorRevision          : WORD
-                ];
-                let field_offsets: SmallVec<[Size; 11]> = field_sizes
-                    .iter()
-                    .copied()
-                    .scan(Size::ZERO, |a, x| {
-                        let res = Some(*a);
-                        *a += x;
-                        res
-                    })
-                    .collect();
-
-                // Set page size.
-                let page_size = system_info.offset(field_offsets[2], dword_layout, &this.tcx)?;
-                this.write_scalar(
-                    Scalar::from_int(this.machine.page_size, dword_layout.size),
-                    &page_size.into(),
-                )?;
-                // Set number of processors.
-                let num_cpus = system_info.offset(field_offsets[6], dword_layout, &this.tcx)?;
-                this.write_scalar(
-                    Scalar::from_int(this.machine.num_cpus, dword_layout.size),
-                    &num_cpus.into(),
+                this.write_int_fields_named(
+                    &[
+                        ("dwPageSize", this.machine.page_size.into()),
+                        ("dwNumberOfProcessors", this.machine.num_cpus.into()),
+                    ],
+                    &system_info,
                 )?;
             }
 
@@ -202,17 +374,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "GetCommandLineW" => {
                 let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.write_pointer(
-                    this.machine.cmd_line.expect("machine must be initialized").ptr,
+                    this.machine.cmd_line.expect("machine must be initialized"),
                     dest,
                 )?;
             }
 
             // Time related shims
-            "GetSystemTimeAsFileTime" => {
+            "GetSystemTimeAsFileTime" | "GetSystemTimePreciseAsFileTime" => {
                 #[allow(non_snake_case)]
                 let [LPFILETIME] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.GetSystemTimeAsFileTime(LPFILETIME)?;
+                this.GetSystemTimeAsFileTime(link_name.as_str(), LPFILETIME)?;
             }
             "QueryPerformanceCounter" => {
                 #[allow(non_snake_case)]
@@ -234,34 +406,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
                 this.Sleep(timeout)?;
             }
+            "CreateWaitableTimerExW" => {
+                let [attributes, name, flags, access] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                this.read_pointer(attributes)?;
+                this.read_pointer(name)?;
+                this.read_scalar(flags)?.to_u32()?;
+                this.read_scalar(access)?.to_u32()?;
+                // Unimplemented. Always return failure.
+                let not_supported = this.eval_windows("c", "ERROR_NOT_SUPPORTED");
+                this.set_last_error(not_supported)?;
+                this.write_null(dest)?;
+            }
 
             // Synchronization primitives
-            "AcquireSRWLockExclusive" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.AcquireSRWLockExclusive(ptr)?;
-            }
-            "ReleaseSRWLockExclusive" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.ReleaseSRWLockExclusive(ptr)?;
-            }
-            "TryAcquireSRWLockExclusive" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let ret = this.TryAcquireSRWLockExclusive(ptr)?;
-                this.write_scalar(ret, dest)?;
-            }
-            "AcquireSRWLockShared" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.AcquireSRWLockShared(ptr)?;
-            }
-            "ReleaseSRWLockShared" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.ReleaseSRWLockShared(ptr)?;
-            }
-            "TryAcquireSRWLockShared" => {
-                let [ptr] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let ret = this.TryAcquireSRWLockShared(ptr)?;
-                this.write_scalar(ret, dest)?;
-            }
             "InitOnceBeginInitialize" => {
                 let [ptr, flags, pending, context] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
@@ -274,24 +432,23 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let result = this.InitOnceComplete(ptr, flags, context)?;
                 this.write_scalar(result, dest)?;
             }
-            "SleepConditionVariableSRW" => {
-                let [condvar, lock, timeout, flags] =
+            "WaitOnAddress" => {
+                let [ptr_op, compare_op, size_op, timeout_op] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
 
-                let result = this.SleepConditionVariableSRW(condvar, lock, timeout, flags, dest)?;
-                this.write_scalar(result, dest)?;
+                this.WaitOnAddress(ptr_op, compare_op, size_op, timeout_op, dest)?;
             }
-            "WakeConditionVariable" => {
-                let [condvar] =
+            "WakeByAddressSingle" => {
+                let [ptr_op] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
 
-                this.WakeConditionVariable(condvar)?;
+                this.WakeByAddressSingle(ptr_op)?;
             }
-            "WakeAllConditionVariable" => {
-                let [condvar] =
+            "WakeByAddressAll" => {
+                let [ptr_op] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
 
-                this.WakeAllConditionVariable(condvar)?;
+                this.WakeByAddressAll(ptr_op)?;
             }
 
             // Dynamic symbol loading
@@ -301,16 +458,92 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.read_target_isize(hModule)?;
                 let name = this.read_c_str(this.read_pointer(lpProcName)?)?;
-                if let Some(dlsym) = Dlsym::from_str(name, &this.tcx.sess.target.os)? {
-                    let ptr = this.create_fn_alloc_ptr(FnVal::Other(dlsym));
+                if let Ok(name) = str::from_utf8(name)
+                    && is_dyn_sym(name)
+                {
+                    let ptr = this.fn_ptr(FnVal::Other(DynSym::from_str(name)));
                     this.write_pointer(ptr, dest)?;
                 } else {
                     this.write_null(dest)?;
                 }
             }
 
+            // Threading
+            "CreateThread" => {
+                let [security, stacksize, start, arg, flags, thread] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let thread_id =
+                    this.CreateThread(security, stacksize, start, arg, flags, thread)?;
+
+                this.write_scalar(Handle::Thread(thread_id).to_scalar(this), dest)?;
+            }
+            "WaitForSingleObject" => {
+                let [handle, timeout] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let ret = this.WaitForSingleObject(handle, timeout)?;
+                this.write_scalar(Scalar::from_u32(ret), dest)?;
+            }
+            "GetCurrentThread" => {
+                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                this.write_scalar(
+                    Handle::Pseudo(PseudoHandle::CurrentThread).to_scalar(this),
+                    dest,
+                )?;
+            }
+            "SetThreadDescription" => {
+                let [handle, name] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let handle = this.read_scalar(handle)?;
+                let name = this.read_wide_str(this.read_pointer(name)?)?;
+
+                let thread = match Handle::from_scalar(handle, this)? {
+                    Some(Handle::Thread(thread)) => thread,
+                    Some(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.get_active_thread(),
+                    _ => this.invalid_handle("SetThreadDescription")?,
+                };
+
+                // FIXME: use non-lossy conversion
+                this.set_thread_name(thread, String::from_utf16_lossy(&name).into_bytes());
+
+                this.write_null(dest)?;
+            }
+            "GetThreadDescription" => {
+                let [handle, name_ptr] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let handle = this.read_scalar(handle)?;
+                let name_ptr = this.deref_pointer(name_ptr)?; // the pointer where we should store the ptr to the name
+
+                let thread = match Handle::from_scalar(handle, this)? {
+                    Some(Handle::Thread(thread)) => thread,
+                    Some(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.get_active_thread(),
+                    _ => this.invalid_handle("SetThreadDescription")?,
+                };
+                // Looks like the default thread name is empty.
+                let name = this.get_thread_name(thread).unwrap_or(b"").to_owned();
+                let name = this.alloc_os_str_as_wide_str(
+                    bytes_to_os_str(&name)?,
+                    MiriMemoryKind::WinLocal.into(),
+                )?;
+
+                this.write_scalar(Scalar::from_maybe_pointer(name, this), &name_ptr)?;
+
+                this.write_null(dest)?;
+            }
+
             // Miscellaneous
+            "ExitProcess" => {
+                let [code] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let code = this.read_scalar(code)?.to_u32()?;
+                throw_machine_stop!(TerminationInfo::Exit { code: code.into(), leak_check: false });
+            }
             "SystemFunction036" => {
+                // used by getrandom 0.1
                 // This is really 'RtlGenRandom'.
                 let [ptr, len] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
@@ -319,7 +552,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.gen_random(ptr, len.into())?;
                 this.write_scalar(Scalar::from_bool(true), dest)?;
             }
+            "ProcessPrng" => {
+                // used by `std`
+                let [ptr, len] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let len = this.read_target_usize(len)?;
+                this.gen_random(ptr, len)?;
+                this.write_scalar(Scalar::from_i32(1), dest)?;
+            }
             "BCryptGenRandom" => {
+                // used by getrandom 0.2
                 let [algorithm, ptr, len, flags] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let algorithm = this.read_scalar(algorithm)?;
@@ -358,7 +601,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [console, buffer_info] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.read_target_isize(console)?;
-                this.deref_operand(buffer_info)?;
+                // FIXME: this should use deref_pointer_as, but CONSOLE_SCREEN_BUFFER_INFO is not in std
+                this.deref_pointer(buffer_info)?;
                 // Indicate an error.
                 // FIXME: we should set last_error, but to what?
                 this.write_null(dest)?;
@@ -396,15 +640,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
                 // Using the host current_exe is a bit off, but consistent with Linux
                 // (where stdlib reads /proc/self/exe).
-                // Unfortunately this Windows function has a crazy behavior so we can't just use
-                // `write_path_to_wide_str`...
                 let path = std::env::current_exe().unwrap();
-                let (all_written, size_needed) = this.write_path_to_wide_str(
-                    &path,
-                    filename,
-                    size.into(),
-                    /*truncate*/ true,
-                )?;
+                let (all_written, size_needed) =
+                    this.write_path_to_wide_str_truncated(&path, filename, size.into())?;
 
                 if all_written {
                     // If the function succeeds, the return value is the length of the string that
@@ -421,31 +659,38 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.set_last_error(insufficient_buffer)?;
                 }
             }
-
-            // Threading
-            "CreateThread" => {
-                let [security, stacksize, start, arg, flags, thread] =
+            "FormatMessageW" => {
+                let [flags, module, message_id, language_id, buffer, size, arguments] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
 
-                let thread_id =
-                    this.CreateThread(security, stacksize, start, arg, flags, thread)?;
+                let flags = this.read_scalar(flags)?.to_u32()?;
+                let _module = this.read_pointer(module)?; // seems to contain a module name
+                let message_id = this.read_scalar(message_id)?;
+                let _language_id = this.read_scalar(language_id)?.to_u32()?;
+                let buffer = this.read_pointer(buffer)?;
+                let size = this.read_scalar(size)?.to_u32()?;
+                let _arguments = this.read_pointer(arguments)?;
 
-                this.write_scalar(Handle::Thread(thread_id).to_scalar(this), dest)?;
-            }
-            "WaitForSingleObject" => {
-                let [handle, timeout] =
-                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                // We only support `FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS`
+                // This also means `arguments` can be ignored.
+                if flags != 4096u32 | 512u32 {
+                    throw_unsup_format!("FormatMessageW: unsupported flags {flags:#x}");
+                }
 
-                let ret = this.WaitForSingleObject(handle, timeout)?;
-                this.write_scalar(Scalar::from_u32(ret), dest)?;
-            }
-            "GetCurrentThread" => {
-                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-
-                this.write_scalar(
-                    Handle::Pseudo(PseudoHandle::CurrentThread).to_scalar(this),
-                    dest,
-                )?;
+                let error = this.try_errnum_to_io_error(message_id)?;
+                let formatted = match error {
+                    Some(err) => format!("{err}"),
+                    None => format!("<unknown error in FormatMessageW: {message_id}>"),
+                };
+                let (complete, length) =
+                    this.write_os_str_to_wide_str(OsStr::new(&formatted), buffer, size.into())?;
+                if !complete {
+                    // The API docs don't say what happens when the buffer is not big enough...
+                    // Let's just bail.
+                    throw_unsup_format!("FormatMessageW: buffer not big enough");
+                }
+                // The return value is the number of characters stored *excluding* the null terminator.
+                this.write_int(length.checked_sub(1).unwrap(), dest)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -474,7 +719,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [console, mode] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.read_target_isize(console)?;
-                this.deref_operand(mode)?;
+                this.deref_pointer(mode)?;
                 // Indicate an error.
                 this.write_null(dest)?;
             }
@@ -514,9 +759,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.write_null(dest)?;
             }
 
-            _ => return Ok(EmulateByNameResult::NotSupported),
+            _ => return Ok(EmulateItemResult::NotSupported),
         }
 
-        Ok(EmulateByNameResult::NeedsJumping)
+        Ok(EmulateItemResult::NeedsReturn)
     }
 }

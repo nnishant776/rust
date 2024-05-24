@@ -1,5 +1,4 @@
-// run-pass
-// ignore-pretty pretty-printing is unhygienic
+//@ run-pass
 
 #![feature(decl_macro)]
 

@@ -48,8 +48,8 @@ use unwind as uw;
 static CANARY: u8 = 0;
 
 // NOTE(nbdd0121)
-// Once `c_unwind` feature is stabilized, there will be ABI stability requirement
-// on this struct. The first two field must be `_Unwind_Exception` and `canary`,
+// There is an ABI stability requirement on this struct.
+// The first two field must be `_Unwind_Exception` and `canary`,
 // as it may be accessed by a different version of the std with a different compiler.
 #[repr(C)]
 struct Exception {
@@ -62,8 +62,8 @@ pub unsafe fn panic(data: Box<dyn Any + Send>) -> u32 {
     let exception = Box::new(Exception {
         _uwe: uw::_Unwind_Exception {
             exception_class: rust_exception_class(),
-            exception_cleanup,
-            private: [0; uw::unwinder_private_data_size],
+            exception_cleanup: Some(exception_cleanup),
+            private: [core::ptr::null(); uw::unwinder_private_data_size],
         },
         canary: &CANARY,
         cause: data,

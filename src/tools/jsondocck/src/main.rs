@@ -1,8 +1,8 @@
 use jsonpath_lib::select;
-use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::{env, fmt, fs};
 
 mod cache;
@@ -95,7 +95,8 @@ impl fmt::Display for CommandKind {
     }
 }
 
-static LINE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static LINE_PATTERN: OnceLock<Regex> = OnceLock::new();
+fn line_pattern() -> Regex {
     RegexBuilder::new(
         r#"
         \s(?P<invalid>!?)@(?P<negated>!?)
@@ -107,7 +108,7 @@ static LINE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     .unicode(true)
     .build()
     .unwrap()
-});
+}
 
 fn print_err(msg: &str, lineno: usize) {
     eprintln!("Invalid command: {} on line {}", msg, lineno)
@@ -123,7 +124,7 @@ fn get_commands(template: &str) -> Result<Vec<Command>, ()> {
     for (lineno, line) in file.split('\n').enumerate() {
         let lineno = lineno + 1;
 
-        let cap = match LINE_PATTERN.captures(line) {
+        let cap = match LINE_PATTERN.get_or_init(line_pattern).captures(line) {
             Some(c) => c,
             None => continue,
         };
@@ -237,7 +238,7 @@ fn check_command(command: Command, cache: &mut Cache) -> Result<(), CkError> {
 
             // Serde json doesn't implement Ord or Hash for Value, so we must
             // use a Vec here. While in theory that makes setwize equality
-            // O(n^2), in practice n will never be large enought to matter.
+            // O(n^2), in practice n will never be large enough to matter.
             let expected_values =
                 values.iter().map(|v| string_to_value(v, cache)).collect::<Vec<_>>();
             if expected_values.len() != got_values.len() {

@@ -1,7 +1,6 @@
 use crate::errors::AutoDerefReachedRecursionLimit;
+use crate::traits;
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
-use crate::traits::NormalizeExt;
-use crate::traits::{self, TraitEngine, TraitEngineExt};
 use rustc_infer::infer::InferCtxt;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -9,10 +8,13 @@ use rustc_session::Limit;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::Span;
+use rustc_trait_selection::traits::ObligationCtxt;
 
 #[derive(Copy, Clone, Debug)]
 pub enum AutoderefKind {
+    /// A true pointer type, such as `&T` and `*mut T`.
     Builtin,
+    /// A type which must dispatch to a `Deref` implementation.
     Overloaded,
 }
 
@@ -67,17 +69,26 @@ impl<'a, 'tcx> Iterator for Autoderef<'a, 'tcx> {
 
         // Otherwise, deref if type is derefable:
         let (kind, new_ty) =
-            if let Some(mt) = self.state.cur_ty.builtin_deref(self.include_raw_pointers) {
-                (AutoderefKind::Builtin, mt.ty)
+            if let Some(ty) = self.state.cur_ty.builtin_deref(self.include_raw_pointers) {
+                debug_assert_eq!(ty, self.infcx.resolve_vars_if_possible(ty));
+                // NOTE: we may still need to normalize the built-in deref in case
+                // we have some type like `&<Ty as Trait>::Assoc`, since users of
+                // autoderef expect this type to have been structurally normalized.
+                if self.infcx.next_trait_solver()
+                    && let ty::Alias(..) = ty.kind()
+                {
+                    let (normalized_ty, obligations) = self.structurally_normalize(ty)?;
+                    self.state.obligations.extend(obligations);
+                    (AutoderefKind::Builtin, normalized_ty)
+                } else {
+                    (AutoderefKind::Builtin, ty)
+                }
             } else if let Some(ty) = self.overloaded_deref_ty(self.state.cur_ty) {
+                // The overloaded deref check already normalizes the pointee type.
                 (AutoderefKind::Overloaded, ty)
             } else {
                 return None;
             };
-
-        if new_ty.references_error() {
-            return None;
-        }
 
         self.state.steps.push((self.state.cur_ty, kind));
         debug!(
@@ -119,14 +130,15 @@ impl<'a, 'tcx> Autoderef<'a, 'tcx> {
 
     fn overloaded_deref_ty(&mut self, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
         debug!("overloaded_deref_ty({:?})", ty);
-
         let tcx = self.infcx.tcx;
 
+        if ty.references_error() {
+            return None;
+        }
+
         // <ty as Deref>
-        let trait_ref = tcx.mk_trait_ref(tcx.lang_items().deref_trait()?, [ty]);
-
+        let trait_ref = ty::TraitRef::new(tcx, tcx.lang_items().deref_trait()?, [ty]);
         let cause = traits::ObligationCause::misc(self.span, self.body_id);
-
         let obligation = traits::Obligation::new(
             tcx,
             cause.clone(),
@@ -138,26 +150,44 @@ impl<'a, 'tcx> Autoderef<'a, 'tcx> {
             return None;
         }
 
-        let normalized_ty = self
-            .infcx
-            .at(&cause, self.param_env)
-            .normalize(tcx.mk_projection(tcx.lang_items().deref_target()?, trait_ref.substs));
-        let mut fulfillcx = <dyn TraitEngine<'tcx>>::new_in_snapshot(tcx);
-        let normalized_ty =
-            normalized_ty.into_value_registering_obligations(self.infcx, &mut *fulfillcx);
-        let errors = fulfillcx.select_where_possible(&self.infcx);
-        if !errors.is_empty() {
-            // This shouldn't happen, except for evaluate/fulfill mismatches,
-            // but that's not a reason for an ICE (`predicate_may_hold` is conservative
-            // by design).
-            debug!("overloaded_deref_ty: encountered errors {:?} while fulfilling", errors);
-            return None;
-        }
-        let obligations = fulfillcx.pending_obligations();
+        let (normalized_ty, obligations) = self.structurally_normalize(Ty::new_projection(
+            tcx,
+            tcx.lang_items().deref_target()?,
+            [ty],
+        ))?;
         debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})", ty, normalized_ty, obligations);
         self.state.obligations.extend(obligations);
 
         Some(self.infcx.resolve_vars_if_possible(normalized_ty))
+    }
+
+    #[instrument(level = "debug", skip(self), ret)]
+    pub fn structurally_normalize(
+        &self,
+        ty: Ty<'tcx>,
+    ) -> Option<(Ty<'tcx>, Vec<traits::PredicateObligation<'tcx>>)> {
+        let ocx = ObligationCtxt::new(self.infcx);
+        let Ok(normalized_ty) = ocx.structurally_normalize(
+            &traits::ObligationCause::misc(self.span, self.body_id),
+            self.param_env,
+            ty,
+        ) else {
+            // We shouldn't have errors here, except for evaluate/fulfill mismatches,
+            // but that's not a reason for an ICE (`predicate_may_hold` is conservative
+            // by design).
+            // FIXME(-Znext-solver): This *actually* shouldn't happen then.
+            return None;
+        };
+        let errors = ocx.select_where_possible();
+        if !errors.is_empty() {
+            // This shouldn't happen, except for evaluate/fulfill mismatches,
+            // but that's not a reason for an ICE (`predicate_may_hold` is conservative
+            // by design).
+            debug!(?errors, "encountered errors while fulfilling");
+            return None;
+        }
+
+        Some((normalized_ty, ocx.into_pending_obligations()))
     }
 
     /// Returns the final type we ended up with, which may be an inference
@@ -215,7 +245,7 @@ pub fn report_autoderef_recursion_limit_error<'tcx>(tcx: TyCtxt<'tcx>, span: Spa
         Limit(0) => Limit(2),
         limit => limit * 2,
     };
-    tcx.sess.emit_err(AutoDerefReachedRecursionLimit {
+    tcx.dcx().emit_err(AutoDerefReachedRecursionLimit {
         span,
         ty,
         suggested_limit,

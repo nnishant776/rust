@@ -1,6 +1,7 @@
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use rustc_hir::LangItem;
-use rustc_middle::ty::subst::GenericArg;
 use rustc_middle::ty::AssocKind;
+use rustc_middle::ty::GenericArg;
 use rustc_session::config::{sigpipe, EntryFnType};
 use rustc_span::symbol::Ident;
 
@@ -28,7 +29,7 @@ pub(crate) fn maybe_create_entry_wrapper(
 
     if main_def_id.is_local() {
         let instance = Instance::mono(tcx, main_def_id).polymorphize(tcx);
-        if !is_jit && module.get_name(&*tcx.symbol_name(instance).name).is_none() {
+        if module.get_name(tcx.symbol_name(instance).name).is_none() {
             return;
         }
     } else if !is_primary_cgu {
@@ -74,8 +75,8 @@ pub(crate) fn maybe_create_entry_wrapper(
         let cmain_func_id = match m.declare_function(entry_name, Linkage::Export, &cmain_sig) {
             Ok(func_id) => func_id,
             Err(err) => {
-                tcx.sess
-                    .fatal(&format!("entry symbol `{entry_name}` declared multiple times: {err}"));
+                tcx.dcx()
+                    .fatal(format!("entry symbol `{entry_name}` declared multiple times: {err}"));
             }
         };
 
@@ -115,14 +116,12 @@ pub(crate) fn maybe_create_entry_wrapper(
                         termination_trait,
                     )
                     .unwrap();
-                let report = Instance::resolve(
+                let report = Instance::expect_resolve(
                     tcx,
                     ParamEnv::reveal_all(),
                     report.def_id,
-                    tcx.mk_substs(&[GenericArg::from(main_ret_ty)]),
+                    tcx.mk_args(&[GenericArg::from(main_ret_ty)]),
                 )
-                .unwrap()
-                .unwrap()
                 .polymorphize(tcx);
 
                 let report_name = tcx.symbol_name(report).name;
@@ -142,14 +141,12 @@ pub(crate) fn maybe_create_entry_wrapper(
                 }
             } else if is_main_fn {
                 let start_def_id = tcx.require_lang_item(LangItem::Start, None);
-                let start_instance = Instance::resolve(
+                let start_instance = Instance::expect_resolve(
                     tcx,
                     ParamEnv::reveal_all(),
                     start_def_id,
-                    tcx.mk_substs(&[main_ret_ty.into()]),
+                    tcx.mk_args(&[main_ret_ty.into()]),
                 )
-                .unwrap()
-                .unwrap()
                 .polymorphize(tcx);
                 let start_func_id = import_function(tcx, m, start_instance);
 
@@ -171,7 +168,7 @@ pub(crate) fn maybe_create_entry_wrapper(
         }
 
         if let Err(err) = m.define_function(cmain_func_id, &mut ctx) {
-            tcx.sess.fatal(&format!("entry symbol `{entry_name}` defined multiple times: {err}"));
+            tcx.dcx().fatal(format!("entry symbol `{entry_name}` defined multiple times: {err}"));
         }
 
         unwind_context.add_function(cmain_func_id, &ctx, m.isa());

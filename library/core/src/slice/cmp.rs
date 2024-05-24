@@ -1,32 +1,22 @@
 //! Comparison traits for `[T]`.
 
-use crate::cmp::{self, Ordering};
-use crate::ffi;
+use crate::cmp::{self, BytewiseEq, Ordering};
+use crate::intrinsics::compare_bytes;
 use crate::mem;
 
 use super::from_raw_parts;
 use super::memchr;
 
-extern "C" {
-    /// Calls implementation provided memcmp.
-    ///
-    /// Interprets the data as u8.
-    ///
-    /// Returns 0 for equal, < 0 for less than and > 0 for greater
-    /// than.
-    fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> ffi::c_int;
-}
-
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<A, B> PartialEq<[B]> for [A]
+impl<T, U> PartialEq<[U]> for [T]
 where
-    A: PartialEq<B>,
+    T: PartialEq<U>,
 {
-    fn eq(&self, other: &[B]) -> bool {
+    fn eq(&self, other: &[U]) -> bool {
         SlicePartialEq::equal(self, other)
     }
 
-    fn ne(&self, other: &[B]) -> bool {
+    fn ne(&self, other: &[U]) -> bool {
         SlicePartialEq::not_equal(self, other)
     }
 }
@@ -34,7 +24,7 @@ where
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Eq> Eq for [T] {}
 
-/// Implements comparison of vectors [lexicographically](Ord#lexicographical-comparison).
+/// Implements comparison of slices [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Ord> Ord for [T] {
     fn cmp(&self, other: &[T]) -> Ordering {
@@ -42,7 +32,7 @@ impl<T: Ord> Ord for [T] {
     }
 }
 
-/// Implements comparison of vectors [lexicographically](Ord#lexicographical-comparison).
+/// Implements comparison of slices [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PartialOrd> PartialOrd for [T] {
     fn partial_cmp(&self, other: &[T]) -> Option<Ordering> {
@@ -70,14 +60,25 @@ where
             return false;
         }
 
-        self.iter().zip(other.iter()).all(|(x, y)| x == y)
+        // Implemented as explicit indexing rather
+        // than zipped iterators for performance reasons.
+        // See PR https://github.com/rust-lang/rust/pull/116846
+        for idx in 0..self.len() {
+            // bound checks are optimized away
+            if self[idx] != other[idx] {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
-// Use memcmp for bytewise equality when the types allow
+// When each element can be compared byte-wise, we can compare all the bytes
+// from the whole size in one call to the intrinsics.
 impl<A, B> SlicePartialEq<B> for [A]
 where
-    A: BytewiseEquality<B>,
+    A: BytewiseEq<B>,
 {
     fn equal(&self, other: &[B]) -> bool {
         if self.len() != other.len() {
@@ -88,7 +89,7 @@ where
         // The two slices have been checked to have the same size above.
         unsafe {
             let size = mem::size_of_val(self);
-            memcmp(self.as_ptr() as *const u8, other.as_ptr() as *const u8, size) == 0
+            compare_bytes(self.as_ptr() as *const u8, other.as_ptr() as *const u8, size) == 0
         }
     }
 }
@@ -183,7 +184,7 @@ impl<A: Ord> SliceOrd for A {
     }
 }
 
-// memcmp compares a sequence of unsigned bytes lexicographically.
+// `compare_bytes` compares a sequence of unsigned bytes lexicographically.
 // this matches the order we want for [u8], but no others (not even [i8]).
 impl SliceOrd for u8 {
     #[inline]
@@ -195,36 +196,13 @@ impl SliceOrd for u8 {
         // SAFETY: `left` and `right` are references and are thus guaranteed to be valid.
         // We use the minimum of both lengths which guarantees that both regions are
         // valid for reads in that interval.
-        let mut order = unsafe { memcmp(left.as_ptr(), right.as_ptr(), len) as isize };
+        let mut order = unsafe { compare_bytes(left.as_ptr(), right.as_ptr(), len) as isize };
         if order == 0 {
             order = diff;
         }
         order.cmp(&0)
     }
 }
-
-// Hack to allow specializing on `Eq` even though `Eq` has a method.
-#[rustc_unsafe_specialization_marker]
-trait MarkerEq<T>: PartialEq<T> {}
-
-impl<T: Eq> MarkerEq<T> for T {}
-
-#[doc(hidden)]
-/// Trait implemented for types that can be compared for equality using
-/// their bytewise representation
-#[rustc_specialization_trait]
-trait BytewiseEquality<T>: MarkerEq<T> + Copy {}
-
-macro_rules! impl_marker_for {
-    ($traitname:ident, $($ty:ty)*) => {
-        $(
-            impl $traitname<$ty> for $ty { }
-        )*
-    }
-}
-
-impl_marker_for!(BytewiseEquality,
-                 u8 i8 u16 i16 u32 i32 u64 i64 u128 i128 usize isize char bool);
 
 pub(super) trait SliceContains: Sized {
     fn slice_contains(&self, x: &[Self]) -> bool;

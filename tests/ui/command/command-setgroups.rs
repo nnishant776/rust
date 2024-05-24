@@ -1,8 +1,9 @@
-// run-pass
-// ignore-windows - this is a unix-specific test
-// ignore-emscripten
-// ignore-sgx
-// ignore-musl - returns dummy result for _SC_NGROUPS_MAX
+//@ run-pass
+//@ ignore-windows - this is a unix-specific test
+//@ ignore-wasm32
+//@ ignore-sgx
+//@ ignore-musl - returns dummy result for _SC_NGROUPS_MAX
+//@ ignore-nto - does not have `/bin/id`, expects groups to be i32 (not u32)
 
 #![feature(rustc_private)]
 #![feature(setgroups)]

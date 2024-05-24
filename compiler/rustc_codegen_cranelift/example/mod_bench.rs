@@ -1,17 +1,18 @@
 #![feature(start, core_intrinsics, lang_items)]
+#![allow(internal_features)]
 #![no_std]
 
 #[cfg_attr(unix, link(name = "c"))]
 #[cfg_attr(target_env = "msvc", link(name = "msvcrt"))]
-extern {}
+extern "C" {}
 
 #[panic_handler]
-fn panic_handler(_: &core::panic::PanicInfo) -> ! {
+fn panic_handler(_: &core::panic::PanicInfo<'_>) -> ! {
     core::intrinsics::abort();
 }
 
-#[lang="eh_personality"]
-fn eh_personality(){}
+#[lang = "eh_personality"]
+fn eh_personality() {}
 
 // Required for rustc_codegen_llvm
 #[no_mangle]

@@ -1,11 +1,12 @@
 #![allow(non_camel_case_types)]
 
 use rustc_hir::LangItem;
-use rustc_middle::mir::interpret::ConstValue;
-use rustc_middle::ty::{self, layout::TyAndLayout, Ty, TyCtxt};
+use rustc_middle::mir;
+use rustc_middle::ty::Instance;
+use rustc_middle::ty::{self, layout::TyAndLayout, TyCtxt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::Span;
 
-use crate::base;
 use crate::traits::*;
 
 #[derive(Copy, Clone)]
@@ -42,7 +43,7 @@ pub enum RealPredicate {
     RealPredicateTrue,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum AtomicRmwBinOp {
     AtomicXchg,
     AtomicAdd,
@@ -120,49 +121,11 @@ pub fn build_langcall<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &Bx,
     span: Option<Span>,
     li: LangItem,
-) -> (Bx::FnAbiOfResult, Bx::Value) {
+) -> (Bx::FnAbiOfResult, Bx::Value, Instance<'tcx>) {
     let tcx = bx.tcx();
     let def_id = tcx.require_lang_item(li, span);
     let instance = ty::Instance::mono(tcx, def_id);
-    (bx.fn_abi_of_instance(instance, ty::List::empty()), bx.get_fn_addr(instance))
-}
-
-// To avoid UB from LLVM, these two functions mask RHS with an
-// appropriate mask unconditionally (i.e., the fallback behavior for
-// all shifts). For 32- and 64-bit types, this matches the semantics
-// of Java. (See related discussion on #1877 and #10183.)
-
-pub fn build_unchecked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
-    bx: &mut Bx,
-    lhs: Bx::Value,
-    rhs: Bx::Value,
-) -> Bx::Value {
-    let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
-    // #1877, #10183: Ensure that input is always valid
-    let rhs = shift_mask_rhs(bx, rhs);
-    bx.shl(lhs, rhs)
-}
-
-pub fn build_unchecked_rshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
-    bx: &mut Bx,
-    lhs_t: Ty<'tcx>,
-    lhs: Bx::Value,
-    rhs: Bx::Value,
-) -> Bx::Value {
-    let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
-    // #1877, #10183: Ensure that input is always valid
-    let rhs = shift_mask_rhs(bx, rhs);
-    let is_signed = lhs_t.is_signed();
-    if is_signed { bx.ashr(lhs, rhs) } else { bx.lshr(lhs, rhs) }
-}
-
-fn shift_mask_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
-    bx: &mut Bx,
-    rhs: Bx::Value,
-) -> Bx::Value {
-    let rhs_llty = bx.val_ty(rhs);
-    let shift_val = shift_mask_val(bx, rhs_llty, rhs_llty, false);
-    bx.and(rhs, shift_val)
+    (bx.fn_abi_of_instance(instance, ty::List::empty()), bx.get_fn_addr(instance), instance)
 }
 
 pub fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
@@ -194,10 +157,10 @@ pub fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 pub fn asm_const_to_str<'tcx>(
     tcx: TyCtxt<'tcx>,
     sp: Span,
-    const_value: ConstValue<'tcx>,
+    const_value: mir::ConstValue<'tcx>,
     ty_and_layout: TyAndLayout<'tcx>,
 ) -> String {
-    let ConstValue::Scalar(scalar) = const_value else {
+    let mir::ConstValue::Scalar(scalar) = const_value else {
         span_bug!(sp, "expected Scalar for promoted asm const, but got {:#?}", const_value)
     };
     let value = scalar.assert_bits(ty_and_layout.size);

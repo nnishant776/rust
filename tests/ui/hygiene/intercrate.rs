@@ -1,6 +1,4 @@
-// ignore-pretty pretty-printing is unhygienic
-
-// aux-build:intercrate.rs
+//@ aux-build:intercrate.rs
 
 #![feature(decl_macro)]
 

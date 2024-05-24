@@ -4,7 +4,9 @@
 // MIR building) evaluates bounds from normalizing an impl after evaluating
 // any bounds on the impl.
 
-// check-pass
+//@ check-pass
+
+#![allow(dropping_copy_types)]
 
 trait A {
     type B;

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::num::NonZeroU32;
 
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
+use rustc_middle::ty::layout::TyAndLayout;
 
 use super::sync::EvalContextExtPriv as _;
 use super::thread::MachineCallback;
@@ -41,13 +41,13 @@ pub enum InitOnceStatus {
 pub(super) struct InitOnce<'mir, 'tcx> {
     status: InitOnceStatus,
     waiters: VecDeque<InitOnceWaiter<'mir, 'tcx>>,
-    data_race: VClock,
+    clock: VClock,
 }
 
-impl<'mir, 'tcx> VisitTags for InitOnce<'mir, 'tcx> {
-    fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+impl<'mir, 'tcx> VisitProvenance for InitOnce<'mir, 'tcx> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         for waiter in self.waiters.iter() {
-            waiter.callback.visit_tags(visit);
+            waiter.callback.visit_provenance(visit);
         }
     }
 }
@@ -61,10 +61,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let current_thread = this.get_active_thread();
 
         if let Some(data_race) = &this.machine.data_race {
-            data_race.validate_lock_acquire(
-                &this.machine.threads.sync.init_onces[id].data_race,
-                current_thread,
-            );
+            data_race
+                .acquire_clock(&this.machine.threads.sync.init_onces[id].clock, current_thread);
         }
     }
 
@@ -77,7 +75,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_mut();
         let current_thread = this.get_active_thread();
 
-        this.unblock_thread(waiter.thread);
+        this.unblock_thread(waiter.thread, BlockReason::InitOnce(id));
 
         // Call callback, with the woken-up thread as `current`.
         this.set_active_thread(waiter.thread);
@@ -94,10 +92,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn init_once_get_or_create_id(
         &mut self,
         lock_op: &OpTy<'tcx, Provenance>,
+        lock_layout: TyAndLayout<'tcx>,
         offset: u64,
     ) -> InterpResult<'tcx, InitOnceId> {
         let this = self.eval_context_mut();
-        this.init_once_get_or_create(|ecx, next_id| ecx.get_or_create_id(next_id, lock_op, offset))
+        this.init_once_get_or_create(|ecx, next_id| {
+            ecx.get_or_create_id(next_id, lock_op, lock_layout, offset)
+        })
     }
 
     /// Provides the closure with the next InitOnceId. Creates that InitOnce if the closure returns None,
@@ -139,7 +140,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let init_once = &mut this.machine.threads.sync.init_onces[id];
         assert_ne!(init_once.status, InitOnceStatus::Complete, "queueing on complete init once");
         init_once.waiters.push_back(InitOnceWaiter { thread, callback });
-        this.block_thread(thread);
+        this.block_thread(thread, BlockReason::InitOnce(id));
     }
 
     /// Begin initializing this InitOnce. Must only be called after checking that it is currently
@@ -151,7 +152,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         assert_eq!(
             init_once.status,
             InitOnceStatus::Uninitialized,
-            "begining already begun or complete init once"
+            "beginning already begun or complete init once"
         );
         init_once.status = InitOnceStatus::Begun;
     }
@@ -173,7 +174,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         // Each complete happens-before the end of the wait
         if let Some(data_race) = &this.machine.data_race {
-            data_race.validate_lock_release(&mut init_once.data_race, current_thread, current_span);
+            init_once.clock.clone_from(&data_race.release_clock(current_thread, current_span));
         }
 
         // Wake up everyone.
@@ -199,7 +200,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         // Each complete happens-before the end of the wait
         if let Some(data_race) = &this.machine.data_race {
-            data_race.validate_lock_release(&mut init_once.data_race, current_thread, current_span);
+            init_once.clock.clone_from(&data_race.release_clock(current_thread, current_span));
         }
 
         // Wake up one waiting thread, so they can go ahead and try to init this.

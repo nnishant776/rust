@@ -103,7 +103,6 @@ pub(crate) fn convert_if_to_bool_then(acc: &mut Assists, ctx: &AssistContext<'_>
                 cond,
                 ast::Expr::BinExpr(_)
                     | ast::Expr::BlockExpr(_)
-                    | ast::Expr::BoxExpr(_)
                     | ast::Expr::BreakExpr(_)
                     | ast::Expr::CastExpr(_)
                     | ast::Expr::ClosureExpr(_)
@@ -160,13 +159,12 @@ pub(crate) fn convert_bool_then_to_if(acc: &mut Assists, ctx: &AssistContext<'_>
     };
     // Verify this is `bool::then` that is being called.
     let func = ctx.sema.resolve_method_call(&mcall)?;
-    if func.name(ctx.sema.db).to_string() != "then" {
+    if func.name(ctx.sema.db).display(ctx.db()).to_string() != "then" {
         return None;
     }
     let assoc = func.as_assoc_item(ctx.sema.db)?;
-    match assoc.container(ctx.sema.db) {
-        hir::AssocItemContainer::Impl(impl_) if impl_.self_ty(ctx.sema.db).is_bool() => {}
-        _ => return None,
+    if !assoc.implementing_ty(ctx.sema.db)?.is_bool() {
+        return None;
     }
 
     let target = mcall.syntax().text_range();

@@ -245,6 +245,30 @@ fn main() {
 }
 
 #[test]
+fn doctest_apply_demorgan_iterator() {
+    check_doc_test(
+        "apply_demorgan_iterator",
+        r#####"
+//- minicore: iterator
+fn main() {
+    let arr = [1, 2, 3];
+    if !arr.into_iter().$0any(|num| num == 4) {
+        println!("foo");
+    }
+}
+"#####,
+        r#####"
+fn main() {
+    let arr = [1, 2, 3];
+    if arr.into_iter().all(|num| num != 4) {
+        println!("foo");
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_auto_import() {
     check_doc_test(
         "auto_import",
@@ -261,6 +285,49 @@ fn main() {
     let map = HashMap::new();
 }
 pub mod std { pub mod collections { pub struct HashMap { } } }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_bind_unused_param() {
+    check_doc_test(
+        "bind_unused_param",
+        r#####"
+fn some_function(x: i32$0) {}
+"#####,
+        r#####"
+fn some_function(x: i32) {
+    let _ = x;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_bool_to_enum() {
+    check_doc_test(
+        "bool_to_enum",
+        r#####"
+fn main() {
+    let $0bool = true;
+
+    if bool {
+        println!("foo");
+    }
+}
+"#####,
+        r#####"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn main() {
+    let bool = Bool::True;
+
+    if bool == Bool::True {
+        println!("foo");
+    }
+}
 "#####,
     )
 }
@@ -318,6 +385,36 @@ fn main() {
     x.into_iter().for_each(|v| {
         let y = v * 2;
     });
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_from_to_tryfrom() {
+    check_doc_test(
+        "convert_from_to_tryfrom",
+        r#####"
+//- minicore: from
+impl $0From<usize> for Thing {
+    fn from(val: usize) -> Self {
+        Thing {
+            b: val.to_string(),
+            a: val
+        }
+    }
+}
+"#####,
+        r#####"
+impl TryFrom<usize> for Thing {
+    type Error = ${0:()};
+
+    fn try_from(val: usize) -> Result<Self, Self::Error> {
+        Ok(Thing {
+            b: val.to_string(),
+            a: val
+        })
+    }
 }
 "#####,
     )
@@ -439,7 +536,7 @@ fn doctest_convert_match_to_let_else() {
         r#####"
 //- minicore: option
 fn foo(opt: Option<()>) {
-    let val = $0match opt {
+    let val$0 = match opt {
         Some(it) => it,
         None => return,
     };
@@ -495,6 +592,31 @@ impl Point {
 }
 
 #[test]
+fn doctest_convert_nested_function_to_closure() {
+    check_doc_test(
+        "convert_nested_function_to_closure",
+        r#####"
+fn main() {
+    fn fo$0o(label: &str, number: u64) {
+        println!("{}: {}", label, number);
+    }
+
+    foo("Bar", 100);
+}
+"#####,
+        r#####"
+fn main() {
+    let foo = |label: &str, number: u64| {
+        println!("{}: {}", label, number);
+    };
+
+    foo("Bar", 100);
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_to_guarded_return() {
     check_doc_test(
         "convert_to_guarded_return",
@@ -513,6 +635,33 @@ fn main() {
     }
     foo();
     bar();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_tuple_return_type_to_struct() {
+    check_doc_test(
+        "convert_tuple_return_type_to_struct",
+        r#####"
+fn bar() {
+    let (a, b, c) = foo();
+}
+
+fn foo() -> ($0u32, u32, u32) {
+    (1, 2, 3)
+}
+"#####,
+        r#####"
+fn bar() {
+    let FooResult(a, b, c) = foo();
+}
+
+struct FooResult(u32, u32, u32);
+
+fn foo() -> FooResult {
+    FooResult(1, 2, 3)
 }
 "#####,
     )
@@ -604,6 +753,35 @@ fn main() {
 }
 
 #[test]
+fn doctest_destructure_struct_binding() {
+    check_doc_test(
+        "destructure_struct_binding",
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let $0foo = Foo { bar: 1, baz: 2 };
+    let bar2 = foo.bar;
+    let baz2 = &foo.baz;
+}
+"#####,
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let Foo { bar, baz } = Foo { bar: 1, baz: 2 };
+    let bar2 = bar;
+    let baz2 = &baz;
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_destructure_tuple_binding() {
     check_doc_test(
         "destructure_tuple_binding",
@@ -669,25 +847,12 @@ fn doctest_extract_expressions_from_format_string() {
     check_doc_test(
         "extract_expressions_from_format_string",
         r#####"
-macro_rules! format_args {
-    ($lit:literal $(tt:tt)*) => { 0 },
-}
-macro_rules! print {
-    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
-}
-
+//- minicore: fmt
 fn main() {
     print!("{var} {x + 1}$0");
 }
 "#####,
         r#####"
-macro_rules! format_args {
-    ($lit:literal $(tt:tt)*) => { 0 },
-}
-macro_rules! print {
-    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
-}
-
 fn main() {
     print!("{var} {}"$0, x + 1);
 }
@@ -798,6 +963,27 @@ fn main() {
 fn main() {
     let $0var_name = (1 + 2);
     var_name * 4;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_fill_record_pattern_fields() {
+    check_doc_test(
+        "fill_record_pattern_fields",
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { ..$0 } = bar;
+}
+"#####,
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { y, z  } = bar;
 }
 "#####,
     )
@@ -927,6 +1113,7 @@ fn doctest_generate_default_from_new() {
     check_doc_test(
         "generate_default_from_new",
         r#####"
+//- minicore: default
 struct Example { _inner: () }
 
 impl Example {
@@ -984,6 +1171,69 @@ struct Person {
 impl Person {
     $0fn age(&self) -> u8 {
         self.age.age()
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_delegate_trait() {
+    check_doc_test(
+        "generate_delegate_trait",
+        r#####"
+trait SomeTrait {
+    type T;
+    fn fn_(arg: u32) -> u32;
+    fn method_(&mut self) -> bool;
+}
+struct A;
+impl SomeTrait for A {
+    type T = u32;
+
+    fn fn_(arg: u32) -> u32 {
+        42
+    }
+
+    fn method_(&mut self) -> bool {
+        false
+    }
+}
+struct B {
+    a$0: A,
+}
+"#####,
+        r#####"
+trait SomeTrait {
+    type T;
+    fn fn_(arg: u32) -> u32;
+    fn method_(&mut self) -> bool;
+}
+struct A;
+impl SomeTrait for A {
+    type T = u32;
+
+    fn fn_(arg: u32) -> u32 {
+        42
+    }
+
+    fn method_(&mut self) -> bool {
+        false
+    }
+}
+struct B {
+    a: A,
+}
+
+impl SomeTrait for B {
+    type T = <A as SomeTrait>::T;
+
+    fn fn_(arg: u32) -> u32 {
+        <A as SomeTrait>::fn_(arg)
+    }
+
+    fn method_(&mut self) -> bool {
+        <A as SomeTrait>::method_(&mut self.a)
     }
 }
 "#####,
@@ -1259,10 +1509,17 @@ fn doctest_generate_getter() {
     check_doc_test(
         "generate_getter",
         r#####"
-//- minicore: as_ref
+//- minicore: as_ref, deref
 pub struct String;
 impl AsRef<str> for String {
     fn as_ref(&self) -> &str {
+        ""
+    }
+}
+
+impl core::ops::Deref for String {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
         ""
     }
 }
@@ -1279,13 +1536,20 @@ impl AsRef<str> for String {
     }
 }
 
+impl core::ops::Deref for String {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        ""
+    }
+}
+
 struct Person {
     name: String,
 }
 
 impl Person {
     fn $0name(&self) -> &str {
-        self.name.as_ref()
+        &self.name
     }
 }
 "#####,
@@ -1329,9 +1593,7 @@ struct Ctx<T: Clone> {
     data: T,
 }
 
-impl<T: Clone> Ctx<T> {
-    $0
-}
+impl<T: Clone> Ctx<T> {$0}
 "#####,
     )
 }
@@ -1369,6 +1631,42 @@ impl MyStruct {
 }
 
 #[test]
+fn doctest_generate_mut_trait_impl() {
+    check_doc_test(
+        "generate_mut_trait_impl",
+        r#####"
+//- minicore: index
+pub enum Axis { X = 0, Y = 1, Z = 2 }
+
+impl<T> core::ops::Index$0<Axis> for [T; 3] {
+    type Output = T;
+
+    fn index(&self, index: Axis) -> &Self::Output {
+        &self[index as usize]
+    }
+}
+"#####,
+        r#####"
+pub enum Axis { X = 0, Y = 1, Z = 2 }
+
+$0impl<T> core::ops::IndexMut<Axis> for [T; 3] {
+    fn index_mut(&mut self, index: Axis) -> &mut Self::Output {
+        &self[index as usize]
+    }
+}
+
+impl<T> core::ops::Index<Axis> for [T; 3] {
+    type Output = T;
+
+    fn index(&self, index: Axis) -> &Self::Output {
+        &self[index as usize]
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_generate_new() {
     check_doc_test(
         "generate_new",
@@ -1383,7 +1681,9 @@ struct Ctx<T: Clone> {
 }
 
 impl<T: Clone> Ctx<T> {
-    fn $0new(data: T) -> Self { Self { data } }
+    fn $0new(data: T) -> Self {
+        Self { data }
+    }
 }
 "#####,
     )
@@ -1404,9 +1704,65 @@ struct Person {
 }
 
 impl Person {
-    fn set_name(&mut self, name: String) {
+    fn $0set_name(&mut self, name: String) {
         self.name = name;
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_trait_from_impl() {
+    check_doc_test(
+        "generate_trait_from_impl",
+        r#####"
+struct Foo<const N: usize>([i32; N]);
+
+macro_rules! const_maker {
+    ($t:ty, $v:tt) => {
+        const CONST: $t = $v;
+    };
+}
+
+impl<const N: usize> Fo$0o<N> {
+    // Used as an associated constant.
+    const CONST_ASSOC: usize = N * 4;
+
+    fn create() -> Option<()> {
+        Some(())
+    }
+
+    const_maker! {i32, 7}
+}
+"#####,
+        r#####"
+struct Foo<const N: usize>([i32; N]);
+
+macro_rules! const_maker {
+    ($t:ty, $v:tt) => {
+        const CONST: $t = $v;
+    };
+}
+
+trait ${0:NewTrait}<const N: usize> {
+    // Used as an associated constant.
+    const CONST_ASSOC: usize = N * 4;
+
+    fn create() -> Option<()>;
+
+    const_maker! {i32, 7}
+}
+
+impl<const N: usize> ${0:NewTrait}<N> for Foo<N> {
+    // Used as an associated constant.
+    const CONST_ASSOC: usize = N * 4;
+
+    fn create() -> Option<()> {
+        Some(())
+    }
+
+    const_maker! {i32, 7}
 }
 "#####,
     )
@@ -1426,9 +1782,7 @@ struct Ctx<T: Clone> {
     data: T,
 }
 
-impl<T: Clone> $0 for Ctx<T> {
-
-}
+impl<T: Clone> ${0:_} for Ctx<T> {}
 "#####,
     )
 }
@@ -1455,6 +1809,27 @@ fn foo(name: Option<&str>) {
 }
 
 #[test]
+fn doctest_inline_const_as_literal() {
+    check_doc_test(
+        "inline_const_as_literal",
+        r#####"
+const STRING: &str = "Hello, World!";
+
+fn something() -> &'static str {
+    STRING$0
+}
+"#####,
+        r#####"
+const STRING: &str = "Hello, World!";
+
+fn something() -> &'static str {
+    "Hello, World!"
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_inline_into_callers() {
     check_doc_test(
         "inline_into_callers",
@@ -1475,13 +1850,13 @@ fn print(_: &str) {}
 
 fn bar() {
     {
-        let word = "안녕하세요";
+        let word: &str = "안녕하세요";
         if !word.is_empty() {
             print(word);
         }
     };
     {
-        let word = "여러분";
+        let word: &str = "여러분";
         if !word.is_empty() {
             print(word);
         }
@@ -1589,6 +1964,40 @@ fn foo() {
 }
 
 #[test]
+fn doctest_into_to_qualified_from() {
+    check_doc_test(
+        "into_to_qualified_from",
+        r#####"
+//- minicore: from
+struct B;
+impl From<i32> for B {
+    fn from(a: i32) -> Self {
+       B
+    }
+}
+
+fn main() -> () {
+    let a = 3;
+    let b: B = a.in$0to();
+}
+"#####,
+        r#####"
+struct B;
+impl From<i32> for B {
+    fn from(a: i32) -> Self {
+       B
+    }
+}
+
+fn main() -> () {
+    let a = 3;
+    let b: B = B::from(a);
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_introduce_named_generic() {
     check_doc_test(
         "introduce_named_generic",
@@ -1596,7 +2005,7 @@ fn doctest_introduce_named_generic() {
 fn foo(bar: $0impl Bar) {}
 "#####,
         r#####"
-fn foo<B: Bar>(bar: B) {}
+fn foo<$0B: Bar>(bar: B) {}
 "#####,
     )
 }
@@ -1729,6 +2138,23 @@ fn handle(action: Action) {
     match action {
         Action::Move(..) | Action::Stop => foo(),
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_merge_nested_if() {
+    check_doc_test(
+        "merge_nested_if",
+        r#####"
+fn main() {
+   i$0f x == 3 { if y == 4 { 1 } }
+}
+"#####,
+        r#####"
+fn main() {
+   if x == 3 && y == 4 { 1 }
 }
 "#####,
     )
@@ -1884,6 +2310,19 @@ fn t() {}
 }
 
 #[test]
+fn doctest_normalize_import() {
+    check_doc_test(
+        "normalize_import",
+        r#####"
+use$0 std::{io, {fmt::Formatter}};
+"#####,
+        r#####"
+use std::{fmt::Formatter, io};
+"#####,
+    )
+}
+
+#[test]
 fn doctest_promote_local_to_const() {
     check_doc_test(
         "promote_local_to_const",
@@ -2006,12 +2445,12 @@ fn doctest_remove_dbg() {
         "remove_dbg",
         r#####"
 fn main() {
-    $0dbg!(92);
+    let x = $0dbg!(42 * dbg!(4 + 2));$0
 }
 "#####,
         r#####"
 fn main() {
-    92;
+    let x = 42 * (4 + 2);
 }
 "#####,
     )
@@ -2069,6 +2508,24 @@ fn main() {
 }
 
 #[test]
+fn doctest_remove_unused_imports() {
+    check_doc_test(
+        "remove_unused_imports",
+        r#####"
+struct X();
+mod foo {
+    use super::X$0;
+}
+"#####,
+        r#####"
+struct X();
+mod foo {
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_remove_unused_param() {
     check_doc_test(
         "remove_unused_param",
@@ -2116,7 +2573,7 @@ trait Foo {
 }
 
 struct Bar;
-$0impl Foo for Bar {
+$0impl Foo for Bar$0 {
     const B: u8 = 17;
     fn c() {}
     type A = String;
@@ -2260,6 +2717,25 @@ fn handle(action: Action) {
 }
 
 #[test]
+fn doctest_replace_is_some_with_if_let_some() {
+    check_doc_test(
+        "replace_is_some_with_if_let_some",
+        r#####"
+fn main() {
+    let x = Some(1);
+    if x.is_som$0e() {}
+}
+"#####,
+        r#####"
+fn main() {
+    let x = Some(1);
+    if let Some(${0:x}) = x {}
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_replace_let_with_if_let() {
     check_doc_test(
         "replace_let_with_if_let",
@@ -2314,41 +2790,14 @@ fn handle(action: Action) {
 }
 
 #[test]
-fn doctest_replace_or_else_with_or() {
+fn doctest_replace_named_generic_with_impl() {
     check_doc_test(
-        "replace_or_else_with_or",
+        "replace_named_generic_with_impl",
         r#####"
-//- minicore:option
-fn foo() {
-    let a = Some(1);
-    a.unwra$0p_or_else(|| 2);
-}
+fn new<P$0: AsRef<Path>>(location: P) -> Self {}
 "#####,
         r#####"
-fn foo() {
-    let a = Some(1);
-    a.unwrap_or(2);
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_replace_or_with_or_else() {
-    check_doc_test(
-        "replace_or_with_or_else",
-        r#####"
-//- minicore:option
-fn foo() {
-    let a = Some(1);
-    a.unwra$0p_or(2);
-}
-"#####,
-        r#####"
-fn foo() {
-    let a = Some(1);
-    a.unwrap_or_else(|| 2);
-}
+fn new(location: impl AsRef<Path>) -> Self {}
 "#####,
     )
 }
@@ -2392,7 +2841,7 @@ fn doctest_replace_try_expr_with_match() {
     check_doc_test(
         "replace_try_expr_with_match",
         r#####"
-//- minicore:option
+//- minicore: try, option
 fn handle() {
     let pat = Some(true)$0?;
 }
@@ -2422,6 +2871,46 @@ fn main() {
 fn make<T>() -> T { ) }
 fn main() {
     let a: i32 = make();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_with_eager_method() {
+    check_doc_test(
+        "replace_with_eager_method",
+        r#####"
+//- minicore:option, fn
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or_else(|| 2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_with_lazy_method() {
+    check_doc_test(
+        "replace_with_lazy_method",
+        r#####"
+//- minicore:option, fn
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or(2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or_else(|| 2);
 }
 "#####,
     )
@@ -2617,6 +3106,8 @@ fn main() {
 mod std { pub mod ops { pub trait Add { fn add(self, _: Self) {} } impl Add for i32 {} } }
 "#####,
         r#####"
+use std::ops::Add;
+
 fn main() {
     1.add(2);
 }
@@ -2687,6 +3178,25 @@ fn foo() -> i32$0 { 42i32 }
 "#####,
         r#####"
 fn foo() -> Result<i32, ${0:_}> { Ok(42i32) }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_wrap_unwrap_cfg_attr() {
+    check_doc_test(
+        "wrap_unwrap_cfg_attr",
+        r#####"
+#[derive$0(Debug)]
+struct S {
+   field: i32
+}
+"#####,
+        r#####"
+#[cfg_attr($0, derive(Debug))]
+struct S {
+   field: i32
+}
 "#####,
     )
 }

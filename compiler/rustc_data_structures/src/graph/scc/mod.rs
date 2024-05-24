@@ -7,9 +7,10 @@
 
 use crate::fx::FxHashSet;
 use crate::graph::vec_graph::VecGraph;
-use crate::graph::{DirectedGraph, GraphSuccessors, WithNumEdges, WithNumNodes, WithSuccessors};
-use rustc_index::vec::{Idx, IndexVec};
+use crate::graph::{DirectedGraph, NumEdges, Successors};
+use rustc_index::{Idx, IndexSlice, IndexVec};
 use std::ops::Range;
+use tracing::{debug, instrument};
 
 #[cfg(test)]
 mod tests;
@@ -39,11 +40,11 @@ pub struct SccData<S: Idx> {
 }
 
 impl<N: Idx, S: Idx + Ord> Sccs<N, S> {
-    pub fn new(graph: &(impl DirectedGraph<Node = N> + WithNumNodes + WithSuccessors)) -> Self {
+    pub fn new(graph: &(impl DirectedGraph<Node = N> + Successors)) -> Self {
         SccsConstruction::construct(graph)
     }
 
-    pub fn scc_indices(&self) -> &IndexVec<N, S> {
+    pub fn scc_indices(&self) -> &IndexSlice<N, S> {
         &self.scc_indices
     }
 
@@ -89,30 +90,22 @@ impl<N: Idx, S: Idx + Ord> Sccs<N, S> {
     }
 }
 
-impl<N: Idx, S: Idx> DirectedGraph for Sccs<N, S> {
+impl<N: Idx, S: Idx + Ord> DirectedGraph for Sccs<N, S> {
     type Node = S;
-}
 
-impl<N: Idx, S: Idx + Ord> WithNumNodes for Sccs<N, S> {
     fn num_nodes(&self) -> usize {
         self.num_sccs()
     }
 }
 
-impl<N: Idx, S: Idx> WithNumEdges for Sccs<N, S> {
+impl<N: Idx, S: Idx + Ord> NumEdges for Sccs<N, S> {
     fn num_edges(&self) -> usize {
         self.scc_data.all_successors.len()
     }
 }
 
-impl<'graph, N: Idx, S: Idx> GraphSuccessors<'graph> for Sccs<N, S> {
-    type Item = S;
-
-    type Iter = std::iter::Cloned<std::slice::Iter<'graph, S>>;
-}
-
-impl<N: Idx, S: Idx + Ord> WithSuccessors for Sccs<N, S> {
-    fn successors(&self, node: S) -> <Self as GraphSuccessors<'_>>::Iter {
+impl<N: Idx, S: Idx + Ord> Successors for Sccs<N, S> {
+    fn successors(&self, node: S) -> impl Iterator<Item = Self::Node> {
         self.successors(node).iter().cloned()
     }
 }
@@ -123,7 +116,7 @@ impl<S: Idx> SccData<S> {
         self.ranges.len()
     }
 
-    pub fn ranges(&self) -> &IndexVec<S, Range<usize>> {
+    pub fn ranges(&self) -> &IndexSlice<S, Range<usize>> {
         &self.ranges
     }
 
@@ -158,7 +151,7 @@ impl<S: Idx> SccData<S> {
     }
 }
 
-struct SccsConstruction<'c, G: DirectedGraph + WithNumNodes + WithSuccessors, S: Idx> {
+struct SccsConstruction<'c, G: DirectedGraph + Successors, S: Idx> {
     graph: &'c G,
 
     /// The state of each node; used during walk to record the stack
@@ -218,7 +211,7 @@ enum WalkReturn<S> {
 
 impl<'c, G, S> SccsConstruction<'c, G, S>
 where
-    G: DirectedGraph + WithNumNodes + WithSuccessors,
+    G: DirectedGraph + Successors,
     S: Idx,
 {
     /// Identifies SCCs in the graph `G` and computes the resulting
@@ -492,7 +485,7 @@ where
             let returned_walk =
                 return_value.take().into_iter().map(|walk| (*successor_node, Some(walk)));
 
-            let successor_walk = successors.by_ref().map(|successor_node| {
+            let successor_walk = successors.map(|successor_node| {
                 debug!(?node, ?successor_node);
                 (successor_node, self.inspect_node(successor_node))
             });

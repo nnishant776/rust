@@ -1,13 +1,13 @@
-// check-pass
+//@ check-pass
 
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+#![feature(lint_reasons)]
 
-trait Foo {
+pub trait Foo {
     fn f() -> Box<impl Sized>;
 }
 
 impl Foo for () {
+    #[expect(refining_impl_trait)]
     fn f() -> Box<String> {
         Box::new(String::new())
     }

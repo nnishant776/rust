@@ -1,3 +1,4 @@
+use core::num::NonZero;
 use std::assert_matches::assert_matches;
 use std::collections::TryReserveErrorKind::*;
 use std::collections::{vec_deque::Drain, VecDeque};
@@ -426,6 +427,28 @@ fn test_into_iter() {
         assert_eq!(it.next(), Some(7));
         assert_eq!(it.size_hint(), (5, Some(5)));
     }
+
+    // advance_by
+    {
+        let mut d = VecDeque::new();
+        for i in 0..=4 {
+            d.push_back(i);
+        }
+        for i in 6..=8 {
+            d.push_front(i);
+        }
+
+        let mut it = d.into_iter();
+        assert_eq!(it.advance_by(1), Ok(()));
+        assert_eq!(it.next(), Some(7));
+        assert_eq!(it.advance_back_by(1), Ok(()));
+        assert_eq!(it.next_back(), Some(3));
+
+        let mut it = VecDeque::from(vec![1, 2, 3, 4, 5]).into_iter();
+        assert_eq!(it.advance_by(10), Err(NonZero::new(5).unwrap()));
+        let mut it = VecDeque::from(vec![1, 2, 3, 4, 5]).into_iter();
+        assert_eq!(it.advance_back_by(10), Err(NonZero::new(5).unwrap()));
+    }
 }
 
 #[test]
@@ -724,6 +747,7 @@ fn test_drop_clear() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_drop_panic() {
     static mut DROPS: i32 = 0;
 
@@ -1046,6 +1070,20 @@ fn test_append_double_drop() {
 }
 
 #[test]
+#[should_panic]
+fn test_append_zst_capacity_overflow() {
+    let mut v = Vec::with_capacity(usize::MAX);
+    // note: using resize instead of set_len here would
+    //       be *extremely* slow in unoptimized builds.
+    // SAFETY: `v` has capacity `usize::MAX`, and no initialization
+    //         is needed for empty tuples.
+    unsafe { v.set_len(usize::MAX) };
+    let mut v = VecDeque::from(v);
+    let mut w = vec![()].into();
+    v.append(&mut w);
+}
+
+#[test]
 fn test_retain() {
     let mut buf = VecDeque::new();
     buf.extend(1..5);
@@ -1142,6 +1180,17 @@ fn test_reserve_exact_2() {
 
     v.reserve_exact(16);
     assert!(v.capacity() >= 33)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
+#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
+fn test_try_with_capacity() {
+    let vec: VecDeque<u32> = VecDeque::try_with_capacity(5).unwrap();
+    assert_eq!(0, vec.len());
+    assert!(vec.capacity() >= 5 && vec.capacity() <= isize::MAX as usize / 4);
+
+    assert!(VecDeque::<u16>::try_with_capacity(isize::MAX as usize + 1).is_err());
 }
 
 #[test]
@@ -1564,6 +1613,7 @@ fn test_try_rfold_moves_iter() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn truncate_leak() {
     static mut DROPS: i32 = 0;
 
@@ -1597,6 +1647,7 @@ fn truncate_leak() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_drain_leak() {
     static mut DROPS: i32 = 0;
 

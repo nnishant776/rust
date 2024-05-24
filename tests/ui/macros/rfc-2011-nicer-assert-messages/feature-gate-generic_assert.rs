@@ -1,8 +1,8 @@
-// compile-flags: --test
+//@ compile-flags: --test
 // ignore-tidy-linelength
-// run-pass
+//@ run-pass
 
-#![feature(core_intrinsics, generic_assert, generic_assert_internals)]
+#![feature(core_intrinsics, generic_assert)]
 
 use std::fmt::{Debug, Formatter};
 

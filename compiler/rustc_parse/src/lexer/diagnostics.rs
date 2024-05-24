@@ -1,14 +1,14 @@
-use super::UnmatchedBrace;
+use super::UnmatchedDelim;
 use rustc_ast::token::Delimiter;
-use rustc_errors::Diagnostic;
+use rustc_errors::Diag;
 use rustc_span::source_map::SourceMap;
 use rustc_span::Span;
 
 #[derive(Default)]
-pub struct TokenTreeDiagInfo {
+pub(super) struct TokenTreeDiagInfo {
     /// Stack of open delimiters and their spans. Used for error message.
     pub open_braces: Vec<(Delimiter, Span)>,
-    pub unmatched_braces: Vec<UnmatchedBrace>,
+    pub unmatched_delims: Vec<UnmatchedDelim>,
 
     /// Used only for error recovery when arriving to EOF with mismatched braces.
     pub last_unclosed_found_span: Option<Span>,
@@ -21,7 +21,7 @@ pub struct TokenTreeDiagInfo {
     pub matching_block_spans: Vec<(Span, Span)>,
 }
 
-pub fn same_identation_level(sm: &SourceMap, open_sp: Span, close_sp: Span) -> bool {
+pub(super) fn same_indentation_level(sm: &SourceMap, open_sp: Span, close_sp: Span) -> bool {
     match (sm.span_to_margin(open_sp), sm.span_to_margin(close_sp)) {
         (Some(open_padding), Some(close_padding)) => open_padding == close_padding,
         _ => false,
@@ -30,12 +30,9 @@ pub fn same_identation_level(sm: &SourceMap, open_sp: Span, close_sp: Span) -> b
 
 // When we get a `)` or `]` for `{`, we should emit help message here
 // it's more friendly compared to report `unmatched error` in later phase
-pub fn report_missing_open_delim(
-    err: &mut Diagnostic,
-    unmatched_braces: &[UnmatchedBrace],
-) -> bool {
+fn report_missing_open_delim(err: &mut Diag<'_>, unmatched_delims: &[UnmatchedDelim]) -> bool {
     let mut reported_missing_open = false;
-    for unmatch_brace in unmatched_braces.iter() {
+    for unmatch_brace in unmatched_delims.iter() {
         if let Some(delim) = unmatch_brace.found_delim
             && matches!(delim, Delimiter::Parenthesis | Delimiter::Bracket)
         {
@@ -46,7 +43,7 @@ pub fn report_missing_open_delim(
             };
             err.span_label(
                 unmatch_brace.found_span.shrink_to_lo(),
-                format!("missing open `{}` for this delimiter", missed_open),
+                format!("missing open `{missed_open}` for this delimiter"),
             );
             reported_missing_open = true;
         }
@@ -54,26 +51,26 @@ pub fn report_missing_open_delim(
     reported_missing_open
 }
 
-pub fn report_suspicious_mismatch_block(
-    err: &mut Diagnostic,
+pub(super) fn report_suspicious_mismatch_block(
+    err: &mut Diag<'_>,
     diag_info: &TokenTreeDiagInfo,
     sm: &SourceMap,
     delim: Delimiter,
 ) {
-    if report_missing_open_delim(err, &diag_info.unmatched_braces) {
+    if report_missing_open_delim(err, &diag_info.unmatched_delims) {
         return;
     }
 
     let mut matched_spans: Vec<(Span, bool)> = diag_info
         .matching_block_spans
         .iter()
-        .map(|&(open, close)| (open.with_hi(close.lo()), same_identation_level(sm, open, close)))
+        .map(|&(open, close)| (open.with_hi(close.lo()), same_indentation_level(sm, open, close)))
         .collect();
 
     // sort by `lo`, so the large block spans in the front
-    matched_spans.sort_by(|a, b| a.0.lo().cmp(&b.0.lo()));
+    matched_spans.sort_by_key(|(span, _)| span.lo());
 
-    // We use larger block whose identation is well to cover those inner mismatched blocks
+    // We use larger block whose indentation is well to cover those inner mismatched blocks
     // O(N^2) here, but we are on error reporting path, so it is fine
     for i in 0..matched_spans.len() {
         let (block_span, same_ident) = matched_spans[i];
@@ -111,9 +108,10 @@ pub fn report_suspicious_mismatch_block(
         // If there is no suspicious span, give the last properly closed block may help
         if let Some(parent) = diag_info.matching_block_spans.last()
             && diag_info.open_braces.last().is_none()
-            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1)) {
-                err.span_label(parent.0, "this opening brace...");
-                err.span_label(parent.1, "...matches this closing brace");
+            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1))
+        {
+            err.span_label(parent.0, "this opening brace...");
+            err.span_label(parent.1, "...matches this closing brace");
         }
     }
 }

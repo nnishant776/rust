@@ -6,12 +6,12 @@ use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ErrorKind {
     Help,
     Error,
@@ -72,9 +72,9 @@ enum WhichLine {
 /// and also //~^ ERROR message one for the preceding line, and
 ///          //~| ERROR message two for that same line.
 ///
-/// If cfg is not None (i.e., in an incremental test), then we look
-/// for `//[X]~` instead, where `X` is the current `cfg`.
-pub fn load_errors(testfile: &Path, cfg: Option<&str>) -> Vec<Error> {
+/// If revision is not None, then we look
+/// for `//[X]~` instead, where `X` is the current revision.
+pub fn load_errors(testfile: &Path, revision: Option<&str>) -> Vec<Error> {
     let rdr = BufReader::new(File::open(testfile).unwrap());
 
     // `last_nonfollow_error` tracks the most recently seen
@@ -90,7 +90,7 @@ pub fn load_errors(testfile: &Path, cfg: Option<&str>) -> Vec<Error> {
     rdr.lines()
         .enumerate()
         .filter_map(|(line_num, line)| {
-            parse_expected(last_nonfollow_error, line_num + 1, &line.unwrap(), cfg).map(
+            parse_expected(last_nonfollow_error, line_num + 1, &line.unwrap(), revision).map(
                 |(which, error)| {
                     match which {
                         FollowPrevious(_) => {}
@@ -108,24 +108,28 @@ fn parse_expected(
     last_nonfollow_error: Option<usize>,
     line_num: usize,
     line: &str,
-    cfg: Option<&str>,
+    test_revision: Option<&str>,
 ) -> Option<(WhichLine, Error)> {
     // Matches comments like:
     //     //~
     //     //~|
     //     //~^
     //     //~^^^^^
-    //     //[cfg1]~
-    //     //[cfg1,cfg2]~^^
-    static RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"//(?:\[(?P<cfgs>[\w,]+)])?~(?P<adjust>\||\^*)").unwrap());
+    //     //[rev1]~
+    //     //[rev1,rev2]~^^
+    static RE: OnceLock<Regex> = OnceLock::new();
 
-    let captures = RE.captures(line)?;
+    let captures = RE
+        .get_or_init(|| Regex::new(r"//(?:\[(?P<revs>[\w\-,]+)])?~(?P<adjust>\||\^*)").unwrap())
+        .captures(line)?;
 
-    match (cfg, captures.name("cfgs")) {
-        // Only error messages that contain our `cfg` between the square brackets apply to us.
-        (Some(cfg), Some(filter)) if !filter.as_str().split(',').any(|s| s == cfg) => return None,
-        (Some(_), Some(_)) => {}
+    match (test_revision, captures.name("revs")) {
+        // Only error messages that contain our revision between the square brackets apply to us.
+        (Some(test_revision), Some(revision_filters)) => {
+            if !revision_filters.as_str().split(',').any(|r| r == test_revision) {
+                return None;
+            }
+        }
 
         (None, Some(_)) => panic!("Only tests with revisions should use `//[X]~`"),
 
@@ -175,3 +179,6 @@ fn parse_expected(
     );
     Some((which, Error { line_num, kind, msg }))
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,7 +1,6 @@
-// run-pass
-// ignore-pretty pretty-printing is unhygienic
+//@ run-pass
 
-// aux-build:xcrate.rs
+//@ aux-build:xcrate.rs
 
 #![feature(decl_macro)]
 

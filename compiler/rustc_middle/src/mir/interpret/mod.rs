@@ -1,96 +1,9 @@
 //! An interpreter for MIR used in CTFE and by miri.
 
-#[macro_export]
-macro_rules! err_unsup {
-    ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::Unsupported(
-            $crate::mir::interpret::UnsupportedOpInfo::$($tt)*
-        )
-    };
-}
-
-#[macro_export]
-macro_rules! err_unsup_format {
-    ($($tt:tt)*) => { err_unsup!(Unsupported(format!($($tt)*))) };
-}
-
-#[macro_export]
-macro_rules! err_inval {
-    ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::InvalidProgram(
-            $crate::mir::interpret::InvalidProgramInfo::$($tt)*
-        )
-    };
-}
-
-#[macro_export]
-macro_rules! err_ub {
-    ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::UndefinedBehavior(
-            $crate::mir::interpret::UndefinedBehaviorInfo::$($tt)*
-        )
-    };
-}
-
-#[macro_export]
-macro_rules! err_ub_format {
-    ($($tt:tt)*) => { err_ub!(Ub(format!($($tt)*))) };
-}
-
-#[macro_export]
-macro_rules! err_exhaust {
-    ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::ResourceExhaustion(
-            $crate::mir::interpret::ResourceExhaustionInfo::$($tt)*
-        )
-    };
-}
-
-#[macro_export]
-macro_rules! err_machine_stop {
-    ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::MachineStop(Box::new($($tt)*))
-    };
-}
-
-// In the `throw_*` macros, avoid `return` to make them work with `try {}`.
-#[macro_export]
-macro_rules! throw_unsup {
-    ($($tt:tt)*) => { do yeet err_unsup!($($tt)*) };
-}
-
-#[macro_export]
-macro_rules! throw_unsup_format {
-    ($($tt:tt)*) => { throw_unsup!(Unsupported(format!($($tt)*))) };
-}
-
-#[macro_export]
-macro_rules! throw_inval {
-    ($($tt:tt)*) => { do yeet err_inval!($($tt)*) };
-}
-
-#[macro_export]
-macro_rules! throw_ub {
-    ($($tt:tt)*) => { do yeet err_ub!($($tt)*) };
-}
-
-#[macro_export]
-macro_rules! throw_ub_format {
-    ($($tt:tt)*) => { throw_ub!(Ub(format!($($tt)*))) };
-}
-
-#[macro_export]
-macro_rules! throw_exhaust {
-    ($($tt:tt)*) => { do yeet err_exhaust!($($tt)*) };
-}
-
-#[macro_export]
-macro_rules! throw_machine_stop {
-    ($($tt:tt)*) => { do yeet err_machine_stop!($($tt)*) };
-}
+#[macro_use]
+mod error;
 
 mod allocation;
-mod error;
 mod pointer;
 mod queries;
 mod value;
@@ -98,46 +11,56 @@ mod value;
 use std::fmt;
 use std::io;
 use std::io::{Read, Write};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use smallvec::{smallvec, SmallVec};
+use tracing::{debug, trace};
 
 use rustc_ast::LitKind;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::{HashMapExt, Lock};
-use rustc_data_structures::tiny_list::TinyList;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::def_id::DefId;
-use rustc_macros::HashStable;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_serialize::{Decodable, Encodable};
 use rustc_target::abi::{AddressSpace, Endian, HasDataLayout};
 
 use crate::mir;
 use crate::ty::codec::{TyDecoder, TyEncoder};
-use crate::ty::subst::GenericArgKind;
+use crate::ty::GenericArgKind;
 use crate::ty::{self, Instance, Ty, TyCtxt};
 
 pub use self::error::{
-    struct_error, CheckInAllocMsg, ErrorHandled, EvalToAllocationRawResult, EvalToConstValueResult,
-    EvalToValTreeResult, InterpError, InterpErrorInfo, InterpResult, InvalidProgramInfo,
-    MachineStopType, ResourceExhaustionInfo, ScalarSizeMismatch, UndefinedBehaviorInfo,
-    UninitBytesAccess, UnsupportedOpInfo,
+    BadBytesAccess, CheckAlignMsg, CheckInAllocMsg, ErrorHandled, EvalStaticInitializerRawResult,
+    EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, ExpectedKind,
+    InterpError, InterpErrorInfo, InterpResult, InvalidMetaKind, InvalidProgramInfo,
+    MachineStopType, Misalignment, PointerKind, ReportedErrorInfo, ResourceExhaustionInfo,
+    ScalarSizeMismatch, UndefinedBehaviorInfo, UnsupportedOpInfo, ValidationErrorInfo,
+    ValidationErrorKind,
+};
+// Also make the error macros available from this module.
+pub use {
+    err_exhaust, err_inval, err_machine_stop, err_ub, err_ub_custom, err_ub_format, err_unsup,
+    err_unsup_format, throw_exhaust, throw_inval, throw_machine_stop, throw_ub, throw_ub_custom,
+    throw_ub_format, throw_unsup, throw_unsup_format,
 };
 
-pub use self::value::{get_slice_bytes, ConstAlloc, ConstValue, Scalar};
+pub use self::value::Scalar;
 
 pub use self::allocation::{
-    alloc_range, AllocError, AllocRange, AllocResult, Allocation, ConstAllocation, InitChunk,
-    InitChunkIter,
+    alloc_range, AllocBytes, AllocError, AllocRange, AllocResult, Allocation, ConstAllocation,
+    InitChunk, InitChunkIter,
 };
 
-pub use self::pointer::{Pointer, PointerArithmetic, Provenance};
+pub use self::pointer::{CtfeProvenance, Pointer, PointerArithmetic, Provenance};
 
 /// Uniquely identifies one of the following:
 /// - A constant
 /// - A static
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable, Lift, TypeFoldable, TypeVisitable)]
+#[derive(HashStable, TypeFoldable, TypeVisitable)]
 pub struct GlobalId<'tcx> {
     /// For a constant or static, the `Instance` of the item itself.
     /// For a promoted global, the `Instance` of the function they belong to.
@@ -151,7 +74,7 @@ impl<'tcx> GlobalId<'tcx> {
     pub fn display(self, tcx: TyCtxt<'tcx>) -> String {
         let instance_name = with_no_trimmed_paths!(tcx.def_path_str(self.instance.def.def_id()));
         if let Some(promoted) = self.promoted {
-            format!("{}::{:?}", instance_name, promoted)
+            format!("{instance_name}::{promoted:?}")
         } else {
             instance_name
         }
@@ -173,14 +96,14 @@ pub struct LitToConstInput<'tcx> {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, HashStable)]
 pub enum LitToConstError {
     /// The literal's inferred type did not match the expected `ty` in the input.
-    /// This is used for graceful error handling (`delay_span_bug`) in
+    /// This is used for graceful error handling (`span_delayed_bug`) in
     /// type checking (`Const::from_anon_const`).
     TypeError,
     Reported(ErrorGuaranteed),
 }
 
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AllocId(pub NonZeroU64);
+pub struct AllocId(pub NonZero<u64>);
 
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
 // all the Miri types.
@@ -227,19 +150,21 @@ pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<I = TyCtxt<'tcx>>>(
             // References to statics doesn't need to know about their allocations,
             // just about its `DefId`.
             AllocDiscriminant::Static.encode(encoder);
-            did.encode(encoder);
+            // Cannot use `did.encode(encoder)` because of a bug around
+            // specializations and method calls.
+            Encodable::<E>::encode(&did, encoder);
         }
     }
 }
 
 // Used to avoid infinite recursion when decoding cyclic allocations.
-type DecodingSessionId = NonZeroU32;
+type DecodingSessionId = NonZero<u32>;
 
 #[derive(Clone)]
 enum State {
     Empty,
-    InProgressNonAlloc(TinyList<DecodingSessionId>),
-    InProgress(TinyList<DecodingSessionId>, AllocId),
+    InProgressNonAlloc(SmallVec<[DecodingSessionId; 1]>),
+    InProgress(SmallVec<[DecodingSessionId; 1]>, AllocId),
     Done(AllocId),
 }
 
@@ -247,7 +172,7 @@ pub struct AllocDecodingState {
     // For each `AllocId`, we keep track of which decoding state it's currently in.
     decoding_state: Vec<Lock<State>>,
     // The offsets of each allocation in the data stream.
-    data_offsets: Vec<u32>,
+    data_offsets: Vec<u64>,
 }
 
 impl AllocDecodingState {
@@ -262,8 +187,9 @@ impl AllocDecodingState {
         AllocDecodingSession { state: self, session_id }
     }
 
-    pub fn new(data_offsets: Vec<u32>) -> Self {
-        let decoding_state = vec![Lock::new(State::Empty); data_offsets.len()];
+    pub fn new(data_offsets: Vec<u64>) -> Self {
+        let decoding_state =
+            std::iter::repeat_with(|| Lock::new(State::Empty)).take(data_offsets.len()).collect();
 
         Self { decoding_state, data_offsets }
     }
@@ -308,8 +234,7 @@ impl<'s> AllocDecodingSession<'s> {
                             // If this is an allocation, we need to reserve an
                             // `AllocId` so we can decode cyclic graphs.
                             let alloc_id = decoder.interner().reserve_alloc_id();
-                            *entry =
-                                State::InProgress(TinyList::new_single(self.session_id), alloc_id);
+                            *entry = State::InProgress(smallvec![self.session_id], alloc_id);
                             Some(alloc_id)
                         }
                         AllocDiscriminant::Fn
@@ -317,8 +242,7 @@ impl<'s> AllocDecodingSession<'s> {
                         | AllocDiscriminant::VTable => {
                             // Fns and statics cannot be cyclic, and their `AllocId`
                             // is determined later by interning.
-                            *entry =
-                                State::InProgressNonAlloc(TinyList::new_single(self.session_id));
+                            *entry = State::InProgressNonAlloc(smallvec![self.session_id]);
                             None
                         }
                     }
@@ -328,7 +252,7 @@ impl<'s> AllocDecodingSession<'s> {
                         bug!("this should be unreachable");
                     } else {
                         // Start decoding concurrently.
-                        sessions.insert(self.session_id);
+                        sessions.push(self.session_id);
                         None
                     }
                 }
@@ -338,7 +262,7 @@ impl<'s> AllocDecodingSession<'s> {
                         return alloc_id;
                     } else {
                         // Start decoding concurrently.
-                        sessions.insert(self.session_id);
+                        sessions.push(self.session_id);
                         Some(alloc_id)
                     }
                 }
@@ -361,7 +285,7 @@ impl<'s> AllocDecodingSession<'s> {
                     trace!("creating fn alloc ID");
                     let instance = ty::Instance::decode(decoder);
                     trace!("decoded fn alloc instance: {:?}", instance);
-                    let alloc_id = decoder.interner().create_fn_alloc(instance);
+                    let alloc_id = decoder.interner().reserve_and_set_fn_alloc(instance);
                     alloc_id
                 }
                 AllocDiscriminant::VTable => {
@@ -371,7 +295,8 @@ impl<'s> AllocDecodingSession<'s> {
                     let poly_trait_ref =
                         <Option<ty::PolyExistentialTraitRef<'_>> as Decodable<D>>::decode(decoder);
                     trace!("decoded vtable alloc instance: {ty:?}, {poly_trait_ref:?}");
-                    let alloc_id = decoder.interner().create_vtable_alloc(ty, poly_trait_ref);
+                    let alloc_id =
+                        decoder.interner().reserve_and_set_vtable_alloc(ty, poly_trait_ref);
                     alloc_id
                 }
                 AllocDiscriminant::Static => {
@@ -379,7 +304,7 @@ impl<'s> AllocDecodingSession<'s> {
                     trace!("creating extern static alloc ID");
                     let did = <DefId as Decodable<D>>::decode(decoder);
                     trace!("decoded static def-ID: {:?}", did);
-                    let alloc_id = decoder.interner().create_static_alloc(did);
+                    let alloc_id = decoder.interner().reserve_and_set_static_alloc(did);
                     alloc_id
                 }
             }
@@ -471,7 +396,7 @@ impl<'tcx> AllocMap<'tcx> {
         AllocMap {
             alloc_map: Default::default(),
             dedup: Default::default(),
-            next_id: AllocId(NonZeroU64::new(1).unwrap()),
+            next_id: AllocId(NonZero::new(1).unwrap()),
         }
     }
     fn reserve(&mut self) -> AllocId {
@@ -516,13 +441,13 @@ impl<'tcx> TyCtxt<'tcx> {
 
     /// Generates an `AllocId` for a static or return a cached one in case this function has been
     /// called on the same static before.
-    pub fn create_static_alloc(self, static_id: DefId) -> AllocId {
+    pub fn reserve_and_set_static_alloc(self, static_id: DefId) -> AllocId {
         self.reserve_and_set_dedup(GlobalAlloc::Static(static_id))
     }
 
     /// Generates an `AllocId` for a function. Depending on the function type,
     /// this might get deduplicated or assigned a new ID each time.
-    pub fn create_fn_alloc(self, instance: Instance<'tcx>) -> AllocId {
+    pub fn reserve_and_set_fn_alloc(self, instance: Instance<'tcx>) -> AllocId {
         // Functions cannot be identified by pointers, as asm-equal functions can get deduplicated
         // by the linker (we set the "unnamed_addr" attribute for LLVM) and functions can be
         // duplicated across crates.
@@ -531,7 +456,7 @@ impl<'tcx> TyCtxt<'tcx> {
         // However, formatting code relies on function identity (see #58320), so we only do
         // this for generic functions. Lifetime parameters are ignored.
         let is_generic = instance
-            .substs
+            .args
             .into_iter()
             .any(|kind| !matches!(kind.unpack(), GenericArgKind::Lifetime(_)));
         if is_generic {
@@ -547,7 +472,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Generates an `AllocId` for a (symbolic, not-reified) vtable. Will get deduplicated.
-    pub fn create_vtable_alloc(
+    pub fn reserve_and_set_vtable_alloc(
         self,
         ty: Ty<'tcx>,
         poly_trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
@@ -560,7 +485,7 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Statics with identical content will still point to the same `Allocation`, i.e.,
     /// their data will be deduplicated through `Allocation` interning -- but they
     /// are different places in memory and as such need different IDs.
-    pub fn create_memory_alloc(self, mem: ConstAllocation<'tcx>) -> AllocId {
+    pub fn reserve_and_set_memory_alloc(self, mem: ConstAllocation<'tcx>) -> AllocId {
         let id = self.reserve_alloc_id();
         self.set_alloc_id_memory(id, mem);
         id
@@ -581,7 +506,7 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Panics in case the `AllocId` is dangling. Since that is impossible for `AllocId`s in
     /// constants (as all constants must pass interning and validation that check for dangling
     /// ids), this function is frequently used throughout rustc, but should not be used within
-    /// the miri engine.
+    /// the interpreter.
     pub fn global_alloc(self, id: AllocId) -> GlobalAlloc<'tcx> {
         match self.try_get_global_alloc(id) {
             Some(alloc) => alloc,
@@ -593,6 +518,16 @@ impl<'tcx> TyCtxt<'tcx> {
     /// call this function twice, even with the same `Allocation` will ICE the compiler.
     pub fn set_alloc_id_memory(self, id: AllocId, mem: ConstAllocation<'tcx>) {
         if let Some(old) = self.alloc_map.lock().alloc_map.insert(id, GlobalAlloc::Memory(mem)) {
+            bug!("tried to set allocation ID {id:?}, but it was already existing as {old:#?}");
+        }
+    }
+
+    /// Freezes an `AllocId` created with `reserve` by pointing it at a static item. Trying to
+    /// call this function twice, even with the same `DefId` will ICE the compiler.
+    pub fn set_nested_alloc_id_static(self, id: AllocId, def_id: LocalDefId) {
+        if let Some(old) =
+            self.alloc_map.lock().alloc_map.insert(id, GlobalAlloc::Static(def_id.to_def_id()))
+        {
             bug!("tried to set allocation ID {id:?}, but it was already existing as {old:#?}");
         }
     }
@@ -631,11 +566,11 @@ pub fn read_target_uint(endianness: Endian, mut source: &[u8]) -> Result<u128, i
     // So we do not read exactly 16 bytes into the u128, just the "payload".
     let uint = match endianness {
         Endian::Little => {
-            source.read(&mut buf)?;
+            source.read_exact(&mut buf[..source.len()])?;
             Ok(u128::from_le_bytes(buf))
         }
         Endian::Big => {
-            source.read(&mut buf[16 - source.len()..])?;
+            source.read_exact(&mut buf[16 - source.len()..])?;
             Ok(u128::from_be_bytes(buf))
         }
     };

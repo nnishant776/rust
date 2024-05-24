@@ -1,8 +1,8 @@
-// run-rustfix
 #![warn(clippy::borrow_as_ptr)]
 #![feature(lang_items, start, libc)]
 #![no_std]
 
+#[clippy::msrv = "1.75"]
 #[start]
 fn main(_argc: isize, _argv: *const *const u8) -> isize {
     let val = 1;

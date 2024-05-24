@@ -1,16 +1,18 @@
-// check-pass
+//@ check-pass
 
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+#![feature(lint_reasons)]
 
-struct Wrapper<T>(T);
+pub struct Wrapper<T>(T);
 
-trait Foo {
+pub trait Foo {
     fn bar() -> Wrapper<impl Sized>;
 }
 
 impl Foo for () {
-    fn bar() -> Wrapper<i32> { Wrapper(0) }
+    #[expect(refining_impl_trait)]
+    fn bar() -> Wrapper<i32> {
+        Wrapper(0)
+    }
 }
 
 fn main() {}

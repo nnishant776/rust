@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 // ignore-tidy-cr
 // ignore-tidy-cr (repeated again because of tidy bug)
 // license is ignored because tidy can't handle the CRLF here properly.
@@ -6,7 +6,6 @@
 // N.B., this file needs CRLF line endings. The .gitattributes file in
 // this directory should enforce it.
 
-// ignore-pretty issue #37195
 
 /// Doc comment that ends in CRLF
 pub fn foo() {}

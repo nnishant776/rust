@@ -2,7 +2,7 @@
 //!
 //! See `rustc_codegen_ssa/src/meth.rs` for reference.
 
-use crate::constant::data_id_for_alloc_id;
+use crate::constant::data_id_for_vtable;
 use crate::prelude::*;
 
 pub(crate) fn vtable_memflags() -> MemFlags {
@@ -43,17 +43,27 @@ pub(crate) fn min_align_of_obj(fx: &mut FunctionCx<'_, '_, '_>, vtable: Value) -
 
 pub(crate) fn get_ptr_and_method_ref<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
-    arg: CValue<'tcx>,
+    mut arg: CValue<'tcx>,
     idx: usize,
 ) -> (Pointer, Value) {
     let (ptr, vtable) = 'block: {
+        if let Abi::Scalar(_) = arg.layout().abi {
+            while !arg.layout().ty.is_unsafe_ptr() && !arg.layout().ty.is_ref() {
+                let (idx, _) = arg
+                    .layout()
+                    .non_1zst_field(fx)
+                    .expect("not exactly one non-1-ZST field in a `DispatchFromDyn` type");
+                arg = arg.value_field(fx, FieldIdx::new(idx));
+            }
+        }
+
         if let ty::Ref(_, ty, _) = arg.layout().ty.kind() {
             if ty.is_dyn_star() {
-                let inner_layout = fx.layout_of(arg.layout().ty.builtin_deref(true).unwrap().ty);
+                let inner_layout = fx.layout_of(arg.layout().ty.builtin_deref(true).unwrap());
                 let dyn_star = CPlace::for_ptr(Pointer::new(arg.load_scalar(fx)), inner_layout);
-                let ptr = dyn_star.place_field(fx, mir::Field::new(0)).to_ptr();
+                let ptr = dyn_star.place_field(fx, FieldIdx::ZERO).to_ptr();
                 let vtable =
-                    dyn_star.place_field(fx, mir::Field::new(1)).to_cvalue(fx).load_scalar(fx);
+                    dyn_star.place_field(fx, FieldIdx::new(1)).to_cvalue(fx).load_scalar(fx);
                 break 'block (ptr, vtable);
             }
         }
@@ -82,12 +92,10 @@ pub(crate) fn get_vtable<'tcx>(
     ty: Ty<'tcx>,
     trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
 ) -> Value {
-    let alloc_id = fx.tcx.vtable_allocation((ty, trait_ref));
-    let data_id =
-        data_id_for_alloc_id(&mut fx.constants_cx, &mut *fx.module, alloc_id, Mutability::Not);
-    let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+    let data_id = data_id_for_vtable(fx.tcx, &mut fx.constants_cx, fx.module, ty, trait_ref);
+    let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
     if fx.clif_comments.enabled() {
-        fx.add_comment(local_data_id, format!("vtable: {:?}", alloc_id));
+        fx.add_comment(local_data_id, "vtable");
     }
     fx.bcx.ins().global_value(fx.pointer_type, local_data_id)
 }

@@ -1,16 +1,17 @@
 #![allow(clippy::wildcard_imports, clippy::enum_glob_use)]
 
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::ast_utils::{eq_field_pat, eq_id, eq_maybe_qself, eq_pat, eq_path};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::over;
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, Mutability, Pat, PatKind, PatKind::*, DUMMY_NODE_ID};
+use rustc_ast::PatKind::*;
+use rustc_ast::{self as ast, Mutability, Pat, PatKind, DUMMY_NODE_ID};
 use rustc_ast_pretty::pprust;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::DUMMY_SP;
 use std::cell::Cell;
 use std::mem;
@@ -28,13 +29,13 @@ declare_clippy_lint! {
     /// In the example above, `Some` is repeated, which unnecessarily complicates the pattern.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0) | Some(2) = Some(0) {}
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0 | 2) = Some(0) {}
     /// }
@@ -67,7 +68,7 @@ impl EarlyLintPass for UnnestedOrPatterns {
 
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
         if self.msrv.meets(msrvs::OR_PATTERNS) {
-            if let ast::ExprKind::Let(pat, _, _) = &e.kind {
+            if let ast::ExprKind::Let(pat, _, _, _) = &e.kind {
                 lint_unnested_or_patterns(cx, pat);
             }
         }
@@ -136,12 +137,12 @@ fn insert_necessary_parens(pat: &mut P<Pat>) {
     struct Visitor;
     impl MutVisitor for Visitor {
         fn visit_pat(&mut self, pat: &mut P<Pat>) {
-            use ast::BindingAnnotation;
+            use ast::BindingMode;
             noop_visit_pat(pat, self);
             let target = match &mut pat.kind {
                 // `i @ a | b`, `box a | b`, and `& mut? a | b`.
                 Ident(.., Some(p)) | Box(p) | Ref(p, _) if matches!(&p.kind, Or(ps) if ps.len() > 1) => p,
-                Ref(p, Mutability::Not) if matches!(p.kind, Ident(BindingAnnotation::MUT, ..)) => p, // `&(mut x)`
+                Ref(p, Mutability::Not) if matches!(p.kind, Ident(BindingMode::MUT, ..)) => p, // `&(mut x)`
                 _ => return,
             };
             target.kind = Paren(P(take_pat(target)));
@@ -162,9 +163,7 @@ fn unnest_or_patterns(pat: &mut P<Pat>) -> bool {
             noop_visit_pat(p, self);
 
             // Don't have an or-pattern? Just quit early on.
-            let Or(alternatives) = &mut p.kind else {
-                return
-            };
+            let Or(alternatives) = &mut p.kind else { return };
 
             // Collapse or-patterns directly nested in or-patterns.
             let mut idx = 0;
@@ -216,7 +215,7 @@ macro_rules! always_pat {
 /// in `alternatives[focus_idx + 1..]`.
 fn transform_with_focus_on_idx(alternatives: &mut ThinVec<P<Pat>>, focus_idx: usize) -> bool {
     // Extract the kind; we'll need to make some changes in it.
-    let mut focus_kind = mem::replace(&mut alternatives[focus_idx].kind, PatKind::Wild);
+    let mut focus_kind = mem::replace(&mut alternatives[focus_idx].kind, Wild);
     // We'll focus on `alternatives[focus_idx]`,
     // so we're draining from `alternatives[focus_idx + 1..]`.
     let start = focus_idx + 1;
@@ -227,13 +226,13 @@ fn transform_with_focus_on_idx(alternatives: &mut ThinVec<P<Pat>>, focus_idx: us
         // Therefore they are not some form of constructor `C`,
         // with which a pattern `C(p_0)` may be formed,
         // which we would want to join with other `C(p_j)`s.
-        Ident(.., None) | Lit(_) | Wild | Path(..) | Range(..) | Rest | MacCall(_)
+        Ident(.., None) | Lit(_) | Wild | Err(_) | Never | Path(..) | Range(..) | Rest | MacCall(_)
         // Skip immutable refs, as grouping them saves few characters,
         // and almost always requires adding parens (increasing noisiness).
         // In the case of only two patterns, replacement adds net characters.
         | Ref(_, Mutability::Not)
         // Dealt with elsewhere.
-        | Or(_) | Paren(_) => false,
+        | Or(_) | Paren(_) | Deref(_) => false,
         // Transform `box x | ... | box y` into `box (x | y)`.
         //
         // The cases below until `Slice(...)` deal with *singleton* products.
@@ -294,7 +293,7 @@ fn extend_with_struct_pat(
     qself1: &Option<P<ast::QSelf>>,
     path1: &ast::Path,
     fps1: &mut [ast::PatField],
-    rest1: bool,
+    rest1: ast::PatFieldsRest,
     start: usize,
     alternatives: &mut ThinVec<P<Pat>>,
 ) -> bool {
@@ -400,7 +399,7 @@ fn drain_matching(
 
     // If `ThinVec` had the `drain_filter` method, this loop could be rewritten
     // like so:
-    // 
+    //
     //   for pat in alternatives.drain_filter(|p| {
     //       // Check if we should extract, but only if `idx >= start`.
     //       idx += 1;
@@ -412,12 +411,12 @@ fn drain_matching(
     while i < alternatives.len() {
         idx += 1;
         // Check if we should extract, but only if `idx >= start`.
-	if idx > start && predicate(&alternatives[i].kind) {
-	    let pat = alternatives.remove(i);
+        if idx > start && predicate(&alternatives[i].kind) {
+            let pat = alternatives.remove(i);
             tail_or.push(extract(pat.into_inner().kind));
-	} else {
-	    i += 1;
-	}
+        } else {
+            i += 1;
+        }
     }
 
     tail_or

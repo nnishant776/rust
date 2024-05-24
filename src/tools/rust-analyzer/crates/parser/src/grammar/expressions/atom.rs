@@ -1,3 +1,5 @@
+use crate::grammar::types::type_;
+
 use super::*;
 
 // test expr_literals
@@ -12,6 +14,8 @@ use super::*;
 //     let _ = r"d";
 //     let _ = b"e";
 //     let _ = br"f";
+//     let _ = c"g";
+//     let _ = cr"h";
 // }
 pub(crate) const LITERAL_FIRST: TokenSet = TokenSet::new(&[
     T![true],
@@ -22,6 +26,7 @@ pub(crate) const LITERAL_FIRST: TokenSet = TokenSet::new(&[
     CHAR,
     STRING,
     BYTE_STRING,
+    C_STRING,
 ]);
 
 pub(crate) fn literal(p: &mut Parser<'_>) -> Option<CompletedMarker> {
@@ -53,6 +58,7 @@ pub(super) const ATOM_EXPR_FIRST: TokenSet =
         T![match],
         T![move],
         T![return],
+        T![become],
         T![static],
         T![try],
         T![unsafe],
@@ -69,6 +75,9 @@ pub(super) fn atom_expr(
 ) -> Option<(CompletedMarker, BlockLike)> {
     if let Some(m) = literal(p) {
         return Some((m, BlockLike::NotBlock));
+    }
+    if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
+        return Some((builtin_expr(p)?, BlockLike::NotBlock));
     }
     if paths::is_path_start(p) {
         return Some(path_expr(p, r));
@@ -90,11 +99,11 @@ pub(super) fn atom_expr(
             m.complete(p, UNDERSCORE_EXPR)
         }
         T![loop] => loop_expr(p, None),
-        T![box] => box_expr(p, None),
         T![while] => while_expr(p, None),
         T![try] => try_block_expr(p, None),
         T![match] => match_expr(p),
         T![return] => return_expr(p),
+        T![become] => become_expr(p),
         T![yield] => yield_expr(p),
         T![do] if p.nth_at_contextual_kw(1, T![yeet]) => yeet_expr(p),
         T![continue] => continue_expr(p),
@@ -138,7 +147,7 @@ pub(super) fn atom_expr(
         T![async] if la == T![move] && p.nth(2) == T!['{'] => {
             let m = p.start();
             p.bump(T![async]);
-            p.eat(T![move]);
+            p.bump(T![move]);
             stmt_list(p);
             m.complete(p, BLOCK_EXPR)
         }
@@ -163,10 +172,8 @@ pub(super) fn atom_expr(
             return None;
         }
     };
-    let blocklike = match done.kind() {
-        IF_EXPR | WHILE_EXPR | FOR_EXPR | LOOP_EXPR | MATCH_EXPR | BLOCK_EXPR => BlockLike::Block,
-        _ => BlockLike::NotBlock,
-    };
+    let blocklike =
+        if BlockLike::is_blocklike(done.kind()) { BlockLike::Block } else { BlockLike::NotBlock };
     Some((done, blocklike))
 }
 
@@ -183,12 +190,22 @@ fn tuple_expr(p: &mut Parser<'_>) -> CompletedMarker {
 
     let mut saw_comma = false;
     let mut saw_expr = false;
+
+    // test_err tuple_expr_leading_comma
+    // fn foo() {
+    //     (,);
+    // }
+    if p.eat(T![,]) {
+        p.error("expected expression");
+        saw_comma = true;
+    }
+
     while !p.at(EOF) && !p.at(T![')']) {
         saw_expr = true;
 
         // test tuple_attrs
         // const A: (i64, i64) = (1, #[cfg(test)] 2);
-        if !expr(p) {
+        if expr(p).is_none() {
             break;
         }
 
@@ -199,6 +216,72 @@ fn tuple_expr(p: &mut Parser<'_>) -> CompletedMarker {
     }
     p.expect(T![')']);
     m.complete(p, if saw_expr && !saw_comma { PAREN_EXPR } else { TUPLE_EXPR })
+}
+
+// test builtin_expr
+// fn foo() {
+//     builtin#asm(0);
+//     builtin#format_args("", 0, 1, a = 2 + 3, a + b);
+//     builtin#offset_of(Foo, bar.baz.0);
+// }
+fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    let m = p.start();
+    p.bump_remap(T![builtin]);
+    p.bump(T![#]);
+    if p.at_contextual_kw(T![offset_of]) {
+        p.bump_remap(T![offset_of]);
+        p.expect(T!['(']);
+        type_(p);
+        p.expect(T![,]);
+        while !p.at(EOF) && !p.at(T![')']) {
+            if p.at(IDENT) || p.at(INT_NUMBER) {
+                name_ref_or_index(p);
+            // } else if p.at(FLOAT_NUMBER) {
+            // FIXME: needs float hack
+            } else {
+                p.err_and_bump("expected field name or number");
+            }
+            if !p.at(T![')']) {
+                p.expect(T![.]);
+            }
+        }
+        p.expect(T![')']);
+        Some(m.complete(p, OFFSET_OF_EXPR))
+    } else if p.at_contextual_kw(T![format_args]) {
+        p.bump_remap(T![format_args]);
+        p.expect(T!['(']);
+        expr(p);
+        if p.eat(T![,]) {
+            while !p.at(EOF) && !p.at(T![')']) {
+                let m = p.start();
+                if p.at(IDENT) && p.nth_at(1, T![=]) {
+                    name(p);
+                    p.bump(T![=]);
+                }
+                if expr(p).is_none() {
+                    m.abandon(p);
+                    break;
+                }
+                m.complete(p, FORMAT_ARGS_ARG);
+
+                if !p.at(T![')']) {
+                    p.expect(T![,]);
+                }
+            }
+        }
+        p.expect(T![')']);
+        Some(m.complete(p, FORMAT_ARGS_EXPR))
+    } else if p.at_contextual_kw(T![asm]) {
+        p.bump_remap(T![asm]);
+        p.expect(T!['(']);
+        // FIXME: We just put expression here so highlighting kind of keeps working
+        expr(p);
+        p.expect(T![')']);
+        Some(m.complete(p, ASM_EXPR))
+    } else {
+        m.abandon(p);
+        None
+    }
 }
 
 // test array_expr
@@ -221,7 +304,7 @@ fn array_expr(p: &mut Parser<'_>) -> CompletedMarker {
 
         // test array_attrs
         // const A: &[i64] = &[1, #[cfg(test)] 2];
-        if !expr(p) {
+        if expr(p).is_none() {
             break;
         }
 
@@ -307,8 +390,7 @@ fn if_expr(p: &mut Parser<'_>) -> CompletedMarker {
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.at(T![else]) {
-        p.bump(T![else]);
+    if p.eat(T![else]) {
         if p.at(T![if]) {
             if_expr(p);
         } else {
@@ -408,6 +490,18 @@ fn match_expr(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, MATCH_EXPR)
 }
 
+// test_err match_arms_recovery
+// fn foo() {
+//     match () {
+//         _ => (),,
+//         _ => ,
+//         _ => (),
+//          => (),
+//         if true => (),
+//         _ => (),
+//         () if => (),
+//     }
+// }
 pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['{']));
     let m = p.start();
@@ -427,6 +521,10 @@ pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
     while !p.at(EOF) && !p.at(T!['}']) {
         if p.at(T!['{']) {
             error_block(p, "expected match arm");
+            continue;
+        }
+        if p.at(T![,]) {
+            p.err_and_bump("expected pattern");
             continue;
         }
         match_arm(p);
@@ -462,26 +560,30 @@ fn match_arm(p: &mut Parser<'_>) {
     // }
     attributes::outer_attrs(p);
 
-    patterns::pattern_top_r(p, TokenSet::EMPTY);
+    patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]]));
     if p.at(T![if]) {
         match_guard(p);
     }
     p.expect(T![=>]);
-    let blocklike = match expr_stmt(p, None) {
-        Some((_, blocklike)) => blocklike,
-        None => BlockLike::NotBlock,
-    };
+    if p.eat(T![,]) {
+        p.error("expected expression");
+    } else {
+        let blocklike = match expr_stmt(p, None) {
+            Some((_, blocklike)) => blocklike,
+            None => BlockLike::NotBlock,
+        };
 
-    // test match_arms_commas
-    // fn foo() {
-    //     match () {
-    //         _ => (),
-    //         _ => {}
-    //         _ => ()
-    //     }
-    // }
-    if !p.eat(T![,]) && !blocklike.is_block() && !p.at(T!['}']) {
-        p.error("expected `,`");
+        // test match_arms_commas
+        // fn foo() {
+        //     match () {
+        //         _ => (),
+        //         _ => {}
+        //         _ => ()
+        //     }
+        // }
+        if !p.eat(T![,]) && !blocklike.is_block() && !p.at(T!['}']) {
+            p.error("expected `,`");
+        }
     }
     m.complete(p, MATCH_ARM);
 }
@@ -497,7 +599,11 @@ fn match_guard(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![if]));
     let m = p.start();
     p.bump(T![if]);
-    expr(p);
+    if p.at(T![=]) {
+        p.error("expected expression");
+    } else {
+        expr(p);
+    }
     m.complete(p, MATCH_GUARD)
 }
 
@@ -538,6 +644,18 @@ fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
         expr(p);
     }
     m.complete(p, RETURN_EXPR)
+}
+
+// test become_expr
+// fn foo() {
+//     become foo();
+// }
+fn become_expr(p: &mut Parser<'_>) -> CompletedMarker {
+    assert!(p.at(T![become]));
+    let m = p.start();
+    p.bump(T![become]);
+    expr(p);
+    m.complete(p, BECOME_EXPR)
 }
 
 // test yield_expr
@@ -650,20 +768,4 @@ fn try_block_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
         p.error("expected a block");
     }
     m.complete(p, BLOCK_EXPR)
-}
-
-// test box_expr
-// fn foo() {
-//     let x = box 1i32;
-//     let y = (box 1i32, box 2i32);
-//     let z = Foo(box 1i32, box 2i32);
-// }
-fn box_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
-    assert!(p.at(T![box]));
-    let m = m.unwrap_or_else(|| p.start());
-    p.bump(T![box]);
-    if p.at_ts(EXPR_FIRST) {
-        expr(p);
-    }
-    m.complete(p, BOX_EXPR)
 }

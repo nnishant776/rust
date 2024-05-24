@@ -6,18 +6,21 @@ use std::borrow::{Borrow, Cow};
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use rustc_apfloat::{Float, FloatConvert};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::mir;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::query::TyCtxtAt;
+use rustc_middle::ty;
+use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::def_id::DefId;
+use rustc_span::Span;
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi as CallAbi;
 
-use crate::const_eval::CheckAlignment;
-
 use super::{
-    AllocId, AllocRange, Allocation, ConstAllocation, Frame, ImmTy, InterpCx, InterpResult,
-    MemoryKind, OpTy, Operand, PlaceTy, Pointer, Provenance, Scalar, StackPopUnwind,
+    throw_unsup, throw_unsup_format, AllocBytes, AllocId, AllocKind, AllocRange, Allocation,
+    ConstAllocation, CtfeProvenance, FnArg, Frame, ImmTy, InterpCx, InterpResult, MPlaceTy,
+    MemoryKind, Misalignment, OpTy, PlaceTy, Pointer, Provenance,
 };
 
 /// Data returned by Machine::stack_pop,
@@ -46,6 +49,14 @@ pub trait AllocMap<K: Hash + Eq, V> {
     /// Deliberately takes `&mut` because that is sufficient, and some implementations
     /// can be more efficient then (using `RefCell::get_mut`).
     fn contains_key<Q: ?Sized + Hash + Eq>(&mut self, k: &Q) -> bool
+    where
+        K: Borrow<Q>;
+
+    /// Callers should prefer [`AllocMap::contains_key`] when it is possible to call because it may
+    /// be more efficient. This function exists for callers that only have a shared reference
+    /// (which might make it slightly less efficient than `contains_key`, e.g. if
+    /// the data is stored inside a `RefCell`).
+    fn contains_key_ref<Q: ?Sized + Hash + Eq>(&self, k: &Q) -> bool
     where
         K: Borrow<Q>;
 
@@ -83,7 +94,7 @@ pub trait AllocMap<K: Hash + Eq, V> {
 
 /// Methods of this trait signifies a point where CTFE evaluation would fail
 /// and some use case dependent behaviour can instead be applied.
-pub trait Machine<'mir, 'tcx>: Sized {
+pub trait Machine<'mir, 'tcx: 'mir>: Sized {
     /// Additional memory kinds a machine wishes to distinguish from the builtin ones
     type MemoryKind: Debug + std::fmt::Display + MayLeak + Eq + 'static;
 
@@ -103,12 +114,18 @@ pub trait Machine<'mir, 'tcx>: Sized {
     type FrameExtra;
 
     /// Extra data stored in every allocation.
-    type AllocExtra: Debug + Clone + 'static;
+    type AllocExtra: Debug + Clone + 'tcx;
+
+    /// Type for the bytes of the allocation.
+    type Bytes: AllocBytes + 'static;
 
     /// Memory's allocation map
     type MemoryMap: AllocMap<
             AllocId,
-            (MemoryKind<Self::MemoryKind>, Allocation<Self::Provenance, Self::AllocExtra>),
+            (
+                MemoryKind<Self::MemoryKind>,
+                Allocation<Self::Provenance, Self::AllocExtra, Self::Bytes>,
+            ),
         > + Default
         + Clone;
 
@@ -123,24 +140,28 @@ pub trait Machine<'mir, 'tcx>: Sized {
     /// Should the machine panic on allocation failures?
     const PANIC_ON_ALLOC_FAIL: bool;
 
+    /// Determines whether `eval_mir_constant` can never fail because all required consts have
+    /// already been checked before.
+    const ALL_CONSTS_ARE_PRECHECKED: bool = true;
+
     /// Whether memory accesses should be alignment-checked.
-    fn enforce_alignment(ecx: &InterpCx<'mir, 'tcx, Self>) -> CheckAlignment;
+    fn enforce_alignment(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
 
-    /// Whether, when checking alignment, we should look at the actual address and thus support
-    /// custom alignment logic based on whatever the integer address happens to be.
-    ///
-    /// If this returns true, Provenance::OFFSET_IS_ADDR must be true.
-    fn use_addr_for_alignment_check(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+    /// Gives the machine a chance to detect more misalignment than the built-in checks would catch.
+    #[inline(always)]
+    fn alignment_check(
+        _ecx: &InterpCx<'mir, 'tcx, Self>,
+        _alloc_id: AllocId,
+        _alloc_align: Align,
+        _alloc_kind: AllocKind,
+        _offset: Size,
+        _align: Align,
+    ) -> Option<Misalignment> {
+        None
+    }
 
-    fn alignment_check_failed(
-        ecx: &InterpCx<'mir, 'tcx, Self>,
-        has: Align,
-        required: Align,
-        check: CheckAlignment,
-    ) -> InterpResult<'tcx, ()>;
-
-    /// Whether to enforce the validity invariant
-    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+    /// Whether to enforce the validity invariant for a specific layout.
+    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>, layout: TyAndLayout<'tcx>) -> bool;
 
     /// Whether function calls should be [ABI](CallAbi)-checked.
     fn enforce_abi(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
@@ -149,7 +170,7 @@ pub trait Machine<'mir, 'tcx>: Sized {
 
     /// Whether Assert(OverflowNeg) and Assert(Overflow) MIR terminators should actually
     /// check for overflow.
-    fn ignore_checkable_overflow_assertions(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
+    fn ignore_optional_overflow_checks(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool;
 
     /// Entry point for obtaining the MIR of anything that should get evaluated.
     /// So not just functions and shims, but also const/static initializers, anonymous
@@ -175,10 +196,10 @@ pub trait Machine<'mir, 'tcx>: Sized {
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         abi: CallAbi,
-        args: &[OpTy<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        args: &[FnArg<'tcx, Self::Provenance>],
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>>;
 
     /// Execute `fn_val`. It is the hook's responsibility to advance the instruction
@@ -187,34 +208,41 @@ pub trait Machine<'mir, 'tcx>: Sized {
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         fn_val: Self::ExtraFnVal,
         abi: CallAbi,
-        args: &[OpTy<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        args: &[FnArg<'tcx, Self::Provenance>],
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx>;
 
     /// Directly process an intrinsic without pushing a stack frame. It is the hook's
     /// responsibility to advance the instruction pointer as appropriate.
+    ///
+    /// Returns `None` if the intrinsic was fully handled.
+    /// Otherwise, returns an `Instance` of the function that implements the intrinsic.
     fn call_intrinsic(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
-    ) -> InterpResult<'tcx>;
+        unwind: mir::UnwindAction,
+    ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>>;
 
     /// Called to evaluate `Assert` MIR terminators that trigger a panic.
     fn assert_panic(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         msg: &mir::AssertMessage<'tcx>,
-        unwind: Option<mir::BasicBlock>,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx>;
 
-    /// Called to evaluate `Abort` MIR terminator.
-    fn abort(_ecx: &mut InterpCx<'mir, 'tcx, Self>, _msg: String) -> InterpResult<'tcx, !> {
-        throw_unsup_format!("aborting execution is not supported")
-    }
+    /// Called to trigger a non-unwinding panic.
+    fn panic_nounwind(_ecx: &mut InterpCx<'mir, 'tcx, Self>, msg: &str) -> InterpResult<'tcx>;
+
+    /// Called when unwinding reached a state where execution should be terminated.
+    fn unwind_terminate(
+        ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        reason: mir::UnwindTerminateReason,
+    ) -> InterpResult<'tcx>;
 
     /// Called for all binary operations where the LHS has pointer type.
     ///
@@ -224,24 +252,16 @@ pub trait Machine<'mir, 'tcx>: Sized {
         bin_op: mir::BinOp,
         left: &ImmTy<'tcx, Self::Provenance>,
         right: &ImmTy<'tcx, Self::Provenance>,
-    ) -> InterpResult<'tcx, (Scalar<Self::Provenance>, bool, Ty<'tcx>)>;
+    ) -> InterpResult<'tcx, ImmTy<'tcx, Self::Provenance>>;
 
-    /// Called to write the specified `local` from the `frame`.
-    /// Since writing a ZST is not actually accessing memory or locals, this is never invoked
-    /// for ZST reads.
-    ///
-    /// Due to borrow checker trouble, we indicate the `frame` as an index rather than an `&mut
-    /// Frame`.
-    #[inline]
-    fn access_local_mut<'a>(
-        ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
-        frame: usize,
-        local: mir::Local,
-    ) -> InterpResult<'tcx, &'a mut Operand<Self::Provenance>>
-    where
-        'tcx: 'mir,
-    {
-        ecx.stack_mut()[frame].locals[local].access_mut()
+    /// Generate the NaN returned by a float operation, given the list of inputs.
+    /// (This is all inputs, not just NaN inputs!)
+    fn generate_nan<F1: Float + FloatConvert<F2>, F2: Float>(
+        _ecx: &InterpCx<'mir, 'tcx, Self>,
+        _inputs: &[F1],
+    ) -> F2 {
+        // By default we always return the preferred NaN.
+        F2::NAN
     }
 
     /// Called before a basic block terminator is executed.
@@ -261,7 +281,7 @@ pub trait Machine<'mir, 'tcx>: Sized {
     /// `def_id` is `Some` if this is the "lazy" allocation of a static.
     #[inline]
     fn before_access_global(
-        _tcx: TyCtxt<'tcx>,
+        _tcx: TyCtxtAt<'tcx>,
         _machine: &Self,
         _alloc_id: AllocId,
         _allocation: ConstAllocation<'tcx>,
@@ -272,26 +292,17 @@ pub trait Machine<'mir, 'tcx>: Sized {
     }
 
     /// Return the `AllocId` for the given thread-local static in the current thread.
-    fn thread_local_static_base_pointer(
+    fn thread_local_static_pointer(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         def_id: DefId,
     ) -> InterpResult<'tcx, Pointer<Self::Provenance>> {
         throw_unsup!(ThreadLocalStatic(def_id))
     }
 
-    /// Return the root pointer for the given `extern static`.
-    fn extern_static_base_pointer(
+    /// Return the `AllocId` for the given `extern static`.
+    fn extern_static_pointer(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         def_id: DefId,
-    ) -> InterpResult<'tcx, Pointer<Self::Provenance>>;
-
-    /// Return a "base" pointer for the given allocation: the one that is used for direct
-    /// accesses to this static/const/fn allocation, or the one returned from the heap allocator.
-    ///
-    /// Not called on `extern` or thread-local statics (those use the methods above).
-    fn adjust_alloc_base_pointer(
-        ecx: &InterpCx<'mir, 'tcx, Self>,
-        ptr: Pointer,
     ) -> InterpResult<'tcx, Pointer<Self::Provenance>>;
 
     /// "Int-to-pointer cast"
@@ -320,6 +331,8 @@ pub trait Machine<'mir, 'tcx>: Sized {
 
     /// Called to adjust allocations to the Provenance and AllocExtra of this machine.
     ///
+    /// If `alloc` contains pointers, then they are all pointing to globals.
+    ///
     /// The way we construct allocations is to always first construct it without extra and then add
     /// the extra. This keeps uniform code paths for handling both allocations created by CTFE for
     /// globals, and allocations created by Miri during evaluation.
@@ -331,32 +344,53 @@ pub trait Machine<'mir, 'tcx>: Sized {
     /// allocation (because a copy had to be done to adjust things), machine memory will
     /// cache the result. (This relies on `AllocMap::get_or` being able to add the
     /// owned allocation to the map even when the map is shared.)
-    ///
-    /// This must only fail if `alloc` contains provenance.
     fn adjust_allocation<'b>(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         id: AllocId,
         alloc: Cow<'b, Allocation>,
         kind: Option<MemoryKind<Self::MemoryKind>>,
-    ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra>>>;
+    ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra, Self::Bytes>>>;
 
+    /// Return a "root" pointer for the given allocation: the one that is used for direct
+    /// accesses to this static/const/fn allocation, or the one returned from the heap allocator.
+    ///
+    /// Not called on `extern` or thread-local statics (those use the methods above).
+    ///
+    /// `kind` is the kind of the allocation the pointer points to; it can be `None` when
+    /// it's a global and `GLOBAL_KIND` is `None`.
+    fn adjust_alloc_root_pointer(
+        ecx: &InterpCx<'mir, 'tcx, Self>,
+        ptr: Pointer,
+        kind: Option<MemoryKind<Self::MemoryKind>>,
+    ) -> InterpResult<'tcx, Pointer<Self::Provenance>>;
+
+    /// Evaluate the inline assembly.
+    ///
+    /// This should take care of jumping to the next block (one of `targets`) when asm goto
+    /// is triggered, `targets[0]` when the assembly falls through, or diverge in case of
+    /// `InlineAsmOptions::NORETURN` being set.
     fn eval_inline_asm(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _template: &'tcx [InlineAsmTemplatePiece],
         _operands: &[mir::InlineAsmOperand<'tcx>],
         _options: InlineAsmOptions,
+        _targets: &[mir::BasicBlock],
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("inline assembly is not supported")
     }
 
     /// Hook for performing extra checks on a memory read access.
     ///
+    /// This will *not* be called during validation!
+    ///
     /// Takes read-only access to the allocation so we can keep all the memory read
     /// operations take `&self`. Use a `RefCell` in `AllocExtra` if you
     /// need to mutate.
+    ///
+    /// This is not invoked for ZST accesses, as no read actually happens.
     #[inline(always)]
     fn before_memory_read(
-        _tcx: TyCtxt<'tcx>,
+        _tcx: TyCtxtAt<'tcx>,
         _machine: &Self,
         _alloc_extra: &Self::AllocExtra,
         _prov: (AllocId, Self::ProvenanceExtra),
@@ -365,10 +399,25 @@ pub trait Machine<'mir, 'tcx>: Sized {
         Ok(())
     }
 
+    /// Hook for performing extra checks on any memory read access,
+    /// that involves an allocation, even ZST reads.
+    ///
+    /// This will *not* be called during validation!
+    ///
+    /// Used to prevent statics from self-initializing by reading from their own memory
+    /// as it is being initialized.
+    fn before_alloc_read(
+        _ecx: &InterpCx<'mir, 'tcx, Self>,
+        _alloc_id: AllocId,
+    ) -> InterpResult<'tcx> {
+        Ok(())
+    }
+
     /// Hook for performing extra checks on a memory write access.
+    /// This is not invoked for ZST accesses, as no write actually happens.
     #[inline(always)]
     fn before_memory_write(
-        _tcx: TyCtxt<'tcx>,
+        _tcx: TyCtxtAt<'tcx>,
         _machine: &mut Self,
         _alloc_extra: &mut Self::AllocExtra,
         _prov: (AllocId, Self::ProvenanceExtra),
@@ -380,11 +429,13 @@ pub trait Machine<'mir, 'tcx>: Sized {
     /// Hook for performing extra operations on a memory deallocation.
     #[inline(always)]
     fn before_memory_deallocation(
-        _tcx: TyCtxt<'tcx>,
+        _tcx: TyCtxtAt<'tcx>,
         _machine: &mut Self,
         _alloc_extra: &mut Self::AllocExtra,
         _prov: (AllocId, Self::ProvenanceExtra),
-        _range: AllocRange,
+        _size: Size,
+        _align: Align,
+        _kind: MemoryKind<Self::MemoryKind>,
     ) -> InterpResult<'tcx> {
         Ok(())
     }
@@ -411,6 +462,19 @@ pub trait Machine<'mir, 'tcx>: Sized {
         Ok(())
     }
 
+    /// Called on places used for in-place function argument and return value handling.
+    ///
+    /// These places need to be protected to make sure the program cannot tell whether the
+    /// argument/return value was actually copied or passed in-place..
+    fn protect_in_place_function_argument(
+        ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        mplace: &MPlaceTy<'tcx, Self::Provenance>,
+    ) -> InterpResult<'tcx> {
+        // Without an aliasing model, all we can do is put `Uninit` into the place.
+        // Conveniently this also ensures that the place actually points to suitable memory.
+        ecx.write_uninit(mplace)
+    }
+
     /// Called immediately before a new stack frame gets pushed.
     fn init_frame_extra(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
@@ -432,8 +496,17 @@ pub trait Machine<'mir, 'tcx>: Sized {
         Ok(())
     }
 
+    /// Called just before the return value is copied to the caller-provided return place.
+    fn before_stack_pop(
+        _ecx: &InterpCx<'mir, 'tcx, Self>,
+        _frame: &Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
+    ) -> InterpResult<'tcx> {
+        Ok(())
+    }
+
     /// Called immediately after a stack frame got popped, but before jumping back to the caller.
     /// The `locals` have already been destroyed!
+    #[inline(always)]
     fn after_stack_pop(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _frame: Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
@@ -443,13 +516,45 @@ pub trait Machine<'mir, 'tcx>: Sized {
         assert!(!unwinding);
         Ok(StackPopJump::Normal)
     }
+
+    /// Called immediately after actual memory was allocated for a local
+    /// but before the local's stack frame is updated to point to that memory.
+    #[inline(always)]
+    fn after_local_allocated(
+        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        _local: mir::Local,
+        _mplace: &MPlaceTy<'tcx, Self::Provenance>,
+    ) -> InterpResult<'tcx> {
+        Ok(())
+    }
+
+    /// Evaluate the given constant. The `eval` function will do all the required evaluation,
+    /// but this hook has the chance to do some pre/postprocessing.
+    #[inline(always)]
+    fn eval_mir_constant<F>(
+        ecx: &InterpCx<'mir, 'tcx, Self>,
+        val: mir::Const<'tcx>,
+        span: Span,
+        layout: Option<TyAndLayout<'tcx>>,
+        eval: F,
+    ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>
+    where
+        F: Fn(
+            &InterpCx<'mir, 'tcx, Self>,
+            mir::Const<'tcx>,
+            Span,
+            Option<TyAndLayout<'tcx>>,
+        ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>,
+    {
+        eval(ecx, val, span, layout)
+    }
 }
 
 /// A lot of the flexibility above is just needed for `Miri`, but all "compile-time" machines
 /// (CTFE and ConstProp) use the same instance. Here, we share that code.
 pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
-    type Provenance = AllocId;
-    type ProvenanceExtra = ();
+    type Provenance = CtfeProvenance;
+    type ProvenanceExtra = bool; // the "immutable" flag
 
     type ExtraFnVal = !;
 
@@ -459,16 +564,19 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
 
     type AllocExtra = ();
     type FrameExtra = ();
+    type Bytes = Box<[u8]>;
 
     #[inline(always)]
-    fn use_addr_for_alignment_check(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
-        // We do not support `use_addr`.
+    fn ignore_optional_overflow_checks(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
         false
     }
 
     #[inline(always)]
-    fn ignore_checkable_overflow_assertions(_ecx: &InterpCx<$mir, $tcx, Self>) -> bool {
-        false
+    fn unwind_terminate(
+        _ecx: &mut InterpCx<$mir, $tcx, Self>,
+        _reason: mir::UnwindTerminateReason,
+    ) -> InterpResult<$tcx> {
+        unreachable!("unwinding cannot happen during compile-time evaluation")
     }
 
     #[inline(always)]
@@ -476,10 +584,10 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
         _ecx: &mut InterpCx<$mir, $tcx, Self>,
         fn_val: !,
         _abi: CallAbi,
-        _args: &[OpTy<$tcx>],
-        _destination: &PlaceTy<$tcx, Self::Provenance>,
+        _args: &[FnArg<$tcx>],
+        _destination: &MPlaceTy<$tcx, Self::Provenance>,
         _target: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<$tcx> {
         match fn_val {}
     }
@@ -494,19 +602,20 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
         Ok(alloc)
     }
 
-    fn extern_static_base_pointer(
+    fn extern_static_pointer(
         ecx: &InterpCx<$mir, $tcx, Self>,
         def_id: DefId,
     ) -> InterpResult<$tcx, Pointer> {
         // Use the `AllocId` associated with the `DefId`. Any actual *access* will fail.
-        Ok(Pointer::new(ecx.tcx.create_static_alloc(def_id), Size::ZERO))
+        Ok(Pointer::new(ecx.tcx.reserve_and_set_static_alloc(def_id).into(), Size::ZERO))
     }
 
     #[inline(always)]
-    fn adjust_alloc_base_pointer(
+    fn adjust_alloc_root_pointer(
         _ecx: &InterpCx<$mir, $tcx, Self>,
-        ptr: Pointer<AllocId>,
-    ) -> InterpResult<$tcx, Pointer<AllocId>> {
+        ptr: Pointer<CtfeProvenance>,
+        _kind: Option<MemoryKind<Self::MemoryKind>>,
+    ) -> InterpResult<$tcx, Pointer<CtfeProvenance>> {
         Ok(ptr)
     }
 
@@ -514,7 +623,7 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     fn ptr_from_addr_cast(
         _ecx: &InterpCx<$mir, $tcx, Self>,
         addr: u64,
-    ) -> InterpResult<$tcx, Pointer<Option<AllocId>>> {
+    ) -> InterpResult<$tcx, Pointer<Option<CtfeProvenance>>> {
         // Allow these casts, but make the pointer not dereferenceable.
         // (I.e., they behave like transmutation.)
         // This is correct because no pointers can ever be exposed in compile-time evaluation.
@@ -524,10 +633,10 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
     #[inline(always)]
     fn ptr_get_alloc(
         _ecx: &InterpCx<$mir, $tcx, Self>,
-        ptr: Pointer<AllocId>,
+        ptr: Pointer<CtfeProvenance>,
     ) -> Option<(AllocId, Size, Self::ProvenanceExtra)> {
         // We know `offset` is relative to the allocation, so we can use `into_parts`.
-        let (alloc_id, offset) = ptr.into_parts();
-        Some((alloc_id, offset, ()))
+        let (prov, offset) = ptr.into_parts();
+        Some((prov.alloc_id(), offset, prov.immutable()))
     }
 }

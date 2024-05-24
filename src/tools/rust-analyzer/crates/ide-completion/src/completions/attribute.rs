@@ -25,6 +25,7 @@ use crate::{
 mod cfg;
 mod derive;
 mod lint;
+mod macro_use;
 mod repr;
 
 pub(crate) use self::derive::complete_derive_path;
@@ -35,6 +36,7 @@ pub(crate) fn complete_known_attribute_input(
     ctx: &CompletionContext<'_>,
     &colon_prefix: &bool,
     fake_attribute_under_caret: &ast::Attr,
+    extern_crate: Option<&ast::ExternCrate>,
 ) -> Option<()> {
     let attribute = fake_attribute_under_caret;
     let name_ref = match attribute.path() {
@@ -42,9 +44,7 @@ pub(crate) fn complete_known_attribute_input(
         None => None,
     };
     let (path, tt) = name_ref.zip(attribute.token_tree())?;
-    if tt.l_paren_token().is_none() {
-        return None;
-    }
+    tt.l_paren_token()?;
 
     match path.text().as_str() {
         "repr" => repr::complete_repr(acc, ctx, tt),
@@ -66,6 +66,9 @@ pub(crate) fn complete_known_attribute_input(
             lint::complete_lint(acc, ctx, colon_prefix, &existing_lints, &lints);
         }
         "cfg" => cfg::complete_cfg(acc, ctx),
+        "macro_use" => {
+            macro_use::complete_macro_use(acc, ctx, extern_crate, &parse_tt_as_comma_sep_paths(tt)?)
+        }
         _ => (),
     }
     Some(())
@@ -93,7 +96,7 @@ pub(crate) fn complete_attribute_path(
                         acc.add_macro(ctx, path_ctx, m, name)
                     }
                     hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
-                        acc.add_module(ctx, path_ctx, m, name)
+                        acc.add_module(ctx, path_ctx, m, name, vec![])
                     }
                     _ => (),
                 }
@@ -104,12 +107,12 @@ pub(crate) fn complete_attribute_path(
         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
         // only show modules in a fresh UseTree
         Qualified::No => {
-            ctx.process_all_names(&mut |name, def| match def {
+            ctx.process_all_names(&mut |name, def, doc_aliases| match def {
                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_attr(ctx.db) => {
                     acc.add_macro(ctx, path_ctx, m, name)
                 }
                 hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
-                    acc.add_module(ctx, path_ctx, m, name)
+                    acc.add_module(ctx, path_ctx, m, name, doc_aliases)
                 }
                 _ => (),
             });
@@ -139,7 +142,7 @@ pub(crate) fn complete_attribute_path(
         }
 
         if is_inner || !attr_completion.prefer_inner {
-            item.add_to(acc);
+            item.add_to(acc, ctx.db);
         }
     };
 

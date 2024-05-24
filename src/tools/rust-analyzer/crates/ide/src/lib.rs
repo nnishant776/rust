@@ -8,36 +8,32 @@
 //! in this crate.
 
 // For proving that RootDatabase is RefUnwindSafe.
+#![warn(rust_2018_idioms, unused_lifetimes)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![recursion_limit = "128"]
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
-
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
 
 #[cfg(test)]
 mod fixture;
 
 mod markup;
-mod prime_caches;
 mod navigation_target;
 
 mod annotations;
 mod call_hierarchy;
-mod signature_help;
 mod doc_links;
-mod highlight_related;
 mod expand_macro;
 mod extend_selection;
+mod fetch_crates;
 mod file_structure;
 mod folding_ranges;
 mod goto_declaration;
 mod goto_definition;
 mod goto_implementation;
 mod goto_type_definition;
+mod highlight_related;
 mod hover;
 mod inlay_hints;
+mod interpret_function;
 mod join_lines;
 mod markdown_remove;
 mod matching_brace;
@@ -47,30 +43,38 @@ mod parent_module;
 mod references;
 mod rename;
 mod runnables;
+mod shuffle_crate_graph;
+mod signature_help;
 mod ssr;
 mod static_index;
 mod status;
 mod syntax_highlighting;
 mod syntax_tree;
+mod test_explorer;
 mod typing;
 mod view_crate_graph;
 mod view_hir;
 mod view_item_tree;
-mod shuffle_crate_graph;
+mod view_memory_layout;
+mod view_mir;
 
-use std::sync::Arc;
+use std::panic::UnwindSafe;
 
 use cfg::CfgOptions;
+use fetch_crates::CrateInfo;
+use hir::ChangeWithProcMacros;
 use ide_db::{
     base_db::{
         salsa::{self, ParallelDatabase},
-        CrateOrigin, Env, FileLoader, FileSet, SourceDatabase, VfsPath,
+        CrateOrigin, Env, FileLoader, FileSet, SourceDatabase, SourceDatabaseExt, VfsPath,
     },
-    symbol_index, LineIndexDatabase,
+    prime_caches, symbol_index, FxHashMap, FxIndexSet, LineIndexDatabase,
 };
 use syntax::SourceFile;
+use triomphe::Arc;
+use view_memory_layout::{view_memory_layout, RecursiveMemoryLayout};
 
-use crate::navigation_target::{ToNav, TryToNav};
+use crate::navigation_target::ToNav;
 
 pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind, AnnotationLocation},
@@ -79,18 +83,23 @@ pub use crate::{
     file_structure::{StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
-    hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
+    hover::{
+        HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult,
+        MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind,
+    },
     inlay_hints::{
-        AdjustmentHints, AdjustmentHintsMode, ClosureReturnTypeHints, DiscriminantHints, InlayHint,
-        InlayHintLabel, InlayHintLabelPart, InlayHintsConfig, InlayKind, InlayTooltip,
-        LifetimeElisionHints,
+        AdjustmentHints, AdjustmentHintsMode, ClosureReturnTypeHints, DiscriminantHints,
+        InlayFieldsToResolve, InlayHint, InlayHintLabel, InlayHintLabelPart, InlayHintPosition,
+        InlayHintsConfig, InlayKind, InlayTooltip, LifetimeElisionHints,
     },
     join_lines::JoinLinesConfig,
     markup::Markup,
-    moniker::{MonikerDescriptorKind, MonikerKind, MonikerResult, PackageInformation},
+    moniker::{
+        MonikerDescriptorKind, MonikerKind, MonikerResult, PackageInformation,
+        SymbolInformationKind,
+    },
     move_item::Direction,
-    navigation_target::NavigationTarget,
-    prime_caches::ParallelPrimeCachesProgress,
+    navigation_target::{NavigationTarget, TryToNav, UpmappingResult},
     references::ReferenceSearchResult,
     rename::RenameError,
     runnables::{Runnable, RunnableKind, TestId},
@@ -100,8 +109,9 @@ pub use crate::{
         tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
         HighlightConfig, HlRange,
     },
+    test_explorer::{TestItem, TestItemKind},
 };
-pub use hir::{Documentation, Semantics};
+pub use hir::Semantics;
 pub use ide_assists::{
     Assist, AssistConfig, AssistId, AssistKind, AssistResolveStrategy, SingleResolve,
 };
@@ -111,18 +121,23 @@ pub use ide_completion::{
 };
 pub use ide_db::{
     base_db::{
-        Cancelled, Change, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange,
-        SourceRoot, SourceRootId,
+        Cancelled, CrateGraph, CrateId, FileChange, FileId, FilePosition, FileRange, SourceRoot,
+        SourceRootId,
     },
+    documentation::Documentation,
     label::Label,
     line_index::{LineCol, LineIndex},
+    prime_caches::ParallelPrimeCachesProgress,
     search::{ReferenceCategory, SearchScope},
-    source_change::{FileSystemEdit, SourceChange},
+    source_change::{FileSystemEdit, SnippetEdit, SourceChange},
     symbol_index::Query,
     RootDatabase, SymbolKind,
 };
-pub use ide_diagnostics::{Diagnostic, DiagnosticsConfig, ExprFillDefaultMode, Severity};
+pub use ide_diagnostics::{
+    Diagnostic, DiagnosticCode, DiagnosticsConfig, ExprFillDefaultMode, Severity,
+};
 pub use ide_ssr::SsrError;
+pub use span::Edition;
 pub use syntax::{TextRange, TextSize};
 pub use text_edit::{Indel, TextEdit};
 
@@ -152,8 +167,16 @@ impl AnalysisHost {
         AnalysisHost { db: RootDatabase::new(lru_capacity) }
     }
 
+    pub fn with_database(db: RootDatabase) -> AnalysisHost {
+        AnalysisHost { db }
+    }
+
     pub fn update_lru_capacity(&mut self, lru_capacity: Option<usize>) {
-        self.db.update_lru_capacity(lru_capacity);
+        self.db.update_base_query_lru_capacities(lru_capacity);
+    }
+
+    pub fn update_lru_capacities(&mut self, lru_capacities: &FxHashMap<Box<str>, usize>) {
+        self.db.update_lru_capacities(lru_capacities);
     }
 
     /// Returns a snapshot of the current state, which you can query for
@@ -164,12 +187,12 @@ impl AnalysisHost {
 
     /// Applies changes to the current state of the world. If there are
     /// outstanding snapshots, they will be canceled.
-    pub fn apply_change(&mut self, change: Change) {
-        self.db.apply_change(change)
+    pub fn apply_change(&mut self, change: ChangeWithProcMacros) {
+        self.db.apply_change(change);
     }
 
     /// NB: this clears the database
-    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes)> {
+    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes, usize)> {
         self.db.per_query_memory_usage()
     }
     pub fn request_cancellation(&mut self) {
@@ -214,12 +237,12 @@ impl Analysis {
     // `AnalysisHost` for creating a fully-featured analysis.
     pub fn from_single_file(text: String) -> (Analysis, FileId) {
         let mut host = AnalysisHost::default();
-        let file_id = FileId(0);
+        let file_id = FileId::from_raw(0);
         let mut file_set = FileSet::default();
-        file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_string()));
+        file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_owned()));
         let source_root = SourceRoot::new_local(file_set);
 
-        let mut change = Change::new();
+        let mut change = ChangeWithProcMacros::new();
         change.set_roots(vec![source_root]);
         let mut crate_graph = CrateGraph::default();
         // FIXME: cfg options
@@ -231,23 +254,27 @@ impl Analysis {
             Edition::CURRENT,
             None,
             None,
-            cfg_options.clone(),
-            cfg_options,
+            Arc::new(cfg_options),
+            None,
             Env::default(),
-            Ok(Vec::new()),
             false,
-            CrateOrigin::CratesIo { repo: None, name: None },
-            Err("Analysis::from_single_file has no target layout".into()),
+            CrateOrigin::Local { repo: None, name: None },
         );
-        change.change_file(file_id, Some(Arc::new(text)));
+        change.change_file(file_id, Some(text));
         change.set_crate_graph(crate_graph);
+        change.set_target_data_layouts(vec![Err("fixture has no layout".into())]);
+        change.set_toolchains(vec![None]);
         host.apply_change(change);
         (host.analysis(), file_id)
     }
 
     /// Debug info about the current state of the analysis.
     pub fn status(&self, file_id: Option<FileId>) -> Cancellable<String> {
-        self.with_db(|db| status::status(&*db, file_id))
+        self.with_db(|db| status::status(db, file_id))
+    }
+
+    pub fn source_root(&self, file_id: FileId) -> Cancellable<SourceRootId> {
+        self.with_db(|db| db.file_source_root(file_id))
     }
 
     pub fn parallel_prime_caches<F>(&self, num_worker_threads: u8, cb: F) -> Cancellable<()>
@@ -258,8 +285,8 @@ impl Analysis {
     }
 
     /// Gets the text of the source file.
-    pub fn file_text(&self, file_id: FileId) -> Cancellable<Arc<String>> {
-        self.with_db(|db| db.file_text(file_id))
+    pub fn file_text(&self, file_id: FileId) -> Cancellable<Arc<str>> {
+        self.with_db(|db| SourceDatabaseExt::file_text(db, file_id))
     }
 
     /// Gets the syntax tree of the file.
@@ -269,7 +296,6 @@ impl Analysis {
 
     /// Returns true if this file belongs to an immutable library.
     pub fn is_library_file(&self, file_id: FileId) -> Cancellable<bool> {
-        use ide_db::base_db::SourceDatabaseExt;
         self.with_db(|db| db.source_root(db.file_source_root(file_id)).is_library)
     }
 
@@ -308,13 +334,41 @@ impl Analysis {
         self.with_db(|db| view_hir::view_hir(db, position))
     }
 
+    pub fn view_mir(&self, position: FilePosition) -> Cancellable<String> {
+        self.with_db(|db| view_mir::view_mir(db, position))
+    }
+
+    pub fn interpret_function(&self, position: FilePosition) -> Cancellable<String> {
+        self.with_db(|db| interpret_function::interpret_function(db, position))
+    }
+
     pub fn view_item_tree(&self, file_id: FileId) -> Cancellable<String> {
         self.with_db(|db| view_item_tree::view_item_tree(db, file_id))
+    }
+
+    pub fn discover_test_roots(&self) -> Cancellable<Vec<TestItem>> {
+        self.with_db(test_explorer::discover_test_roots)
+    }
+
+    pub fn discover_tests_in_crate_by_test_id(&self, crate_id: &str) -> Cancellable<Vec<TestItem>> {
+        self.with_db(|db| test_explorer::discover_tests_in_crate_by_test_id(db, crate_id))
+    }
+
+    pub fn discover_tests_in_crate(&self, crate_id: CrateId) -> Cancellable<Vec<TestItem>> {
+        self.with_db(|db| test_explorer::discover_tests_in_crate(db, crate_id))
+    }
+
+    pub fn discover_tests_in_file(&self, file_id: FileId) -> Cancellable<Vec<TestItem>> {
+        self.with_db(|db| test_explorer::discover_tests_in_file(db, file_id))
     }
 
     /// Renders the crate graph to GraphViz "dot" syntax.
     pub fn view_crate_graph(&self, full: bool) -> Cancellable<Result<String, String>> {
         self.with_db(|db| view_crate_graph::view_crate_graph(db, full))
+    }
+
+    pub fn fetch_crates(&self) -> Cancellable<FxIndexSet<CrateInfo>> {
+        self.with_db(fetch_crates::fetch_crates)
     }
 
     pub fn expand_macro(&self, position: FilePosition) -> Cancellable<Option<ExpandedMacro>> {
@@ -373,6 +427,18 @@ impl Analysis {
     ) -> Cancellable<Vec<InlayHint>> {
         self.with_db(|db| inlay_hints::inlay_hints(db, file_id, range, config))
     }
+    pub fn inlay_hints_resolve(
+        &self,
+        config: &InlayHintsConfig,
+        file_id: FileId,
+        position: TextSize,
+        hash: u64,
+        hasher: impl Fn(&InlayHint) -> u64 + Send + UnwindSafe,
+    ) -> Cancellable<Option<InlayHint>> {
+        self.with_db(|db| {
+            inlay_hints::inlay_hints_resolve(db, file_id, position, hash, config, hasher)
+        })
+    }
 
     /// Returns the set of folding ranges.
     pub fn folding_ranges(&self, file_id: FileId) -> Cancellable<Vec<Fold>> {
@@ -380,11 +446,13 @@ impl Analysis {
     }
 
     /// Fuzzy searches for a symbol.
-    pub fn symbol_search(&self, query: Query) -> Cancellable<Vec<NavigationTarget>> {
+    pub fn symbol_search(&self, query: Query, limit: usize) -> Cancellable<Vec<NavigationTarget>> {
         self.with_db(|db| {
             symbol_index::world_symbols(db, query)
                 .into_iter() // xx: should we make this a par iter?
                 .filter_map(|s| s.try_to_nav(db))
+                .take(limit)
+                .map(UpmappingResult::call_site)
                 .collect::<Vec<_>>()
         })
     }
@@ -447,12 +515,19 @@ impl Analysis {
         self.with_db(|db| moniker::moniker(db, position))
     }
 
-    /// Return URL(s) for the documentation of the symbol under the cursor.
+    /// Returns URL(s) for the documentation of the symbol under the cursor.
+    /// # Arguments
+    /// * `position` - Position in the file.
+    /// * `target_dir` - Directory where the build output is storeda.
     pub fn external_docs(
         &self,
         position: FilePosition,
-    ) -> Cancellable<Option<doc_links::DocumentationLink>> {
-        self.with_db(|db| doc_links::external_docs(db, &position))
+        target_dir: Option<&str>,
+        sysroot: Option<&str>,
+    ) -> Cancellable<doc_links::DocumentationLinks> {
+        self.with_db(|db| {
+            doc_links::external_docs(db, position, target_dir, sysroot).unwrap_or_default()
+        })
     }
 
     /// Computes parameter information at the given position.
@@ -501,6 +576,11 @@ impl Analysis {
     /// Returns the edition of the given crate.
     pub fn crate_edition(&self, crate_id: CrateId) -> Cancellable<Edition> {
         self.with_db(|db| db.crate_graph()[crate_id].edition)
+    }
+
+    /// Returns true if this crate has `no_std` or `no_core` specified.
+    pub fn is_crate_no_std(&self, crate_id: CrateId) -> Cancellable<bool> {
+        self.with_db(|db| hir::db::DefDatabase::crate_def_map(db, crate_id).is_no_std())
     }
 
     /// Returns the root file of the given crate.
@@ -606,7 +686,7 @@ impl Analysis {
         };
 
         self.with_db(|db| {
-            let diagnostic_assists = if include_fixes {
+            let diagnostic_assists = if diagnostics_config.enabled && include_fixes {
                 ide_diagnostics::diagnostics(db, diagnostics_config, &resolve, frange.file_id)
                     .into_iter()
                     .flat_map(|it| it.fixes.unwrap_or_default())
@@ -619,8 +699,8 @@ impl Analysis {
             let assists = ide_assists::assists(db, assist_config, resolve, frange);
 
             let mut res = diagnostic_assists;
-            res.extend(ssr_assists.into_iter());
-            res.extend(assists.into_iter());
+            res.extend(ssr_assists);
+            res.extend(assists);
 
             res
         })
@@ -686,6 +766,13 @@ impl Analysis {
         direction: Direction,
     ) -> Cancellable<Option<TextEdit>> {
         self.with_db(|db| move_item::move_item(db, range, direction))
+    }
+
+    pub fn get_recursive_memory_layout(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<RecursiveMemoryLayout>> {
+        self.with_db(|db| view_memory_layout(db, position))
     }
 
     /// Performs an operation on the database that may be canceled.

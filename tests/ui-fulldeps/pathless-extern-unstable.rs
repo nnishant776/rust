@@ -1,6 +1,5 @@
-// ignore-stage1
-// edition:2018
-// compile-flags:--extern rustc_middle
+//@ edition:2018
+//@ compile-flags:--extern rustc_middle
 
 // Test that `--extern rustc_middle` fails with `rustc_private`.
 

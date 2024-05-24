@@ -1,4 +1,4 @@
-// revisions: full min
+//@ revisions: full min
 #![cfg_attr(full, feature(adt_const_params))]
 #![cfg_attr(full, allow(incomplete_features))]
 
@@ -12,8 +12,7 @@ unsafe extern "C" fn pass(args: PassArg) {
 
 impl Test {
     pub fn call_me<Args: Sized, const IDX: usize, const FN: unsafe extern "C" fn(Args)>(&self) {
-        //~^ ERROR: using function pointers as const generic parameters is forbidden
-        //~| ERROR: the type of const parameters must not depend on other generic parameters
+        //~^ ERROR: the type of const parameters must not depend on other generic parameters
         self.0 = Self::trampiline::<Args, IDX, FN> as _
     }
 
@@ -21,8 +20,7 @@ impl Test {
         Args: Sized,
         const IDX: usize,
         const FN: unsafe extern "C" fn(Args),
-        //~^ ERROR: using function pointers as const generic parameters is forbidden
-        //~| ERROR: the type of const parameters must not depend on other generic parameters
+        //~^ ERROR: the type of const parameters must not depend on other generic parameters
     >(
         args: Args,
     ) {
@@ -31,6 +29,6 @@ impl Test {
 }
 
 fn main() {
-    let x = Test();
+    let x = Test(std::ptr::null());
     x.call_me::<PassArg, 30, pass>()
 }

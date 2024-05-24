@@ -1,11 +1,11 @@
 //! `TypeFoldable` implementations for MIR types
 
 use rustc_ast::InlineAsmTemplatePiece;
+use rustc_hir::def_id::LocalDefId;
 
 use super::*;
-use crate::ty;
 
-TrivialTypeTraversalAndLiftImpls! {
+TrivialTypeTraversalImpls! {
     BlockTailInfo,
     MirPhase,
     SourceInfo,
@@ -16,18 +16,15 @@ TrivialTypeTraversalAndLiftImpls! {
     UserTypeAnnotationIndex,
     BorrowKind,
     CastKind,
-    NullOp,
-    hir::Movability,
     BasicBlock,
     SwitchTargets,
-    GeneratorKind,
-    GeneratorSavedLocal,
+    CoroutineKind,
+    CoroutineSavedLocal,
 }
 
 TrivialTypeTraversalImpls! {
-    for <'tcx> {
-        ConstValue<'tcx>,
-    }
+    ConstValue<'tcx>,
+    NullOp<'tcx>,
 }
 
 impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx [InlineAsmTemplatePiece] {
@@ -40,6 +37,15 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx [InlineAsmTemplatePiece] {
 }
 
 impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx [Span] {
+    fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
+        self,
+        _folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        Ok(self)
+    }
+}
+
+impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx ty::List<LocalDefId> {
     fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
         self,
         _folder: &mut F,

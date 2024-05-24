@@ -1,6 +1,6 @@
-// check-pass
-// compile-flags: -Zunpretty=expanded
-// edition:2021
+//@ check-pass
+//@ compile-flags: -Zunpretty=expanded
+//@ edition:2021
 //
 // This test checks the code generated for all[*] the builtin derivable traits
 // on a variety of structs and enums. It protects against accidental changes to
@@ -154,6 +154,20 @@ enum Fielded {
 enum EnumGeneric<T, U> {
     One(T),
     Two(U),
+}
+
+// An enum that has variant, which does't implement `Copy`.
+#[derive(PartialEq)]
+enum NonCopyEnum {
+    // The `dyn NonCopyTrait` implements `PartialEq`, but it doesn't require `Copy`.
+    // So we cannot generate `PartialEq` with dereference.
+    NonCopyField(Box<dyn NonCopyTrait>),
+}
+trait NonCopyTrait {}
+impl PartialEq for dyn NonCopyTrait {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 // A union. Most builtin traits are not derivable for unions.

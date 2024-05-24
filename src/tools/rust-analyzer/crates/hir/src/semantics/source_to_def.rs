@@ -14,7 +14,7 @@
 //! expression, an item definition.
 //!
 //! Knowing only the syntax gives us relatively little info. For example,
-//! looking at the syntax of the function we can realise that it is a part of an
+//! looking at the syntax of the function we can realize that it is a part of an
 //! `impl` block, but we won't be able to tell what trait function the current
 //! function overrides, and whether it does that correctly. For that, we need to
 //! go from [`ast::Fn`] to [`crate::Function`], and that's exactly what this
@@ -86,16 +86,19 @@
 //! syntax nodes against this specific crate.
 
 use base_db::FileId;
+use either::Either;
 use hir_def::{
     child_by_source::ChildBySource,
-    dyn_map::DynMap,
-    expr::{LabelId, PatId},
-    keys::{self, Key},
-    AdtId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, FieldId, FunctionId,
-    GenericDefId, GenericParamId, ImplId, LifetimeParamId, MacroId, ModuleId, StaticId, StructId,
-    TraitId, TypeAliasId, TypeParamId, UnionId, VariantId,
+    dyn_map::{
+        keys::{self, Key},
+        DynMap,
+    },
+    hir::{BindingId, LabelId},
+    AdtId, BlockId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternCrateId,
+    FieldId, FunctionId, GenericDefId, GenericParamId, ImplId, LifetimeParamId, MacroId, ModuleId,
+    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
 };
-use hir_expand::{attrs::AttrId, name::AsName, HirFileId, MacroCallId};
+use hir_expand::{attrs::AttrId, name::AsName, HirFileId, HirFileIdExt, MacroCallId};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use stdx::impl_from;
@@ -110,15 +113,15 @@ pub(super) type SourceToDefCache = FxHashMap<(ChildContainer, HirFileId), DynMap
 
 pub(super) struct SourceToDefCtx<'a, 'b> {
     pub(super) db: &'b dyn HirDatabase,
-    pub(super) cache: &'a mut SourceToDefCache,
+    pub(super) dynmap_cache: &'a mut SourceToDefCache,
 }
 
 impl SourceToDefCtx<'_, '_> {
     pub(super) fn file_to_def(&self, file: FileId) -> SmallVec<[ModuleId; 1]> {
-        let _p = profile::span("SourceBinder::to_module_def");
+        let _p = tracing::span!(tracing::Level::INFO, "SourceToDefCtx::file_to_def").entered();
         let mut mods = SmallVec::new();
         for &crate_id in self.db.relevant_crates(file).iter() {
-            // FIXME: inner items
+            // Note: `mod` declarations in block modules cannot be supported here
             let crate_def_map = self.db.crate_def_map(crate_id);
             mods.extend(
                 crate_def_map
@@ -126,21 +129,28 @@ impl SourceToDefCtx<'_, '_> {
                     .map(|local_id| crate_def_map.module_id(local_id)),
             )
         }
+        if mods.is_empty() {
+            // FIXME: detached file
+        }
         mods
     }
 
-    pub(super) fn module_to_def(&self, src: InFile<ast::Module>) -> Option<ModuleId> {
-        let _p = profile::span("module_to_def");
+    pub(super) fn module_to_def(&mut self, src: InFile<ast::Module>) -> Option<ModuleId> {
+        let _p = tracing::span!(tracing::Level::INFO, "module_to_def").entered();
         let parent_declaration = src
             .syntax()
             .ancestors_with_macros_skip_attr_item(self.db.upcast())
-            .find_map(|it| it.map(ast::Module::cast).transpose());
+            .find_map(|it| it.map(Either::<ast::Module, ast::BlockExpr>::cast).transpose())
+            .map(|it| it.transpose());
 
         let parent_module = match parent_declaration {
-            Some(parent_declaration) => self.module_to_def(parent_declaration),
+            Some(Either::Right(parent_block)) => self
+                .block_to_def(parent_block)
+                .map(|block| self.db.block_def_map(block).root_module_id()),
+            Some(Either::Left(parent_declaration)) => self.module_to_def(parent_declaration),
             None => {
                 let file_id = src.file_id.original_file(self.db.upcast());
-                self.file_to_def(file_id).get(0).copied()
+                self.file_to_def(file_id).first().copied()
             }
         }?;
 
@@ -151,13 +161,19 @@ impl SourceToDefCtx<'_, '_> {
     }
 
     pub(super) fn source_file_to_def(&self, src: InFile<ast::SourceFile>) -> Option<ModuleId> {
-        let _p = profile::span("source_file_to_def");
+        let _p = tracing::span!(tracing::Level::INFO, "source_file_to_def").entered();
         let file_id = src.file_id.original_file(self.db.upcast());
-        self.file_to_def(file_id).get(0).copied()
+        self.file_to_def(file_id).first().copied()
     }
 
     pub(super) fn trait_to_def(&mut self, src: InFile<ast::Trait>) -> Option<TraitId> {
         self.to_def(src, keys::TRAIT)
+    }
+    pub(super) fn trait_alias_to_def(
+        &mut self,
+        src: InFile<ast::TraitAlias>,
+    ) -> Option<TraitAliasId> {
+        self.to_def(src, keys::TRAIT_ALIAS)
     }
     pub(super) fn impl_to_def(&mut self, src: InFile<ast::Impl>) -> Option<ImplId> {
         self.to_def(src, keys::IMPL)
@@ -189,11 +205,24 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn tuple_field_to_def(&mut self, src: InFile<ast::TupleField>) -> Option<FieldId> {
         self.to_def(src, keys::TUPLE_FIELD)
     }
+    pub(super) fn block_to_def(&mut self, src: InFile<ast::BlockExpr>) -> Option<BlockId> {
+        self.to_def(src, keys::BLOCK)
+    }
     pub(super) fn enum_variant_to_def(
         &mut self,
         src: InFile<ast::Variant>,
     ) -> Option<EnumVariantId> {
-        self.to_def(src, keys::VARIANT)
+        self.to_def(src, keys::ENUM_VARIANT)
+    }
+    pub(super) fn extern_crate_to_def(
+        &mut self,
+        src: InFile<ast::ExternCrate>,
+    ) -> Option<ExternCrateId> {
+        self.to_def(src, keys::EXTERN_CRATE)
+    }
+    #[allow(dead_code)]
+    pub(super) fn use_to_def(&mut self, src: InFile<ast::Use>) -> Option<UseId> {
+        self.to_def(src, keys::USE)
     }
     pub(super) fn adt_to_def(
         &mut self,
@@ -210,14 +239,14 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn bind_pat_to_def(
         &mut self,
         src: InFile<ast::IdentPat>,
-    ) -> Option<(DefWithBodyId, PatId)> {
+    ) -> Option<(DefWithBodyId, BindingId)> {
         let container = self.find_pat_or_label_container(src.syntax())?;
         let (body, source_map) = self.db.body_with_source_map(container);
         let src = src.map(ast::Pat::from);
         let pat_id = source_map.node_pat(src.as_ref())?;
         // the pattern could resolve to a constant, verify that that is not the case
-        if let crate::Pat::Bind { .. } = body[pat_id] {
-            Some((container, pat_id))
+        if let crate::Pat::Bind { id, .. } = body[pat_id] {
+            Some((container, id))
         } else {
             None
         }
@@ -225,11 +254,10 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn self_param_to_def(
         &mut self,
         src: InFile<ast::SelfParam>,
-    ) -> Option<(DefWithBodyId, PatId)> {
+    ) -> Option<(DefWithBodyId, BindingId)> {
         let container = self.find_pat_or_label_container(src.syntax())?;
-        let (_body, source_map) = self.db.body_with_source_map(container);
-        let pat_id = source_map.node_self_param(src.as_ref())?;
-        Some((container, pat_id))
+        let body = self.db.body(container);
+        Some((container, body.self_param?))
     }
     pub(super) fn label_to_def(
         &mut self,
@@ -277,7 +305,7 @@ impl SourceToDefCtx<'_, '_> {
 
     fn cache_for(&mut self, container: ChildContainer, file_id: HirFileId) -> &DynMap {
         let db = self.db;
-        self.cache
+        self.dynmap_cache
             .entry((container, file_id))
             .or_insert_with(|| container.child_by_source(db, file_id))
     }
@@ -285,7 +313,7 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn type_param_to_def(&mut self, src: InFile<ast::TypeParam>) -> Option<TypeParamId> {
         let container: ChildContainer = self.find_generic_param_container(src.syntax())?.into();
         let dyn_map = self.cache_for(container, src.file_id);
-        dyn_map[keys::TYPE_PARAM].get(&src.value).copied().map(|x| TypeParamId::from_unchecked(x))
+        dyn_map[keys::TYPE_PARAM].get(&src.value).copied().map(TypeParamId::from_unchecked)
     }
 
     pub(super) fn lifetime_param_to_def(
@@ -303,7 +331,7 @@ impl SourceToDefCtx<'_, '_> {
     ) -> Option<ConstParamId> {
         let container: ChildContainer = self.find_generic_param_container(src.syntax())?.into();
         let dyn_map = self.cache_for(container, src.file_id);
-        dyn_map[keys::CONST_PARAM].get(&src.value).copied().map(|x| ConstParamId::from_unchecked(x))
+        dyn_map[keys::CONST_PARAM].get(&src.value).copied().map(ConstParamId::from_unchecked)
     }
 
     pub(super) fn generic_param_to_def(
@@ -344,7 +372,7 @@ impl SourceToDefCtx<'_, '_> {
             }
         }
 
-        let def = self.file_to_def(src.file_id.original_file(self.db.upcast())).get(0).copied()?;
+        let def = self.file_to_def(src.file_id.original_file(self.db.upcast())).first().copied()?;
         Some(def.into())
     }
 
@@ -353,6 +381,9 @@ impl SourceToDefCtx<'_, '_> {
             match item {
                 ast::Item::Module(it) => self.module_to_def(container.with_value(it))?.into(),
                 ast::Item::Trait(it) => self.trait_to_def(container.with_value(it))?.into(),
+                ast::Item::TraitAlias(it) => {
+                    self.trait_alias_to_def(container.with_value(it))?.into()
+                }
                 ast::Item::Impl(it) => self.impl_to_def(container.with_value(it))?.into(),
                 ast::Item::Enum(it) => self.enum_to_def(container.with_value(it))?.into(),
                 ast::Item::TypeAlias(it) => {
@@ -400,6 +431,9 @@ impl SourceToDefCtx<'_, '_> {
                 ast::Item::Struct(it) => self.struct_to_def(InFile::new(file_id, it))?.into(),
                 ast::Item::Enum(it) => self.enum_to_def(InFile::new(file_id, it))?.into(),
                 ast::Item::Trait(it) => self.trait_to_def(InFile::new(file_id, it))?.into(),
+                ast::Item::TraitAlias(it) => {
+                    self.trait_alias_to_def(InFile::new(file_id, it))?.into()
+                }
                 ast::Item::TypeAlias(it) => {
                     self.type_alias_to_def(InFile::new(file_id, it))?.into()
                 }
@@ -435,6 +469,7 @@ pub(crate) enum ChildContainer {
     DefWithBodyId(DefWithBodyId),
     ModuleId(ModuleId),
     TraitId(TraitId),
+    TraitAliasId(TraitAliasId),
     ImplId(ImplId),
     EnumId(EnumId),
     VariantId(VariantId),
@@ -447,6 +482,7 @@ impl_from! {
     DefWithBodyId,
     ModuleId,
     TraitId,
+    TraitAliasId,
     ImplId,
     EnumId,
     VariantId,
@@ -462,6 +498,7 @@ impl ChildContainer {
             ChildContainer::DefWithBodyId(it) => it.child_by_source(db, file_id),
             ChildContainer::ModuleId(it) => it.child_by_source(db, file_id),
             ChildContainer::TraitId(it) => it.child_by_source(db, file_id),
+            ChildContainer::TraitAliasId(_) => DynMap::default(),
             ChildContainer::ImplId(it) => it.child_by_source(db, file_id),
             ChildContainer::EnumId(it) => it.child_by_source(db, file_id),
             ChildContainer::VariantId(it) => it.child_by_source(db, file_id),

@@ -4,6 +4,7 @@ use crate::build::expr::category::Category;
 use crate::build::ForGuard::{OutsideGuard, RefWithinGuard};
 use crate::build::{BlockAnd, BlockAndExtension, Builder, Capture, CaptureMap};
 use rustc_hir::def_id::LocalDefId;
+use rustc_middle::bug;
 use rustc_middle::hir::place::Projection as HirProjection;
 use rustc_middle::hir::place::ProjectionKind as HirProjectionKind;
 use rustc_middle::middle::region;
@@ -11,11 +12,10 @@ use rustc_middle::mir::AssertKind::BoundsCheck;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::AdtDef;
-use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, TyCtxt, Variance};
+use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, Variance};
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
-
-use rustc_index::vec::Idx;
+use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
+use tracing::{debug, instrument, trace};
 
 use std::assert_matches::assert_matches;
 use std::iter;
@@ -77,7 +77,7 @@ pub(in crate::build) struct PlaceBuilder<'tcx> {
 
 /// Given a list of MIR projections, convert them to list of HIR ProjectionKind.
 /// The projections are truncated to represent a path that might be captured by a
-/// closure/generator. This implies the vector returned from this function doesn't contain
+/// closure/coroutine. This implies the vector returned from this function doesn't contain
 /// ProjectionElems `Downcast`, `ConstantIndex`, `Index`, or `Subslice` because those will never be
 /// part of a path that is captured by a closure. We stop applying projections once we see the first
 /// projection that isn't captured by a closure.
@@ -91,8 +91,8 @@ fn convert_to_hir_projections_and_truncate_for_capture(
         let hir_projection = match mir_projection {
             ProjectionElem::Deref => HirProjectionKind::Deref,
             ProjectionElem::Field(field, _) => {
-                let variant = variant.unwrap_or(VariantIdx::new(0));
-                HirProjectionKind::Field(field.index() as u32, variant)
+                let variant = variant.unwrap_or(FIRST_VARIANT);
+                HirProjectionKind::Field(*field, variant)
             }
             ProjectionElem::Downcast(.., idx) => {
                 // We don't expect to see multi-variant enums here, as earlier
@@ -104,7 +104,7 @@ fn convert_to_hir_projections_and_truncate_for_capture(
                 continue;
             }
             // These do not affect anything, they just make sure we know the right type.
-            ProjectionElem::OpaqueCast(_) => continue,
+            ProjectionElem::OpaqueCast(_) | ProjectionElem::Subtype(..) => continue,
             ProjectionElem::Index(..)
             | ProjectionElem::ConstantIndex { .. }
             | ProjectionElem::Subslice { .. } => {
@@ -177,13 +177,10 @@ fn to_upvars_resolved_place_builder<'tcx>(
     projection: &[PlaceElem<'tcx>],
 ) -> Option<PlaceBuilder<'tcx>> {
     let Some((capture_index, capture)) =
-        find_capture_matching_projections(
-            &cx.upvars,
-            var_hir_id,
-            &projection,
-        ) else {
+        find_capture_matching_projections(&cx.upvars, var_hir_id, projection)
+    else {
         let closure_span = cx.tcx.def_span(closure_def_id);
-        if !enable_precise_capture(cx.tcx, closure_span) {
+        if !enable_precise_capture(closure_span) {
             bug!(
                 "No associated capture found for {:?}[{:#?}] even though \
                     capture_disjoint_fields isn't enabled",
@@ -191,10 +188,7 @@ fn to_upvars_resolved_place_builder<'tcx>(
                 projection
             )
         } else {
-            debug!(
-                "No associated capture found for {:?}[{:#?}]",
-                var_hir_id, projection,
-            );
+            debug!("No associated capture found for {:?}[{:#?}]", var_hir_id, projection,);
         }
         return None;
     };
@@ -221,7 +215,7 @@ fn to_upvars_resolved_place_builder<'tcx>(
 /// projections.
 ///
 /// Supports only HIR projection kinds that represent a path that might be
-/// captured by a closure or a generator, i.e., an `Index` or a `Subslice`
+/// captured by a closure or a coroutine, i.e., an `Index` or a `Subslice`
 /// projection kinds are unsupported.
 fn strip_prefix<'a, 'tcx>(
     mut base_ty: Ty<'tcx>,
@@ -243,6 +237,9 @@ fn strip_prefix<'a, 'tcx>(
                     assert_matches!(iter.next(), Some(ProjectionElem::Downcast(..)));
                 }
                 assert_matches!(iter.next(), Some(ProjectionElem::Field(..)));
+            }
+            HirProjectionKind::OpaqueCast => {
+                assert_matches!(iter.next(), Some(ProjectionElem::OpaqueCast(..)));
             }
             HirProjectionKind::Index | HirProjectionKind::Subslice => {
                 bug!("unexpected projection kind: {:?}", projection);
@@ -295,7 +292,7 @@ impl<'tcx> PlaceBuilder<'tcx> {
         &self.projection
     }
 
-    pub(crate) fn field(self, f: Field, ty: Ty<'tcx>) -> Self {
+    pub(crate) fn field(self, f: FieldIdx, ty: Ty<'tcx>) -> Self {
         self.project(PlaceElem::Field(f, ty))
     }
 
@@ -359,9 +356,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     pub(crate) fn as_place(
         &mut self,
         mut block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
     ) -> BlockAnd<Place<'tcx>> {
-        let place_builder = unpack!(block = self.as_place_builder(block, expr));
+        let place_builder = unpack!(block = self.as_place_builder(block, expr_id));
         block.and(place_builder.to_place(self))
     }
 
@@ -370,9 +367,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     pub(crate) fn as_place_builder(
         &mut self,
         block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
     ) -> BlockAnd<PlaceBuilder<'tcx>> {
-        self.expr_as_place(block, expr, Mutability::Mut, None)
+        self.expr_as_place(block, expr_id, Mutability::Mut, None)
     }
 
     /// Compile `expr`, yielding a place that we can move from etc.
@@ -383,9 +380,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     pub(crate) fn as_read_only_place(
         &mut self,
         mut block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
     ) -> BlockAnd<Place<'tcx>> {
-        let place_builder = unpack!(block = self.as_read_only_place_builder(block, expr));
+        let place_builder = unpack!(block = self.as_read_only_place_builder(block, expr_id));
         block.and(place_builder.to_place(self))
     }
 
@@ -398,18 +395,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn as_read_only_place_builder(
         &mut self,
         block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
     ) -> BlockAnd<PlaceBuilder<'tcx>> {
-        self.expr_as_place(block, expr, Mutability::Not, None)
+        self.expr_as_place(block, expr_id, Mutability::Not, None)
     }
 
     fn expr_as_place(
         &mut self,
         mut block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
         mutability: Mutability,
         fake_borrow_temps: Option<&mut Vec<Local>>,
     ) -> BlockAnd<PlaceBuilder<'tcx>> {
+        let expr = &self.thir[expr_id];
         debug!("expr_as_place(block={:?}, expr={:?}, mutability={:?})", block, expr, mutability);
 
         let this = self;
@@ -418,14 +416,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match expr.kind {
             ExprKind::Scope { region_scope, lint_level, value } => {
                 this.in_scope((region_scope, source_info), lint_level, |this| {
-                    this.expr_as_place(block, &this.thir[value], mutability, fake_borrow_temps)
+                    this.expr_as_place(block, value, mutability, fake_borrow_temps)
                 })
             }
             ExprKind::Field { lhs, variant_index, name } => {
-                let lhs = &this.thir[lhs];
+                let lhs_expr = &this.thir[lhs];
                 let mut place_builder =
                     unpack!(block = this.expr_as_place(block, lhs, mutability, fake_borrow_temps,));
-                if let ty::Adt(adt_def, _) = lhs.ty.kind() {
+                if let ty::Adt(adt_def, _) = lhs_expr.ty.kind() {
                     if adt_def.is_enum() {
                         place_builder = place_builder.downcast(*adt_def, variant_index);
                     }
@@ -433,16 +431,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block.and(place_builder.field(name, expr.ty))
             }
             ExprKind::Deref { arg } => {
-                let place_builder = unpack!(
-                    block =
-                        this.expr_as_place(block, &this.thir[arg], mutability, fake_borrow_temps,)
-                );
+                let place_builder =
+                    unpack!(block = this.expr_as_place(block, arg, mutability, fake_borrow_temps,));
                 block.and(place_builder.deref())
             }
             ExprKind::Index { lhs, index } => this.lower_index_expression(
                 block,
-                &this.thir[lhs],
-                &this.thir[index],
+                lhs,
+                index,
                 mutability,
                 fake_borrow_temps,
                 expr.temp_lifetime,
@@ -466,12 +462,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
             ExprKind::PlaceTypeAscription { source, ref user_ty } => {
                 let place_builder = unpack!(
-                    block = this.expr_as_place(
-                        block,
-                        &this.thir[source],
-                        mutability,
-                        fake_borrow_temps,
-                    )
+                    block = this.expr_as_place(block, source, mutability, fake_borrow_temps,)
                 );
                 if let Some(user_ty) = user_ty {
                     let annotation_index =
@@ -499,9 +490,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block.and(place_builder)
             }
             ExprKind::ValueTypeAscription { source, ref user_ty } => {
-                let source = &this.thir[source];
-                let temp =
-                    unpack!(block = this.as_temp(block, source.temp_lifetime, source, mutability));
+                let source_expr = &this.thir[source];
+                let temp = unpack!(
+                    block = this.as_temp(block, source_expr.temp_lifetime, source, mutability)
+                );
                 if let Some(user_ty) = user_ty {
                     let annotation_index =
                         this.canonical_user_type_annotations.push(CanonicalUserTypeAnnotation {
@@ -537,7 +529,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Cast { .. }
             | ExprKind::Use { .. }
             | ExprKind::NeverToAny { .. }
-            | ExprKind::Pointer { .. }
+            | ExprKind::PointerCoercion { .. }
             | ExprKind::Repeat { .. }
             | ExprKind::Borrow { .. }
             | ExprKind::AddressOf { .. }
@@ -551,6 +543,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Break { .. }
             | ExprKind::Continue { .. }
             | ExprKind::Return { .. }
+            | ExprKind::Become { .. }
             | ExprKind::Literal { .. }
             | ExprKind::NamedConst { .. }
             | ExprKind::NonHirLiteral { .. }
@@ -559,13 +552,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ConstBlock { .. }
             | ExprKind::StaticRef { .. }
             | ExprKind::InlineAsm { .. }
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Yield { .. }
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. } => {
                 // these are not places, so we need to make a temporary.
                 debug_assert!(!matches!(Category::of(&expr.kind), Some(Category::Place)));
                 let temp =
-                    unpack!(block = this.as_temp(block, expr.temp_lifetime, expr, mutability));
+                    unpack!(block = this.as_temp(block, expr.temp_lifetime, expr_id, mutability));
                 block.and(PlaceBuilder::from(temp))
             }
         }
@@ -594,8 +588,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn lower_index_expression(
         &mut self,
         mut block: BasicBlock,
-        base: &Expr<'tcx>,
-        index: &Expr<'tcx>,
+        base: ExprId,
+        index: ExprId,
         mutability: Mutability,
         fake_borrow_temps: Option<&mut Vec<Local>>,
         temp_lifetime: Option<region::Scope>,
@@ -612,7 +606,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // Making this a *fresh* temporary means we do not have to worry about
         // the index changing later: Nothing will ever change this temporary.
         // The "retagging" transformation (for Stacked Borrows) relies on this.
-        let idx = unpack!(block = self.as_temp(block, temp_lifetime, index, Mutability::Not,));
+        let idx = unpack!(block = self.as_temp(block, temp_lifetime, index, Mutability::Not));
 
         block = self.bounds_check(block, &base_place, idx, expr_span, source_info);
 
@@ -678,40 +672,29 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // check that we just did stays valid. Since we can't assign to
             // unsized values, we only need to ensure that none of the
             // pointers in the base place are modified.
-            for (idx, elem) in base_place.projection.iter().enumerate().rev() {
+            for (base_place, elem) in base_place.iter_projections().rev() {
                 match elem {
                     ProjectionElem::Deref => {
-                        let fake_borrow_deref_ty = Place::ty_from(
-                            base_place.local,
-                            &base_place.projection[..idx],
-                            &self.local_decls,
-                            tcx,
-                        )
-                        .ty;
+                        let fake_borrow_deref_ty = base_place.ty(&self.local_decls, tcx).ty;
                         let fake_borrow_ty =
-                            tcx.mk_imm_ref(tcx.lifetimes.re_erased, fake_borrow_deref_ty);
+                            Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, fake_borrow_deref_ty);
                         let fake_borrow_temp =
                             self.local_decls.push(LocalDecl::new(fake_borrow_ty, expr_span));
-                        let projection = tcx.mk_place_elems(&base_place.projection[..idx]);
+                        let projection = tcx.mk_place_elems(base_place.projection);
                         self.cfg.push_assign(
                             block,
                             source_info,
                             fake_borrow_temp.into(),
                             Rvalue::Ref(
                                 tcx.lifetimes.re_erased,
-                                BorrowKind::Shallow,
+                                BorrowKind::Fake(FakeBorrowKind::Shallow),
                                 Place { local: base_place.local, projection },
                             ),
                         );
                         fake_borrow_temps.push(fake_borrow_temp);
                     }
                     ProjectionElem::Index(_) => {
-                        let index_ty = Place::ty_from(
-                            base_place.local,
-                            &base_place.projection[..idx],
-                            &self.local_decls,
-                            tcx,
-                        );
+                        let index_ty = base_place.ty(&self.local_decls, tcx);
                         match index_ty.ty.kind() {
                             // The previous index expression has already
                             // done any index expressions needed here.
@@ -723,6 +706,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     ProjectionElem::Field(..)
                     | ProjectionElem::Downcast(..)
                     | ProjectionElem::OpaqueCast(..)
+                    | ProjectionElem::Subtype(..)
                     | ProjectionElem::ConstantIndex { .. }
                     | ProjectionElem::Subslice { .. } => (),
                 }
@@ -745,8 +729,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 }
 
-/// Precise capture is enabled if the feature gate `capture_disjoint_fields` is enabled or if
-/// user is using Rust Edition 2021 or higher.
-fn enable_precise_capture(tcx: TyCtxt<'_>, closure_span: Span) -> bool {
-    tcx.features().capture_disjoint_fields || closure_span.rust_2021()
+/// Precise capture is enabled if user is using Rust Edition 2021 or higher.
+fn enable_precise_capture(closure_span: Span) -> bool {
+    closure_span.at_least_rust_2021()
 }

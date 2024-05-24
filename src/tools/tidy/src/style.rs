@@ -18,8 +18,12 @@
 // ignore-tidy-dbg
 
 use crate::walk::{filter_dirs, walk};
-use regex::{Regex, RegexSet};
-use std::path::Path;
+use regex::RegexSet;
+use rustc_hash::FxHashMap;
+use std::{ffi::OsStr, path::Path};
+
+#[cfg(test)]
+mod tests;
 
 /// Error code markdown is restricted to 80 columns because they can be
 /// displayed on the console with --example.
@@ -55,18 +59,65 @@ const ANNOTATIONS_TO_IGNORE: &[&str] = &[
     "// CHECK",
     "// EMIT_MIR",
     "// compile-flags",
+    "//@ compile-flags",
     "// error-pattern",
+    "//@ error-pattern",
     "// gdb",
     "// lldb",
     "// cdb",
     "// normalize-stderr-test",
+    "//@ normalize-stderr-test",
 ];
 
+fn generate_problems<'a>(
+    consts: &'a [u32],
+    letter_digit: &'a FxHashMap<char, char>,
+) -> impl Iterator<Item = u32> + 'a {
+    consts.iter().flat_map(move |const_value| {
+        let problem =
+            letter_digit.iter().fold(format!("{:X}", const_value), |acc, (key, value)| {
+                acc.replace(&value.to_string(), &key.to_string())
+            });
+        let indexes: Vec<usize> = problem
+            .chars()
+            .enumerate()
+            .filter_map(|(index, c)| if letter_digit.contains_key(&c) { Some(index) } else { None })
+            .collect();
+        (0..1 << indexes.len()).map(move |i| {
+            u32::from_str_radix(
+                &problem
+                    .chars()
+                    .enumerate()
+                    .map(|(index, c)| {
+                        if let Some(pos) = indexes.iter().position(|&x| x == index) {
+                            if (i >> pos) & 1 == 1 { letter_digit[&c] } else { c }
+                        } else {
+                            c
+                        }
+                    })
+                    .collect::<String>(),
+                0x10,
+            )
+            .unwrap()
+        })
+    })
+}
+
 // Intentionally written in decimal rather than hex
-const PROBLEMATIC_CONSTS: &[u32] = &[
+const ROOT_PROBLEMATIC_CONSTS: &[u32] = &[
     184594741, 2880289470, 2881141438, 2965027518, 2976579765, 3203381950, 3405691582, 3405697037,
-    3735927486, 3735932941, 4027431614, 4276992702,
+    3735927486, 3735932941, 4027431614, 4276992702, 195934910, 252707358, 762133, 179681982,
+    173390526, 721077,
 ];
+
+fn generate_problematic_strings(
+    consts: &[u32],
+    letter_digit: &FxHashMap<char, char>,
+) -> Vec<String> {
+    generate_problems(consts, letter_digit)
+        .flat_map(|v| vec![v.to_string(), format!("{:x}", v), format!("{:X}", v)])
+        .collect()
+}
 
 const INTERNAL_COMPILER_DOCS_LINE: &str = "#### This error code is internal to the compiler and will not be emitted with normal Rust code.";
 
@@ -127,8 +178,14 @@ fn should_ignore(line: &str) -> bool {
     // Matches test annotations like `//~ ERROR text`.
     // This mirrors the regex in src/tools/compiletest/src/runtest.rs, please
     // update both if either are changed.
-    let re = Regex::new("\\s*//(\\[.*\\])?~.*").unwrap();
-    re.is_match(line) || ANNOTATIONS_TO_IGNORE.iter().any(|a| line.contains(a))
+    static_regex!("\\s*//(\\[.*\\])?~.*").is_match(line)
+        || ANNOTATIONS_TO_IGNORE.iter().any(|a| line.contains(a))
+
+    // For `ui_test`-style UI test directives, also ignore
+    // - `//@[rev] compile-flags`
+    // - `//@[rev] normalize-stderr-test`
+        || static_regex!("\\s*//@(\\[.*\\]) (compile-flags|normalize-stderr-test|error-pattern).*")
+            .is_match(line)
 }
 
 /// Returns `true` if `line` is allowed to be longer than the normal limit.
@@ -163,6 +220,7 @@ fn contains_ignore_directive(can_contain: bool, contents: &str, check: &str) -> 
     if contents.contains(&format!("// ignore-tidy-{check}"))
         || contents.contains(&format!("# ignore-tidy-{check}"))
         || contents.contains(&format!("/* ignore-tidy-{check} */"))
+        || contents.contains(&format!("<!-- ignore-tidy-{check} -->"))
     {
         Directive::Ignore(false)
     } else {
@@ -171,9 +229,9 @@ fn contains_ignore_directive(can_contain: bool, contents: &str, check: &str) -> 
 }
 
 macro_rules! suppressible_tidy_err {
-    ($err:ident, $skip:ident, $msg:expr) => {
+    ($err:ident, $skip:ident, $msg:literal) => {
         if let Directive::Deny = $skip {
-            $err($msg);
+            $err(&format!($msg));
         } else {
             $skip = Directive::Ignore(true);
         }
@@ -185,7 +243,7 @@ pub fn is_in(full_path: &Path, parent_folder_to_find: &str, folder_to_find: &str
         if parent.file_name().map_or_else(
             || false,
             |f| {
-                f.to_string_lossy() == folder_to_find
+                f == folder_to_find
                     && parent
                         .parent()
                         .and_then(|f| f.file_name())
@@ -227,22 +285,40 @@ fn is_unexplained_ignore(extension: &str, line: &str) -> bool {
 }
 
 pub fn check(path: &Path, bad: &mut bool) {
-    fn skip(path: &Path) -> bool {
-        filter_dirs(path) || skip_markdown_path(path)
+    fn skip(path: &Path, is_dir: bool) -> bool {
+        if path.file_name().map_or(false, |name| name.to_string_lossy().starts_with(".#")) {
+            // vim or emacs temporary file
+            return true;
+        }
+
+        if filter_dirs(path) || skip_markdown_path(path) {
+            return true;
+        }
+
+        // Don't check extensions for directories
+        if is_dir {
+            return false;
+        }
+
+        let extensions = ["rs", "py", "js", "sh", "c", "cpp", "h", "md", "css", "ftl", "goml"];
+
+        // NB: don't skip paths without extensions (or else we'll skip all directories and will only check top level files)
+        if path.extension().map_or(true, |ext| !extensions.iter().any(|e| ext == OsStr::new(e))) {
+            return true;
+        }
+
+        // We only check CSS files in rustdoc.
+        path.extension().map_or(false, |e| e == "css") && !is_in(path, "src", "librustdoc")
     }
-    let problematic_consts_strings: Vec<String> = (PROBLEMATIC_CONSTS.iter().map(u32::to_string))
-        .chain(PROBLEMATIC_CONSTS.iter().map(|v| format!("{:x}", v)))
-        .chain(PROBLEMATIC_CONSTS.iter().map(|v| format!("{:X}", v)))
-        .collect();
+    let problematic_consts_strings = generate_problematic_strings(
+        ROOT_PROBLEMATIC_CONSTS,
+        &[('A', '4'), ('B', '8'), ('E', '3')].iter().cloned().collect(),
+    );
     let problematic_regex = RegexSet::new(problematic_consts_strings.as_slice()).unwrap();
-    walk(path, &mut skip, &mut |entry, contents| {
+
+    walk(path, skip, &mut |entry, contents| {
         let file = entry.path();
         let filename = file.file_name().unwrap().to_string_lossy();
-        let extensions =
-            [".rs", ".py", ".js", ".sh", ".c", ".cpp", ".h", ".md", ".css", ".ftl", ".goml"];
-        if extensions.iter().all(|e| !filename.ends_with(e)) || filename.starts_with(".#") {
-            return;
-        }
 
         let is_style_file = filename.ends_with(".css");
         let under_rustfmt = filename.ends_with(".rs") &&
@@ -252,11 +328,6 @@ pub fn check(path: &Path, bad: &mut bool) {
                 (a.ends_with("tests") && a.join("COMPILER_TESTS.md").exists()) ||
                     a.ends_with("src/doc/book")
             });
-
-        if is_style_file && !is_in(file, "src", "librustdoc") {
-            // We only check CSS files in rustdoc.
-            return;
-        }
 
         if contents.is_empty() {
             tidy_error!(bad, "{}: empty file", file.display());
@@ -276,15 +347,18 @@ pub fn check(path: &Path, bad: &mut bool) {
 
         let can_contain = contents.contains("// ignore-tidy-")
             || contents.contains("# ignore-tidy-")
-            || contents.contains("/* ignore-tidy-");
+            || contents.contains("/* ignore-tidy-")
+            || contents.contains("<!-- ignore-tidy-");
         // Enable testing ICE's that require specific (untidy)
         // file formats easily eg. `issue-1234-ignore-tidy.rs`
         if filename.contains("ignore-tidy") {
             return;
         }
-        // apfloat shouldn't be changed because of license problems
-        if is_in(file, "compiler", "rustc_apfloat") {
-            return;
+        // Shell completions are automatically generated
+        if let Some(p) = file.parent() {
+            if p.ends_with(Path::new("src/etc/completions")) {
+                return;
+            }
         }
         let mut skip_cr = contains_ignore_directive(can_contain, &contents, "cr");
         let mut skip_undocumented_unsafe =
@@ -300,10 +374,13 @@ pub fn check(path: &Path, bad: &mut bool) {
             contains_ignore_directive(can_contain, &contents, "leading-newlines");
         let mut skip_copyright = contains_ignore_directive(can_contain, &contents, "copyright");
         let mut skip_dbg = contains_ignore_directive(can_contain, &contents, "dbg");
+        let mut skip_odd_backticks =
+            contains_ignore_directive(can_contain, &contents, "odd-backticks");
         let mut leading_new_lines = false;
         let mut trailing_new_lines = 0;
         let mut lines = 0;
         let mut last_safety_comment = false;
+        let mut comment_block: Option<(usize, usize)> = None;
         let is_test = file.components().any(|c| c.as_os_str() == "tests");
         // scanning the whole file for multiple needles at once is more efficient than
         // executing lines times needles separate searches.
@@ -351,7 +428,7 @@ pub fn check(path: &Path, bad: &mut bool) {
                 suppressible_tidy_err!(
                     err,
                     skip_line_length,
-                    &format!("line longer than {max_columns} chars")
+                    "line longer than {max_columns} chars"
                 );
             }
             if !is_style_file && line.contains('\t') {
@@ -368,10 +445,12 @@ pub fn check(path: &Path, bad: &mut bool) {
             }
             if filename != "style.rs" {
                 if trimmed.contains("TODO") {
-                    err("TODO is deprecated; use FIXME")
+                    err(
+                        "TODO is used for tasks that should be done before merging a PR; If you want to leave a message in the codebase use FIXME",
+                    )
                 }
                 if trimmed.contains("//") && trimmed.contains(" XXX") {
-                    err("XXX is deprecated; use FIXME")
+                    err("Instead of XXX use FIXME")
                 }
                 if any_problematic_line {
                     for s in problematic_consts_strings.iter() {
@@ -406,31 +485,74 @@ pub fn check(path: &Path, bad: &mut bool) {
                     "copyright notices attributed to the Rust Project Developers are deprecated"
                 );
             }
-            if is_unexplained_ignore(&extension, line) {
-                err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+            if !file.components().any(|c| c.as_os_str() == "rustc_baked_icu_data") {
+                if is_unexplained_ignore(&extension, line) {
+                    err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+                }
             }
+
             if filename.ends_with(".cpp") && line.contains("llvm_unreachable") {
                 err(LLVM_UNREACHABLE_INFO);
             }
 
             // For now only enforce in compiler
             let is_compiler = || file.components().any(|c| c.as_os_str() == "compiler");
-            if is_compiler()
-                && line.contains("//")
-                && line
-                    .chars()
-                    .collect::<Vec<_>>()
-                    .windows(4)
-                    .any(|cs| matches!(cs, ['.', ' ', ' ', last] if last.is_alphabetic()))
-            {
-                err(DOUBLE_SPACE_AFTER_DOT)
+
+            if is_compiler() {
+                if line.contains("//")
+                    && line
+                        .chars()
+                        .collect::<Vec<_>>()
+                        .windows(4)
+                        .any(|cs| matches!(cs, ['.', ' ', ' ', last] if last.is_alphabetic()))
+                {
+                    err(DOUBLE_SPACE_AFTER_DOT)
+                }
+
+                if filename.ends_with(".ftl") {
+                    let line_backticks = trimmed.chars().filter(|ch| *ch == '`').count();
+                    if line_backticks % 2 == 1 {
+                        suppressible_tidy_err!(err, skip_odd_backticks, "odd number of backticks");
+                    }
+                } else if trimmed.contains("//") {
+                    let (start_line, mut backtick_count) = comment_block.unwrap_or((i + 1, 0));
+                    let line_backticks = trimmed.chars().filter(|ch| *ch == '`').count();
+                    let comment_text = trimmed.split("//").nth(1).unwrap();
+                    // This check ensures that we don't lint for code that has `//` in a string literal
+                    if line_backticks % 2 == 1 {
+                        backtick_count += comment_text.chars().filter(|ch| *ch == '`').count();
+                    }
+                    comment_block = Some((start_line, backtick_count));
+                } else {
+                    if let Some((start_line, backtick_count)) = comment_block.take() {
+                        if backtick_count % 2 == 1 {
+                            let mut err = |msg: &str| {
+                                tidy_error!(bad, "{}:{start_line}: {msg}", file.display());
+                            };
+                            let block_len = (i + 1) - start_line;
+                            if block_len == 1 {
+                                suppressible_tidy_err!(
+                                    err,
+                                    skip_odd_backticks,
+                                    "comment with odd number of backticks"
+                                );
+                            } else {
+                                suppressible_tidy_err!(
+                                    err,
+                                    skip_odd_backticks,
+                                    "{block_len}-line comment block with odd number of backticks"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         if leading_new_lines {
             let mut err = |_| {
                 tidy_error!(bad, "{}: leading newline", file.display());
             };
-            suppressible_tidy_err!(err, skip_leading_newlines, "mising leading newline");
+            suppressible_tidy_err!(err, skip_leading_newlines, "missing leading newline");
         }
         let mut err = |msg: &str| {
             tidy_error!(bad, "{}: {}", file.display(), msg);
@@ -441,7 +563,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             n => suppressible_tidy_err!(
                 err,
                 skip_trailing_newlines,
-                &format!("too many trailing newlines ({n})")
+                "too many trailing newlines ({n})"
             ),
         };
         if lines > LINES {

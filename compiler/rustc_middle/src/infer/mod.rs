@@ -4,6 +4,7 @@ pub mod unify_key;
 use crate::ty::Region;
 use crate::ty::{OpaqueTypeKey, Ty};
 use rustc_data_structures::sync::Lrc;
+use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
 use rustc_span::Span;
 
 /// Requires that `region` must be equal to one of the regions in `choice_regions`.
@@ -12,9 +13,10 @@ use rustc_span::Span;
 /// ```text
 /// R0 member of [O1..On]
 /// ```
-#[derive(Debug, Clone, HashStable, TypeFoldable, TypeVisitable, Lift)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(HashStable, TypeFoldable, TypeVisitable)]
 pub struct MemberConstraint<'tcx> {
-    /// The `DefId` and substs of the opaque type causing this constraint.
+    /// The `DefId` and args of the opaque type causing this constraint.
     /// Used for error reporting.
     pub key: OpaqueTypeKey<'tcx>,
 
